@@ -295,8 +295,8 @@ def detect_input_tandem_clusters(input_locs, mapper, max_distance_kb=50):
     positions = {}
     for loc in input_locs:
         if loc in mapper.gene_positions:
-            chrom, start = mapper.gene_positions[loc]
-            positions[loc] = {'chrom': chrom, 'start': start}
+            chrom, start, end, strand = mapper.gene_positions[loc]
+            positions[loc] = {'chrom': chrom, 'start': start, 'end': end, 'strand': strand}
         else:
             print(f"  Warning: {loc} not found in BK genome")
 
@@ -315,9 +315,8 @@ def detect_input_tandem_clusters(input_locs, mapper, max_distance_kb=50):
             prev_loc = current_cluster[-1]
 
             # Check if on same chromosome and within max distance
-            # Using start-to-start distance since we don't have gene lengths
             if (positions[loc]['chrom'] == positions[prev_loc]['chrom'] and
-                abs(positions[loc]['start'] - positions[prev_loc]['start']) < max_distance_kb * 1000):
+                abs(positions[loc]['start'] - positions[prev_loc]['end']) < max_distance_kb * 1000):
                 current_cluster.append(loc)
             else:
                 # Start new cluster
@@ -396,14 +395,12 @@ def name_locus(genome_code, chromosome, locus_number):
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python 01_discover_paralogs_gene_level.py <LOC_ID(s)> <output_dir> [gene_family]")
+        print("Usage: python 01_discover_paralogs_gene_level.py <LOC_ID(s)> <output_dir>")
         print("  LOC_ID(s): Single LOC or comma-separated LOCs (e.g., 'LOC117167432' or 'LOC117167432,LOC117167433')")
-        print("  gene_family: Optional gene family name for batch processing")
         sys.exit(1)
 
     target_input = sys.argv[1]
     output_dir = Path(sys.argv[2])
-    gene_family = sys.argv[3] if len(sys.argv) > 3 else "unknown"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Parse input LOCs (may be comma-separated)
@@ -538,8 +535,7 @@ def main():
                 'flanking_count': len(flanking_genes),
                 'tandem_count': len(tandems),
                 'is_tandem': len(tandems) > 0,
-                'flanking_file': str(flanking_file),
-                'gene_family': gene_family
+                'flanking_file': str(flanking_file)
             }
 
             unique_loci.append(locus)
