@@ -4,34 +4,35 @@ Step 07: Annotate flanking proteins with SwissProt.
 
 Searches extracted hit sequences from each genome against SwissProt
 to get functional annotations for comparative analysis.
+
+Usage:
+    python 07_swissprot_annotation.py \\
+        --synteny-dir <path/to/02_synteny_blocks> \\
+        --swissprot-db <path/to/swissprot.dmnd> \\
+        --output-dir <path/to/swissprot_annotations> \\
+        [--evalue 1e-5] \\
+        [--threads 16]
 """
 
-print("DEBUG: Starting imports...", flush=True)
 from pathlib import Path
-print("DEBUG: Imported pathlib", flush=True)
 import subprocess
-print("DEBUG: Imported subprocess", flush=True)
 import pandas as pd
-print("DEBUG: Imported pandas", flush=True)
 import xml.etree.ElementTree as ET
-print("DEBUG: Imported xml", flush=True)
 from Bio import SeqIO
-print("DEBUG: Imported Bio.SeqIO", flush=True)
-import config
-print("DEBUG: Imported config", flush=True)
+import argparse
 
-def run_diamond(query_file, output_xml):
+def run_diamond(query_file, output_xml, swissprot_db, evalue, threads, use_diamond=True):
     """Run DIAMOND against SwissProt database (100-1000x faster than BLASTP)."""
 
-    if config.USE_DIAMOND:
+    if use_diamond:
         cmd = [
             'diamond', 'blastp',
             '--query', str(query_file),
-            '--db', str(config.SWISSPROT_DB),
+            '--db', str(swissprot_db),
             '--outfmt', '5',  # XML format (same as BLAST)
-            '--evalue', config.SWISSPROT_BLAST_EVALUE,
+            '--evalue', str(evalue),
             '--max-target-seqs', '1',  # Only need top hit
-            '--threads', str(config.BLAST_THREADS),
+            '--threads', str(threads),
             '--quiet'  # Suppress progress messages
         ]
     else:
@@ -39,11 +40,11 @@ def run_diamond(query_file, output_xml):
         cmd = [
             'blastp',
             '-query', str(query_file),
-            '-db', str(config.SWISSPROT_DB).replace('.dmnd', ''),  # Remove .dmnd extension for BLAST
+            '-db', str(swissprot_db).replace('.dmnd', ''),  # Remove .dmnd extension for BLAST
             '-outfmt', '5',  # XML format
-            '-evalue', config.SWISSPROT_BLAST_EVALUE,
+            '-evalue', str(evalue),
             '-max_target_seqs', '1',  # Only need top hit
-            '-num_threads', str(config.BLAST_THREADS)
+            '-num_threads', str(threads)
         ]
 
     with open(output_xml, 'w') as f:
@@ -149,27 +150,27 @@ def load_flanking_protein_mapping(locus_id, loci_df):
 
     return position_to_protein
 
-def annotate_locus_hits(locus_id, position_to_protein):
+def annotate_locus_hits(locus_id, position_to_protein, synteny_dir, output_dir, swissprot_db, evalue, threads, use_diamond):
     """Annotate hit sequences for one locus."""
 
-    print(f"\n  Processing {locus_id}...")
+    print(f"\n  Processing {locus_id}...", flush=True)
 
     # Find hit sequences directory
-    hit_seqs_dir = config.STEP02_SYNTENY / locus_id / "hit_sequences"
+    hit_seqs_dir = synteny_dir / locus_id / "hit_sequences"
 
     if not hit_seqs_dir.exists():
-        print(f"    ERROR: Hit sequences not found: {hit_seqs_dir}")
+        print(f"    ERROR: Hit sequences not found: {hit_seqs_dir}", flush=True)
         return []
 
     # Get all genome hit sequence files
     hit_files = list(hit_seqs_dir.glob("*_hit_proteins.fasta"))
 
     if not hit_files:
-        print(f"    No hit sequence files found")
+        print(f"    No hit sequence files found", flush=True)
         return []
 
     # Output directory
-    locus_output = config.STEP07_SWISSPROT / locus_id
+    locus_output = output_dir / locus_id
     locus_output.mkdir(exist_ok=True, parents=True)
 
     all_annotations = []
@@ -177,18 +178,18 @@ def annotate_locus_hits(locus_id, position_to_protein):
     # Process each genome's hits
     for hit_file in hit_files:
         genome_id = hit_file.stem.replace('_hit_proteins', '')
-        print(f"    {genome_id}...", end='')
+        print(f"    {genome_id}...", end='', flush=True)
 
         # Run SwissProt search (DIAMOND or BLAST)
         swissprot_xml = locus_output / f"{genome_id}_swissprot.xml"
 
         if swissprot_xml.exists():
-            print(" using existing result", end='')
+            print(" using existing result", end='', flush=True)
         else:
-            if run_diamond(hit_file, swissprot_xml):
-                print(" search done", end='')
+            if run_diamond(hit_file, swissprot_xml, swissprot_db, evalue, threads, use_diamond):
+                print(" search done", end='', flush=True)
             else:
-                print(" search FAILED")
+                print(" search FAILED", flush=True)
                 continue
 
         # Parse annotations
@@ -234,45 +235,66 @@ def annotate_locus_hits(locus_id, position_to_protein):
             }
             all_annotations.append(annot_record)
 
-        print(f" - {len(annotations)} proteins annotated")
+        print(f" - {len(annotations)} proteins annotated", flush=True)
 
     return all_annotations
 
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Annotate flanking proteins with SwissProt",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument('--synteny-dir', required=True, type=Path,
+                        help='Path to 02_synteny_blocks directory')
+    parser.add_argument('--swissprot-db', required=True, type=Path,
+                        help='Path to SwissProt DIAMOND database (.dmnd)')
+    parser.add_argument('--output-dir', required=True, type=Path,
+                        help='Output directory for annotations')
+    parser.add_argument('--evalue', type=str, default="1e-5",
+                        help='E-value threshold (default: 1e-5)')
+    parser.add_argument('--threads', type=int, default=16,
+                        help='Number of threads for DIAMOND (default: 16)')
+
+    return parser.parse_args()
+
 def main():
     """Main execution function."""
-    print("DEBUG: Entered main() function", flush=True)
-    print("DEBUG: About to print header", flush=True)
+    args = parse_args()
+
     print("=" * 80, flush=True)
     print("STEP 07: SWISSPROT ANNOTATION OF HIT SEQUENCES", flush=True)
     print("=" * 80, flush=True)
+    print(f"\nInput files:")
+    print(f"  Synteny directory: {args.synteny_dir}")
+    print(f"  SwissProt database: {args.swissprot_db}")
+    print(f"  Output directory: {args.output_dir}")
+    print(f"\nParameters:")
+    print(f"  E-value threshold: {args.evalue}")
+    print(f"  Threads: {args.threads}")
 
     # Create output directory
-    print("DEBUG: About to create output directory", flush=True)
-    config.STEP07_SWISSPROT.mkdir(exist_ok=True, parents=True)
-    print("DEBUG: Created output directory", flush=True)
+    args.output_dir.mkdir(exist_ok=True, parents=True)
 
-    # Load locus definitions
-    print("\n[1] Loading locus definitions...", flush=True)
-    loci_df = pd.read_csv(config.LOCI_DEFINITIONS_FILE, sep='\t')
-    loci = loci_df['locus_id'].tolist()
-    print(f"  Loaded {len(loci)} loci", flush=True)
+    # Determine if using DIAMOND based on file extension
+    use_diamond = str(args.swissprot_db).endswith('.dmnd')
+    db_type = "DIAMOND (.dmnd)" if use_diamond else "BLAST"
 
     # Check if SwissProt database exists
-    print("\n[2] Checking SwissProt database...", flush=True)
-    if config.USE_DIAMOND:
-        db_exists = config.SWISSPROT_DB.exists()
-        db_type = "DIAMOND (.dmnd)"
+    print("\n[1] Checking SwissProt database...", flush=True)
+    if use_diamond:
+        db_exists = args.swissprot_db.exists()
     else:
-        db_exists = (Path(str(config.SWISSPROT_DB).replace('.dmnd', '') + ".phr").exists() or
-                     Path(str(config.SWISSPROT_DB).replace('.dmnd', '') + ".fasta").exists())
-        db_type = "BLAST"
+        db_exists = (Path(str(args.swissprot_db) + ".phr").exists() or
+                     args.swissprot_db.exists())
 
     print(f"  Using {db_type} database", flush=True)
 
     if not db_exists:
-        print(f"  WARNING: SwissProt database not found: {config.SWISSPROT_DB}")
-        print("  Skipping SwissProt annotation...")
-        if config.USE_DIAMOND:
+        print(f"  WARNING: SwissProt database not found: {args.swissprot_db}", flush=True)
+        print("  Skipping SwissProt annotation...", flush=True)
+        if use_diamond:
             print("\n  NOTE: Install DIAMOND SwissProt database:")
             print("    1. Download: ftp://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz")
             print("    2. Extract: gunzip uniprot_sprot.fasta.gz")
@@ -281,24 +303,39 @@ def main():
             print("\n  NOTE: Install SwissProt for functional annotations:")
             print("    1. Download: ftp://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz")
             print("    2. Extract and format: makeblastdb -in uniprot_sprot.fasta -dbtype prot")
-        print("    3. Update config.py with database path")
         return
 
+    # Load locus definitions from synteny directory
+    print("\n[2] Loading locus definitions...", flush=True)
+    loci_def_file = args.synteny_dir.parent / "locus_definitions.tsv"
+
+    if not loci_def_file.exists():
+        print(f"  ERROR: Locus definitions not found: {loci_def_file}", flush=True)
+        print("  Expected at parent of synteny-dir", flush=True)
+        return
+
+    loci_df = pd.read_csv(loci_def_file, sep='\t')
+    loci = loci_df['locus_id'].tolist()
+    print(f"  Loaded {len(loci)} loci", flush=True)
+
     # Process each locus
-    print("\n[3] Annotating hit sequences...")
+    print("\n[3] Annotating hit sequences...", flush=True)
     all_annotations = []
 
     for locus_id in loci:
         # Load position → protein mapping for this locus
         position_to_protein = load_flanking_protein_mapping(locus_id, loci_df)
-        print(f"  Loaded {len(position_to_protein)} protein position mappings for {locus_id}")
+        print(f"  Loaded {len(position_to_protein)} protein position mappings for {locus_id}", flush=True)
 
-        locus_annotations = annotate_locus_hits(locus_id, position_to_protein)
+        locus_annotations = annotate_locus_hits(
+            locus_id, position_to_protein, args.synteny_dir, args.output_dir,
+            args.swissprot_db, args.evalue, args.threads, use_diamond
+        )
         all_annotations.extend(locus_annotations)
 
     # Save all annotations
-    print("\n[4] Saving annotations...")
-    output_file = config.STEP07_SWISSPROT / "genome_specific_swissprot_annotations.tsv"
+    print("\n[4] Saving annotations...", flush=True)
+    output_file = args.output_dir / "genome_specific_swissprot_annotations.tsv"
 
     if all_annotations:
         annot_df = pd.DataFrame(all_annotations)
@@ -329,14 +366,12 @@ def main():
         print(f"  No annotations found, created empty file: {output_file.name}")
 
     # Overall summary
-    print("\n" + "=" * 80)
-    print("SWISSPROT ANNOTATION COMPLETE")
-    print("=" * 80)
-    print(f"\nAnnotations saved to: {config.STEP07_SWISSPROT}")
-    print(f"Output file: {output_file.name}")
-    print("\nNext step: 08a_generate_locus_matrices.py")
+    print("\n" + "=" * 80, flush=True)
+    print("SWISSPROT ANNOTATION COMPLETE", flush=True)
+    print("=" * 80, flush=True)
+    print(f"\nAnnotations saved to: {args.output_dir}", flush=True)
+    print(f"Output file: {output_file.name}", flush=True)
+    print("\nNext step: 08a_generate_locus_matrices.py", flush=True)
 
 if __name__ == "__main__":
-    print("DEBUG: In __main__ block, about to call main()", flush=True)
     main()
-    print("DEBUG: main() returned", flush=True)
