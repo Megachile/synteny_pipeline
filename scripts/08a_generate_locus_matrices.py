@@ -6,20 +6,32 @@ Creates one matrix per locus showing:
 - All genomes (rows) sorted by phylogenetic order
 - Flanking protein presence/absence with SwissProt annotations
 - Target gene status (length + functional/pseudogene)
+
+Usage:
+    python 08a_generate_locus_matrices.py \\
+        --locus-defs <path/to/locus_definitions.tsv> \\
+        --synteny-dir <path/to/02_synteny_blocks> \\
+        --blocks <path/to/synteny_blocks_filtered.tsv> \\
+        --targets <path/to/all_targets_classified.tsv> \\
+        --swissprot <path/to/genome_specific_swissprot_annotations.tsv> \\
+        --reference-proteins <path/to/protein.faa> \\
+        --species-map <path/to/gca_to_species.tsv> \\
+        --output-dir <path/to/output/matrices>
 """
 
 from pathlib import Path
 import pandas as pd
 from collections import OrderedDict
-import config
+import argparse
+import sys
 
-def get_protein_names_from_faa():
+def get_protein_names_from_faa(proteins_file):
     """Extract protein names from protein.faa for better column headers."""
     protein_names = {}
 
     from Bio import SeqIO
 
-    for record in SeqIO.parse(config.BK_PROTEINS_FILE, "fasta"):
+    for record in SeqIO.parse(proteins_file, "fasta"):
         # Parse header: >XP_033228127.1 low density lipoprotein receptor adapter protein 1-like [Belonocnema kinseyi]
         protein_id = record.id
         description = record.description
@@ -47,12 +59,12 @@ def get_protein_names_from_faa():
 
     return protein_names
 
-def load_species_and_phylo():
+def load_species_and_phylo(species_map_file):
     """Load species mapping and phylogenetic order."""
     species_map = {}
     phylo_order_map = {}
 
-    with open(config.SPECIES_MAP_FILE) as f:
+    with open(species_map_file) as f:
         header = f.readline()  # Skip header
         for line in f:
             parts = line.strip().split('\t')
@@ -106,14 +118,17 @@ def parse_flanking_proteins_from_faa(flanking_file):
 
     return protein_ids, protein_names
 
-def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_df, flanking_df, species_map, phylo_order_map, protein_names):
+def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_df, flanking_df, species_map, phylo_order_map, protein_names, synteny_dir):
     """Create matrix for one locus."""
 
     print(f"\n  Processing {locus_id}...")
 
-    # Get locus details
-    gene_family = locus_info['gene_family']
-    flanking_file = Path(locus_info['flanking_file'])
+    # Derive gene family from locus_id (e.g., "BK_chr2_a" -> "ferritin" or use locus_id)
+    # If gene_family column exists in locus_info, use it; otherwise use locus_id
+    gene_family = locus_info.get('gene_family', locus_id.split('_')[0] if '_' in locus_id else locus_id)
+
+    # Construct flanking file path from Phase 2 outputs
+    flanking_file = synteny_dir / locus_id / f"{locus_id}_flanking_filtered.faa"
 
     # Parse flanking proteins from .faa file
     flanking_protein_ids, flanking_protein_names = parse_flanking_proteins_from_faa(flanking_file)
@@ -126,7 +141,10 @@ def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_d
     total_expected = len(flanking_protein_ids)
 
     # Get blocks for this locus
-    locus_blocks = blocks_df[blocks_df['locus_id'] == locus_id]
+    if not blocks_df.empty and 'locus_id' in blocks_df.columns:
+        locus_blocks = blocks_df[blocks_df['locus_id'] == locus_id]
+    else:
+        locus_blocks = pd.DataFrame()
 
     # Index SwissProt annotations
     swissprot_map = {}
@@ -328,35 +346,70 @@ def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_d
 
     return pd.DataFrame()  # Empty if no data
 
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Generate locus-specific matrices with flanking proteins and SwissProt annotations",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument('--locus-defs', required=True, type=Path,
+                        help='Path to locus_definitions.tsv')
+    parser.add_argument('--synteny-dir', required=True, type=Path,
+                        help='Path to 02_synteny_blocks directory')
+    parser.add_argument('--blocks', type=Path,
+                        help='Path to synteny_blocks_filtered.tsv (optional)')
+    parser.add_argument('--targets', type=Path,
+                        help='Path to all_targets_classified.tsv (optional)')
+    parser.add_argument('--swissprot', type=Path,
+                        help='Path to genome_specific_swissprot_annotations.tsv (optional)')
+    parser.add_argument('--reference-proteins', required=True, type=Path,
+                        help='Path to reference protein.faa file (for column headers)')
+    parser.add_argument('--species-map', required=True, type=Path,
+                        help='Path to gca_to_species.tsv')
+    parser.add_argument('--output-dir', required=True, type=Path,
+                        help='Output directory for matrices')
+
+    return parser.parse_args()
+
 def main():
     """Main execution function."""
+    args = parse_args()
+
     print("=" * 80)
     print("STEP 08a: GENERATE LOCUS-SPECIFIC MATRICES")
     print("=" * 80)
+    print(f"\nInput files:")
+    print(f"  Locus definitions: {args.locus_defs}")
+    print(f"  Synteny directory: {args.synteny_dir}")
+    print(f"  Blocks: {args.blocks if args.blocks else 'None'}")
+    print(f"  Targets: {args.targets if args.targets else 'None'}")
+    print(f"  SwissProt: {args.swissprot if args.swissprot else 'None'}")
+    print(f"  Reference proteins: {args.reference_proteins}")
+    print(f"  Species map: {args.species_map}")
+    print(f"  Output directory: {args.output_dir}")
 
     # Create output directory
-    config.LOCUS_MATRICES_DIR.mkdir(exist_ok=True, parents=True)
+    args.output_dir.mkdir(exist_ok=True, parents=True)
 
     # Load all required data
     print("\n[1] Loading data...")
 
     # Locus definitions
-    loci_df = pd.read_csv(config.LOCI_DEFINITIONS_FILE, sep='\t')
+    loci_df = pd.read_csv(args.locus_defs, sep='\t')
     print(f"  Loaded {len(loci_df)} locus definitions")
 
     # Filtered synteny blocks
-    blocks_file = config.STEP03_FILTERED / "synteny_blocks_filtered.tsv"
-    if blocks_file.exists():
-        blocks_df = pd.read_csv(blocks_file, sep='\t')
+    if args.blocks and args.blocks.exists():
+        blocks_df = pd.read_csv(args.blocks, sep='\t')
         print(f"  Loaded {len(blocks_df)} synteny blocks")
     else:
         blocks_df = pd.DataFrame()
         print("  No synteny blocks found")
 
     # Classified targets
-    targets_file = config.STEP05_CLASSIFIED / "all_targets_classified.tsv"
-    if targets_file.exists():
-        targets_df = pd.read_csv(targets_file, sep='\t')
+    if args.targets and args.targets.exists():
+        targets_df = pd.read_csv(args.targets, sep='\t')
         # Filter to syntenic only for main column
         syntenic_targets = targets_df[targets_df['placement'] == 'synteny']
         print(f"  Loaded {len(syntenic_targets)} syntenic targets")
@@ -365,20 +418,19 @@ def main():
         print("  No classified targets found")
 
     # SwissProt annotations
-    swissprot_file = config.STEP07_SWISSPROT / "genome_specific_swissprot_annotations.tsv"
-    if swissprot_file.exists():
-        swissprot_df = pd.read_csv(swissprot_file, sep='\t')
+    if args.swissprot and args.swissprot.exists():
+        swissprot_df = pd.read_csv(args.swissprot, sep='\t')
         print(f"  Loaded {len(swissprot_df)} SwissProt annotations")
     else:
         swissprot_df = pd.DataFrame()
         print("  No SwissProt annotations found")
 
     # Species mapping
-    species_map, phylo_order_map = load_species_and_phylo()
+    species_map, phylo_order_map = load_species_and_phylo(args.species_map)
     print(f"  Loaded species mapping for {len(species_map)} genomes")
 
     # Get protein names for better column headers
-    protein_names = get_protein_names_from_faa()
+    protein_names = get_protein_names_from_faa(args.reference_proteins)
     print(f"  Loaded protein names for {len(protein_names)} proteins")
 
     # Process each locus
@@ -388,7 +440,7 @@ def main():
         locus_id = locus_info['locus_id']
 
         # Load flanking protein details if available
-        flanking_file = config.STEP02_SYNTENY / locus_id / "flanking_blast_all.tsv"
+        flanking_file = args.synteny_dir / locus_id / "flanking_blast_all.tsv"
         if flanking_file.exists():
             flanking_df = pd.read_csv(flanking_file, sep='\t')
         else:
@@ -397,12 +449,13 @@ def main():
         # Create matrix
         matrix_df = create_locus_matrix(
             locus_id, locus_info, blocks_df, syntenic_targets,
-            swissprot_df, flanking_df, species_map, phylo_order_map, protein_names
+            swissprot_df, flanking_df, species_map, phylo_order_map, protein_names,
+            args.synteny_dir
         )
 
         if not matrix_df.empty:
             # Save matrix
-            output_file = config.LOCUS_MATRICES_DIR / f"{locus_id}_genome_swissprot_matrix.tsv"
+            output_file = args.output_dir / f"{locus_id}_genome_swissprot_matrix.tsv"
             matrix_df.to_csv(output_file, sep='\t', index=False)
 
             print(f"    Saved: {output_file.name}")
@@ -420,8 +473,8 @@ def main():
     print("\n" + "=" * 80)
     print("LOCUS MATRICES COMPLETE")
     print("=" * 80)
-    print(f"\nMatrices saved to: {config.LOCUS_MATRICES_DIR}")
-    print("\nNext step: 07b_generate_summary_matrices.py")
+    print(f"\nMatrices saved to: {args.output_dir}")
+    print("\nNext step: 08b_generate_summary_matrices.py")
 
 if __name__ == "__main__":
     main()
