@@ -111,16 +111,12 @@ def load_target_sequences(genome_id, parent_locus, output_dir):
 
     return sequences
 
-def classify_targets(targets_df, blocks_df, targets_dir, bk_proteins_file, min_length):
-    """Classify each target as syntenic or unplaceable with quality assessment."""
+def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bitscore):
+    """Classify each target as syntenic or unplaceable based on proximity to synteny blocks.
 
-    # Load reference protein sequences to get lengths
-    from Bio import SeqIO
-    ref_proteins = {}
-    if bk_proteins_file.exists():
-        for record in SeqIO.parse(bk_proteins_file, "fasta"):
-            ref_proteins[record.id] = len(record.seq)
-    
+    Quality assessment happens AFTER Exonerate extraction (Phase 6).
+    """
+
     # Index synteny blocks by (genome, scaffold) for fast lookup
     synteny_index = defaultdict(list)
     for _, block in blocks_df.iterrows():
@@ -137,69 +133,36 @@ def classify_targets(targets_df, blocks_df, targets_dir, bk_proteins_file, min_l
         assigned_to = None
         for block in candidate_blocks:
             # Check proximity - accept ANY target hit near synteny block
-            # (don't filter by locus_id - BLAST e-values can be fickle)
             if check_proximity(target, block):
                 assigned_to = block['locus_id']
                 break
 
         if assigned_to:
+            # Syntenic hit - keep regardless of strength
             classification = {
                 **target.to_dict(),
                 'placement': 'synteny',
                 'assigned_to': assigned_to,
-                'description': assigned_to  # For compatibility with matrix script
+                'parent_locus': assigned_to,  # For downstream compatibility
+                'description': assigned_to
             }
+            classifications.append(classification)
         else:
-            classification = {
-                **target.to_dict(),
-                'placement': 'unplaceable',
-                'assigned_to': f"{target['gene_family']}_unplaceable",
-                'description': f"{target['gene_family']}_unplaceable"
-            }
+            # Unplaceable hit - apply strict filters
+            evalue = target.get('best_evalue', 1.0)
+            bitscore = target.get('bitscore', 0) if 'bitscore' in target else target.get('best_bitscore', 0)
 
-        # Load target sequences for quality assessment
-        genome_sequences = load_target_sequences(
-            target['genome'],
-            target['parent_locus'],
-            targets_dir
-        )
-
-        # Get reference protein length
-        query_id = target.get('query_id', target.get('gene_id', ''))
-        ref_length = ref_proteins.get(query_id, 300)  # Default 300aa if not found
-
-        # Find matching HSP sequence
-        hsp_seq = None
-        pident = target.get('pident', 0)
-        for seq_id, seq in genome_sequences.items():
-            if query_id in seq_id or target['gene_family'] in seq_id:
-                hsp_seq = seq
-                break
-
-        # Assess quality
-        if hsp_seq:
-            status, quality_flag, has_stops = assess_target_quality(hsp_seq, ref_length, pident, min_length)
-            hsp_length = len(hsp_seq.replace('-', ''))
-            coverage_pct = (hsp_length / ref_length * 100) if ref_length > 0 else 0
-        else:
-            # Fallback to coordinate-based estimate
-            orf_length_nt = target['end'] - target['start'] + 1
-            hsp_length = orf_length_nt // 3
-            status = 'uncertain'
-            quality_flag = 'no_hsp_sequence'
-            has_stops = False
-            coverage_pct = 0
-        
-        classification['orf_length_aa'] = hsp_length
-        classification['status'] = status
-        classification['quality_flag'] = quality_flag
-        classification['has_stop_codons'] = has_stops
-        classification['ref_length'] = ref_length
-        classification['coverage_pct'] = round(coverage_pct, 1)
-        classification['hsp_sequence'] = hsp_seq if hsp_seq else ""
-        classification['genome_id'] = target['genome']  # Alias for matrix script
-
-        classifications.append(classification)
+            # Only keep strong unplaceable hits
+            if evalue <= unplaceable_evalue and bitscore >= unplaceable_bitscore:
+                classification = {
+                    **target.to_dict(),
+                    'placement': 'unplaceable',
+                    'assigned_to': f"{target['gene_family']}_unplaceable",
+                    'parent_locus': f"{target['gene_family']}_unplaceable",  # For downstream compatibility
+                    'description': f"{target['gene_family']}_unplaceable"
+                }
+                classifications.append(classification)
+            # Weak hits are silently filtered (not included in output)
 
     return pd.DataFrame(classifications)
 
@@ -218,6 +181,10 @@ def parse_args():
                         help='Output directory for classified targets')
     parser.add_argument('--min-length', type=int, default=30,
                         help='Minimum ORF length in amino acids (default: 30)')
+    parser.add_argument('--unplaceable-evalue', type=float, default=1e-10,
+                        help='E-value threshold for unplaceable targets (default: 1e-10)')
+    parser.add_argument('--unplaceable-bitscore', type=float, default=100,
+                        help='Bitscore threshold for unplaceable targets (default: 100)')
 
     return parser.parse_args()
 
@@ -233,7 +200,8 @@ def main():
     print(f"  Synteny blocks: {args.blocks}")
     print(f"  Output directory: {args.output_dir}")
     print(f"\nParameters:")
-    print(f"  Minimum ORF length: {args.min_length} aa")
+    print(f"  Unplaceable e-value threshold: {args.unplaceable_evalue}")
+    print(f"  Unplaceable bitscore threshold: {args.unplaceable_bitscore}")
 
     # Create output directory
     args.output_dir.mkdir(exist_ok=True, parents=True)
@@ -266,11 +234,24 @@ def main():
 
     # Classify targets
     print("\n[3] Classifying targets...", flush=True)
-    classified_df = classify_targets(targets_df, blocks_df, targets_dir, bk_proteins_file, args.min_length)
+    print(f"  Unplaceable filters: e-value <= {args.unplaceable_evalue}, bitscore >= {args.unplaceable_bitscore}")
+
+    classified_df = classify_targets(
+        targets_df,
+        blocks_df,
+        args.unplaceable_evalue,
+        args.unplaceable_bitscore
+    )
+
+    if len(classified_df) == 0:
+        print("  No targets passed classification filters!", flush=True)
+        return
 
     syntenic = classified_df[classified_df['placement'] == 'synteny']
     unplaceable = classified_df[classified_df['placement'] == 'unplaceable']
 
+    print(f"  Input targets: {len(targets_df)}")
+    print(f"  After filtering: {len(classified_df)} ({len(classified_df)/len(targets_df)*100:.1f}%)")
     print(f"  Syntenic: {len(syntenic)} ({len(syntenic)/len(classified_df)*100:.1f}%)")
     print(f"  Unplaceable: {len(unplaceable)} ({len(unplaceable)/len(classified_df)*100:.1f}%)")
 
@@ -293,22 +274,16 @@ def main():
     print(f"  Saved unplaceable: {unplaceable_file.name}", flush=True)
 
     # Summary by locus
-    print("\n[5] Summary by locus:")
-    for parent_locus in classified_df['parent_locus'].unique():
-        locus_targets = classified_df[classified_df['parent_locus'] == parent_locus]
+    print("\n[5] Summary by assigned locus:")
+    for assigned_locus in sorted(classified_df['assigned_to'].unique()):
+        locus_targets = classified_df[classified_df['assigned_to'] == assigned_locus]
         locus_syntenic = locus_targets[locus_targets['placement'] == 'synteny']
         locus_unplaceable = locus_targets[locus_targets['placement'] == 'unplaceable']
 
-        print(f"\n  {parent_locus}:")
+        print(f"\n  {assigned_locus}:")
         print(f"    Total targets: {len(locus_targets)}")
-        print(f"    Syntenic: {len(locus_syntenic)} ({len(locus_syntenic)/len(locus_targets)*100:.1f}%)")
-        print(f"    Unplaceable: {len(locus_unplaceable)} ({len(locus_unplaceable)/len(locus_targets)*100:.1f}%)")
-
-        # Functional status
-        functional = locus_targets[locus_targets['status'] == 'functional']
-        pseudo = locus_targets[locus_targets['status'] == 'pseudogene']
-        print(f"    Functional: {len(functional)} ({len(functional)/len(locus_targets)*100:.1f}%)")
-        print(f"    Pseudogenes: {len(pseudo)} ({len(pseudo)/len(locus_targets)*100:.1f}%)")
+        print(f"    Syntenic: {len(locus_syntenic)}")
+        print(f"    Unplaceable: {len(locus_unplaceable)}")
 
     # Overall summary
     print("\n" + "=" * 80, flush=True)
@@ -318,11 +293,8 @@ def main():
     print(f"Syntenic: {len(syntenic)} ({len(syntenic)/len(classified_df)*100:.1f}%)", flush=True)
     print(f"Unplaceable: {len(unplaceable)} ({len(unplaceable)/len(classified_df)*100:.1f}%)", flush=True)
 
-    functional = classified_df[classified_df['status'] == 'functional']
-    print(f"Functional: {len(functional)} ({len(functional)/len(classified_df)*100:.1f}%)", flush=True)
-
     print(f"\nOutputs saved to: {args.output_dir}", flush=True)
-    print("\nNext step: 06_extract_sequences.py", flush=True)
+    print("\nNext step: 06_extract_sequences.py (Exonerate will extract full gene structures)", flush=True)
 
 if __name__ == "__main__":
     main()

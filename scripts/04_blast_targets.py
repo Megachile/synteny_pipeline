@@ -210,6 +210,8 @@ def parse_args():
                         help='Maximum BLAST targets per query (default: 10000)')
     parser.add_argument('--threads', type=int, default=16,
                         help='Number of threads for BLAST (default: 16)')
+    parser.add_argument('--gene-family', type=str, default='unknown',
+                        help='Gene family name for these targets (default: unknown)')
 
     return parser.parse_args()
 
@@ -319,59 +321,55 @@ def main():
     # Infer gap_kb from config or use default
     gap_kb = 50  # Default clustering gap
 
-    # Assign hits to loci and track best matches
-    print("\n[6] Assigning hits to loci...", flush=True)
+    # Process all hits - NO per-locus duplication
+    print("\n[6] Clustering target hits (frame-aware)...", flush=True)
     all_target_loci = []
 
-    for _, locus_row in loci_df.iterrows():
-        locus_id = locus_row['locus_id']
-        gene_family = locus_row['gene_family']
-        expected_protein = locus_to_protein.get(locus_id)
+    for genome_name, hits in genome_hits.items():
+        if not hits:
+            continue
 
-        print(f"\n  Processing {locus_id} (expects {expected_protein})...", flush=True)
+        print(f"  Processing {genome_name}: {len(hits)} hits", flush=True)
 
-        locus_output = args.output_dir / locus_id
-        locus_output.mkdir(exist_ok=True, parents=True)
+        # Filter multi-frame artifacts: keep only best frame per genomic location
+        hits_by_location = defaultdict(list)
+        for hit in hits:
+            # Group by scaffold + approximate location (5kb bins)
+            location_key = (hit['scaffold'], hit['start'] // 5000)
+            hits_by_location[location_key].append(hit)
 
-        # Collect all hits for this locus across genomes
-        for genome_name, hits in genome_hits.items():
-            # Filter to hits for this locus's expected protein
-            # BUT also check for query mismatches (hits to other proteins)
-            locus_hits = []
-            query_mismatches = []
-
-            for hit in hits:
-                if hit['query_id'] == expected_protein:
-                    locus_hits.append(hit)
+        filtered_hits = []
+        for location_key, location_hits in hits_by_location.items():
+            if len(location_hits) == 1:
+                filtered_hits.append(location_hits[0])
+            else:
+                # Multiple hits at same location - check if multi-frame artifacts
+                frames = {h['frame'] for h in location_hits}
+                if len(frames) > 1:
+                    # Multi-frame artifact - keep only strongest
+                    best_hit = min(location_hits, key=lambda h: h['evalue'])
+                    filtered_hits.append(best_hit)
+                    print(f"    Multi-frame artifact at {location_key}: kept frame {best_hit['frame']} (e-value {best_hit['evalue']:.2e}), filtered {len(location_hits)-1} others", flush=True)
                 else:
-                    # Track hits to other query proteins (potential ortho-paralogs)
-                    query_mismatches.append(hit)
+                    # Same frame, might be legitimate multi-exon hits
+                    filtered_hits.extend(location_hits)
 
-            if not locus_hits:
-                continue
+        print(f"    After multi-frame filtering: {len(filtered_hits)} hits", flush=True)
 
-            # Cluster hits into target loci (min_hits=1 for single-protein targets)
-            target_loci = cluster_into_loci(locus_hits, locus_id, gene_family, gap_kb, min_hits=1)
+        # Cluster hits by query protein
+        for query_id in {h['query_id'] for h in filtered_hits}:
+            query_hits = [h for h in filtered_hits if h['query_id'] == query_id]
+
+            # Create a locus_id placeholder (will be assigned by Phase 5)
+            locus_id_placeholder = f"{query_id.split('.')[0]}_targets"
+
+            # Cluster into loci (min_hits=1 for single-protein targets)
+            target_loci = cluster_into_loci(query_hits, locus_id_placeholder, args.gene_family, gap_kb, min_hits=1)
 
             for target_locus in target_loci:
                 target_locus['genome'] = genome_name
-                target_locus['parent_locus'] = locus_id
-                target_locus['expected_query'] = expected_protein
-                target_locus['query_matched'] = expected_protein  # Matches as expected
-
-                # Check if there are strong hits to other queries in this region
-                region_mismatches = [h for h in query_mismatches if
-                                   h['scaffold'] == target_locus['scaffold'] and
-                                   h['start'] >= target_locus['start'] - 50000 and
-                                   h['end'] <= target_locus['end'] + 50000]
-
-                if region_mismatches:
-                    best_mismatch = max(region_mismatches, key=lambda x: x['bitscore'])
-                    target_locus['also_matches'] = best_mismatch['query_id']
-                    target_locus['mismatch_bitscore'] = best_mismatch['bitscore']
-                else:
-                    target_locus['also_matches'] = None
-                    target_locus['mismatch_bitscore'] = None
+                target_locus['query_id'] = query_id
+                # NO parent_locus assignment - Phase 5 will assign based on synteny proximity
 
                 all_target_loci.append(target_locus)
 
@@ -385,13 +383,12 @@ def main():
         print(f"  Saved {len(loci_df_out)} target loci to {loci_file.name}", flush=True)
 
         # Summary
-        print("\n[8] Summary by locus:", flush=True)
-        for parent_locus in sorted(loci_df_out['parent_locus'].unique()):
-            parent_loci = loci_df_out[loci_df_out['parent_locus'] == parent_locus]
-            genomes_with_targets = parent_loci['genome'].nunique()
-            total_loci = len(parent_loci)
-            with_mismatches = parent_loci['also_matches'].notna().sum()
-            print(f"  {parent_locus}: {total_loci} loci in {genomes_with_targets} genomes ({with_mismatches} with query mismatches)", flush=True)
+        print("\n[8] Summary by query protein:", flush=True)
+        for query_id in sorted(loci_df_out['query_id'].unique()):
+            query_loci = loci_df_out[loci_df_out['query_id'] == query_id]
+            genomes_with_targets = query_loci['genome'].nunique()
+            total_loci = len(query_loci)
+            print(f"  {query_id}: {total_loci} loci in {genomes_with_targets} genomes", flush=True)
     else:
         print("  No target loci found", flush=True)
 
