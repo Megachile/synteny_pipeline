@@ -5,11 +5,20 @@ Phase 1: Gene-level paralog discovery with isoform deduplication.
 Key improvements:
 1. Maps proteins to LOC IDs to handle isoforms properly
 2. Extracts flanking at GENE level (not protein level)
-3. Detects tandem duplications
-4. Names loci systematically by chromosome
+3. Detects tandem duplications among input LOCs
+4. Detects tandem duplications among paralogs
+5. Names loci systematically by chromosome
 
 Usage:
-    python 01_discover_paralogs_gene_level.py <LOC_or_protein_ID> <output_dir>
+    python 01_discover_paralogs_gene_level.py <LOC_ID(s)> <output_dir>
+
+    LOC_ID(s): Single LOC or comma-separated LOCs
+               Single: LOC117167432
+               Multiple: LOC117167432,LOC117167433,LOC117167434
+
+When multiple LOCs are provided, the script detects if any are tandem duplications
+(adjacent on the same chromosome) and groups them into clusters. One representative
+from each cluster is used for paralog discovery.
 """
 
 import sys
@@ -274,6 +283,58 @@ def find_paralogs_in_genome(query_protein_seq, genome_code, mapper):
     return hits, unique_genes
 
 
+def detect_input_tandem_clusters(input_locs, mapper, max_distance_kb=50):
+    """
+    Detect tandem clusters among input LOCs.
+
+    Returns list of clusters, where each cluster is a list of tandem LOCs.
+    Non-tandem LOCs are returned as single-element clusters.
+    """
+
+    # Get positions for all input LOCs
+    positions = {}
+    for loc in input_locs:
+        if loc in mapper.gene_positions:
+            chrom, start, end, strand = mapper.gene_positions[loc]
+            positions[loc] = {'chrom': chrom, 'start': start, 'end': end, 'strand': strand}
+        else:
+            print(f"  Warning: {loc} not found in BK genome")
+
+    # Sort by chromosome and position
+    sorted_locs = sorted(positions.keys(),
+                        key=lambda x: (positions[x]['chrom'], positions[x]['start']))
+
+    # Cluster tandem genes
+    clusters = []
+    current_cluster = []
+
+    for i, loc in enumerate(sorted_locs):
+        if not current_cluster:
+            current_cluster.append(loc)
+        else:
+            prev_loc = current_cluster[-1]
+
+            # Check if on same chromosome and within max distance
+            if (positions[loc]['chrom'] == positions[prev_loc]['chrom'] and
+                abs(positions[loc]['start'] - positions[prev_loc]['end']) < max_distance_kb * 1000):
+                current_cluster.append(loc)
+            else:
+                # Start new cluster
+                clusters.append(current_cluster)
+                current_cluster = [loc]
+
+    # Add final cluster
+    if current_cluster:
+        clusters.append(current_cluster)
+
+    # Add any LOCs that weren't in positions as single-element clusters
+    for loc in input_locs:
+        if loc not in positions:
+            clusters.append([loc])
+
+    return clusters
+
+
 def detect_tandems(target_genes, flanking_genes):
     """Detect tandem duplications where targets appear in flanking."""
 
@@ -334,17 +395,23 @@ def name_locus(genome_code, chromosome, locus_number):
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python 01_discover_paralogs_gene_level.py <LOC_or_protein_ID> <output_dir>")
+        print("Usage: python 01_discover_paralogs_gene_level.py <LOC_ID(s)> <output_dir>")
+        print("  LOC_ID(s): Single LOC or comma-separated LOCs (e.g., 'LOC117167432' or 'LOC117167432,LOC117167433')")
         sys.exit(1)
 
-    target_id = sys.argv[1]
+    target_input = sys.argv[1]
     output_dir = Path(sys.argv[2])
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Parse input LOCs (may be comma-separated)
+    input_locs = [loc.strip() for loc in target_input.split(',')]
 
     print("="*80)
     print("GENE-LEVEL PARALOG DISCOVERY WITH SYNTENY")
     print("="*80)
-    print(f"\nTarget: {target_id}")
+    print(f"\nInput LOCs: {len(input_locs)}")
+    for loc in input_locs:
+        print(f"  - {loc}")
     print(f"Output: {output_dir}")
 
     # Step 1: Build mappers for all genomes
@@ -353,13 +420,41 @@ def main():
     for genome_code, info in LANDMARKS.items():
         mappers[genome_code] = GenomicMapper(genome_code, info.get('gff'), info.get('proteome'))
 
-    # Step 2: Find query protein in BK
+    # Step 1b: Detect tandem clusters among input LOCs
+    print("\n[1b] Detecting tandem clusters in input LOCs...")
+    bk_mapper = mappers['BK']
+    tandem_clusters = detect_input_tandem_clusters(input_locs, bk_mapper)
+
+    print(f"  Found {len(tandem_clusters)} clusters:")
+    for i, cluster in enumerate(tandem_clusters):
+        if len(cluster) > 1:
+            print(f"    Cluster {i+1} (TANDEM): {', '.join(cluster)}")
+        else:
+            print(f"    Cluster {i+1}: {cluster[0]}")
+
+    # Use first LOC from each cluster as representative
+    representative_locs = [cluster[0] for cluster in tandem_clusters]
+    print(f"\n  Using {len(representative_locs)} representatives for paralog discovery")
+
+    # Save tandem clustering info
+    cluster_info = {
+        'input_locs': input_locs,
+        'clusters': [[loc for loc in cluster] for cluster in tandem_clusters],
+        'representatives': representative_locs,
+        'tandem_cluster_count': sum(1 for c in tandem_clusters if len(c) > 1)
+    }
+    with open(output_dir / "input_tandem_clusters.json", 'w') as f:
+        json.dump(cluster_info, f, indent=2)
+
+    # Step 2: Find query protein in BK for first representative
     print("\n[2] Finding query protein...")
     query_protein = None
     query_gene = None
 
     bk_proteome = SeqIO.to_dict(SeqIO.parse(LANDMARKS['BK']['proteome'], 'fasta'))
 
+    # Use first representative LOC for paralog discovery
+    target_id = representative_locs[0]
     if target_id.startswith('LOC'):
         # Find a protein for this LOC
         for protein_id in mappers['BK'].gene_to_proteins.get(target_id, []):
