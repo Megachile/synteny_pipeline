@@ -6,19 +6,27 @@ Creates summary matrices by gene family showing:
 - All genomes (rows) sorted by phylogenetic order
 - All loci of that gene family (columns)
 - Includes both syntenic and unplaceable targets
+
+Usage:
+    python 08b_generate_summary_matrices.py \\
+        --locus-defs <path/to/locus_definitions.tsv> \\
+        --blocks <path/to/synteny_blocks_filtered.tsv> \\
+        --targets <path/to/all_targets_classified.tsv> \\
+        --species-map <path/to/gca_to_species.tsv> \\
+        --output-dir <path/to/gene_type_summaries>
 """
 
 from pathlib import Path
 import pandas as pd
 from collections import OrderedDict, defaultdict
-import config
+import argparse
 
-def load_species_and_phylo():
+def load_species_and_phylo(species_map_file):
     """Load species mapping and phylogenetic order."""
     species_map = {}
     phylo_order_map = {}
 
-    with open(config.SPECIES_MAP_FILE) as f:
+    with open(species_map_file) as f:
         header = f.readline()  # Skip header
         for line in f:
             parts = line.strip().split('\t')
@@ -118,42 +126,68 @@ def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_bl
 
     return pd.DataFrame()
 
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Generate gene-type summary matrices",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument('--locus-defs', required=True, type=Path,
+                        help='Path to locus_definitions.tsv with gene_family column')
+    parser.add_argument('--blocks', type=Path,
+                        help='Path to synteny_blocks_filtered.tsv (optional)')
+    parser.add_argument('--targets', type=Path,
+                        help='Path to all_targets_classified.tsv (optional)')
+    parser.add_argument('--species-map', required=True, type=Path,
+                        help='Path to gca_to_species.tsv')
+    parser.add_argument('--output-dir', required=True, type=Path,
+                        help='Output directory for summary matrices')
+
+    return parser.parse_args()
+
 def main():
     """Main execution function."""
+    args = parse_args()
+
     print("=" * 80)
-    print("STEP 07b: GENERATE GENE-TYPE SUMMARY MATRICES")
+    print("STEP 08b: GENERATE GENE-TYPE SUMMARY MATRICES")
     print("=" * 80)
+    print(f"\nInput files:")
+    print(f"  Locus definitions: {args.locus_defs}")
+    print(f"  Synteny blocks: {args.blocks if args.blocks else 'None'}")
+    print(f"  Targets: {args.targets if args.targets else 'None'}")
+    print(f"  Species map: {args.species_map}")
+    print(f"  Output directory: {args.output_dir}")
 
     # Create output directory
-    config.SUMMARY_MATRICES_DIR.mkdir(exist_ok=True, parents=True)
+    args.output_dir.mkdir(exist_ok=True, parents=True)
 
     # Load all required data
     print("\n[1] Loading data...")
 
     # Locus definitions
-    loci_df = pd.read_csv(config.LOCI_DEFINITIONS_FILE, sep='\t')
+    loci_df = pd.read_csv(args.locus_defs, sep='\t')
     print(f"  Loaded {len(loci_df)} locus definitions")
 
     # Load synteny blocks to track presence/absence
-    synteny_blocks_file = config.STEP03_FILTERED / "synteny_blocks_filtered.tsv"
-    if synteny_blocks_file.exists():
-        synteny_blocks_df = pd.read_csv(synteny_blocks_file, sep='\t')
+    if args.blocks and args.blocks.exists():
+        synteny_blocks_df = pd.read_csv(args.blocks, sep='\t')
         print(f"  Loaded {len(synteny_blocks_df)} synteny blocks")
     else:
         synteny_blocks_df = pd.DataFrame()
         print("  No synteny blocks found")
 
     # All classified targets (including unplaceable)
-    targets_file = config.STEP05_CLASSIFIED / "all_targets_classified.tsv"
-    if targets_file.exists():
-        all_targets_df = pd.read_csv(targets_file, sep='\t')
+    if args.targets and args.targets.exists():
+        all_targets_df = pd.read_csv(args.targets, sep='\t')
         print(f"  Loaded {len(all_targets_df)} classified targets")
     else:
         all_targets_df = pd.DataFrame()
         print("  No classified targets found")
 
     # Species mapping
-    species_map, phylo_order_map = load_species_and_phylo()
+    species_map, phylo_order_map = load_species_and_phylo(args.species_map)
     print(f"  Loaded species mapping for {len(species_map)} genomes")
 
     # Get unique gene families
@@ -175,7 +209,7 @@ def main():
 
         if not matrix_df.empty:
             # Save matrix
-            output_file = config.SUMMARY_MATRICES_DIR / f"{gene_family}_summary_matrix.tsv"
+            output_file = args.output_dir / f"{gene_family}_summary_matrix.tsv"
             matrix_df.to_csv(output_file, sep='\t', index=False)
 
             print(f"    Saved: {output_file.name}")
@@ -199,14 +233,11 @@ def main():
                 print(f"    Syntenic: {syntenic_count} ({syntenic_count/(syntenic_count+unplaceable_count)*100:.1f}%)")
                 print(f"    Unplaceable: {unplaceable_count} ({unplaceable_count/(syntenic_count+unplaceable_count)*100:.1f}%)")
 
-    # NOTE: "All genes combined summary" removed as it's redundant for single gene families
-    # and confusing for users. Each gene family has its own summary matrix.
-
     # Overall summary
     print("\n" + "=" * 80)
     print("SUMMARY MATRICES COMPLETE")
     print("=" * 80)
-    print(f"\nMatrices saved to: {config.SUMMARY_MATRICES_DIR}")
+    print(f"\nMatrices saved to: {args.output_dir}")
 
     if not all_targets_df.empty:
         print(f"\nOverall statistics:")
@@ -215,9 +246,7 @@ def main():
         print(f"  Unplaceable: {len(all_targets_df[all_targets_df['placement'] == 'unplaceable'])}")
         print(f"  Genomes with targets: {all_targets_df['genome'].nunique()}")
 
-    print("\nPipeline complete! Review outputs in:")
-    print(f"  - Locus matrices: {config.LOCUS_MATRICES_DIR}")
-    print(f"  - Summary matrices: {config.SUMMARY_MATRICES_DIR}")
+    print("\nPipeline complete!")
 
 if __name__ == "__main__":
     main()
