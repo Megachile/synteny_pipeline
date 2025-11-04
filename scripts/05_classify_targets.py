@@ -3,13 +3,20 @@
 Step 05: Classify target loci as syntenic or unplaceable.
 
 Checks if target loci overlap with synteny blocks to determine placement.
+
+Usage:
+    python 05_classify_targets.py \\
+        --targets <path/to/all_target_loci.tsv> \\
+        --blocks <path/to/synteny_blocks_filtered.tsv> \\
+        --output-dir <path/to/classified_targets> \\
+        [--min-length 30]
 """
 
 from pathlib import Path
 import pandas as pd
 from collections import defaultdict
 from Bio import SeqIO
-import config
+import argparse
 
 def check_proximity(target, block, max_distance_kb=500):
     """Check if target gene is near synteny block (within max_distance_kb).
@@ -38,39 +45,40 @@ def check_proximity(target, block, max_distance_kb=500):
 
     return distance <= max_distance_bp
 
-def assess_target_quality(hsp_seq, ref_length, pident):
+def assess_target_quality(hsp_seq, ref_length, pident, min_length):
     """
     Assess target quality from HSP sequence.
-    
+
     Args:
         hsp_seq: HSP protein sequence (with gaps)
         ref_length: Reference protein length
         pident: Percent identity
-    
+        min_length: Minimum ORF length to consider
+
     Returns:
         (status, quality_flag, has_stops) tuple
     """
     # Remove gaps
     clean_seq = hsp_seq.replace('-', '') if hsp_seq else ""
-    
+
     if not clean_seq:
         return "uncertain", "no_sequence", False
-    
+
     hsp_length = len(clean_seq)
     coverage = (hsp_length / ref_length * 100) if ref_length > 0 else 0
-    
+
     # Flag 1: Internal stop codons
     has_stops = '*' in clean_seq
-    
+
     # Flag 2: Severely truncated (< 50% of reference)
     severely_truncated = coverage < 50
-    
+
     # Flag 3: Very low identity
     low_identity = pident < 30
-    
+
     # Flag 4: Very short absolute length
-    very_short = hsp_length < 50
-    
+    very_short = hsp_length < min_length
+
     # Decision logic
     if has_stops:
         return "pseudogene", "internal_stop_codon", True
@@ -86,32 +94,31 @@ def assess_target_quality(hsp_seq, ref_length, pident):
 def load_target_sequences(genome_id, parent_locus, output_dir):
     """Load target sequences from FASTA files."""
     seqs_dir = output_dir / "target_sequences"
-    
+
     if not seqs_dir.exists():
         return {}
-    
+
     # Find FASTA file for this genome and locus
     fasta_file = seqs_dir / f"{genome_id}_{parent_locus}_target_proteins.fasta"
-    
+
     if not fasta_file.exists():
         return {}
-    
+
     # Load sequences
     sequences = {}
     for record in SeqIO.parse(fasta_file, "fasta"):
         sequences[record.id] = str(record.seq)
-    
+
     return sequences
 
-def classify_targets(targets_df, blocks_df):
+def classify_targets(targets_df, blocks_df, targets_dir, bk_proteins_file, min_length):
     """Classify each target as syntenic or unplaceable with quality assessment."""
 
     # Load reference protein sequences to get lengths
     from Bio import SeqIO
     ref_proteins = {}
-    ref_file = config.BK_PROTEINS_FILE
-    if ref_file.exists():
-        for record in SeqIO.parse(ref_file, "fasta"):
+    if bk_proteins_file.exists():
+        for record in SeqIO.parse(bk_proteins_file, "fasta"):
             ref_proteins[record.id] = len(record.seq)
     
     # Index synteny blocks by (genome, scaffold) for fast lookup
@@ -152,15 +159,15 @@ def classify_targets(targets_df, blocks_df):
 
         # Load target sequences for quality assessment
         genome_sequences = load_target_sequences(
-            target['genome'], 
+            target['genome'],
             target['parent_locus'],
-            config.STEP04_TARGETS
+            targets_dir
         )
-        
+
         # Get reference protein length
         query_id = target.get('query_id', target.get('gene_id', ''))
         ref_length = ref_proteins.get(query_id, 300)  # Default 300aa if not found
-        
+
         # Find matching HSP sequence
         hsp_seq = None
         pident = target.get('pident', 0)
@@ -168,10 +175,10 @@ def classify_targets(targets_df, blocks_df):
             if query_id in seq_id or target['gene_family'] in seq_id:
                 hsp_seq = seq
                 break
-        
+
         # Assess quality
         if hsp_seq:
-            status, quality_flag, has_stops = assess_target_quality(hsp_seq, ref_length, pident)
+            status, quality_flag, has_stops = assess_target_quality(hsp_seq, ref_length, pident, min_length)
             hsp_length = len(hsp_seq.replace('-', ''))
             coverage_pct = (hsp_length / ref_length * 100) if ref_length > 0 else 0
         else:
@@ -196,42 +203,70 @@ def classify_targets(targets_df, blocks_df):
 
     return pd.DataFrame(classifications)
 
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Classify target loci as syntenic or unplaceable",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument('--targets', required=True, type=Path,
+                        help='Path to all_target_loci.tsv from Phase 4')
+    parser.add_argument('--blocks', required=True, type=Path,
+                        help='Path to synteny_blocks_filtered.tsv from Phase 3')
+    parser.add_argument('--output-dir', required=True, type=Path,
+                        help='Output directory for classified targets')
+    parser.add_argument('--min-length', type=int, default=30,
+                        help='Minimum ORF length in amino acids (default: 30)')
+
+    return parser.parse_args()
+
 def main():
     """Main execution function."""
-    print("=" * 80)
-    print("STEP 05: CLASSIFY TARGET LOCI")
-    print("=" * 80)
+    args = parse_args()
+
+    print("=" * 80, flush=True)
+    print("STEP 05: CLASSIFY TARGET LOCI", flush=True)
+    print("=" * 80, flush=True)
+    print(f"\nInput files:")
+    print(f"  Target loci: {args.targets}")
+    print(f"  Synteny blocks: {args.blocks}")
+    print(f"  Output directory: {args.output_dir}")
+    print(f"\nParameters:")
+    print(f"  Minimum ORF length: {args.min_length} aa")
 
     # Create output directory
-    config.STEP05_CLASSIFIED.mkdir(exist_ok=True, parents=True)
+    args.output_dir.mkdir(exist_ok=True, parents=True)
 
     # Load synteny blocks
-    print("\n[1] Loading synteny blocks...")
-    blocks_file = config.STEP03_FILTERED / "synteny_blocks_filtered.tsv"
+    print("\n[1] Loading synteny blocks...", flush=True)
 
-    if not blocks_file.exists():
-        print(f"  ERROR: Filtered blocks not found: {blocks_file}")
-        print("  Run Step 03 first.")
+    if not args.blocks.exists():
+        print(f"  ERROR: Filtered blocks not found: {args.blocks}", flush=True)
+        print("  Run Step 03 first.", flush=True)
         return
 
-    blocks_df = pd.read_csv(blocks_file, sep='\t')
-    print(f"  Loaded {len(blocks_df)} synteny blocks")
+    blocks_df = pd.read_csv(args.blocks, sep='\t')
+    print(f"  Loaded {len(blocks_df)} synteny blocks", flush=True)
 
     # Load target loci
-    print("\n[2] Loading target loci...")
-    targets_file = config.STEP04_TARGETS / "all_target_loci.tsv"
+    print("\n[2] Loading target loci...", flush=True)
 
-    if not targets_file.exists():
-        print(f"  ERROR: Target loci not found: {targets_file}")
-        print("  Run Step 04 first.")
+    if not args.targets.exists():
+        print(f"  ERROR: Target loci not found: {args.targets}", flush=True)
+        print("  Run Step 04 first.", flush=True)
         return
 
-    targets_df = pd.read_csv(targets_file, sep='\t')
-    print(f"  Loaded {len(targets_df)} target loci")
+    targets_df = pd.read_csv(args.targets, sep='\t')
+    print(f"  Loaded {len(targets_df)} target loci", flush=True)
+
+    # Infer paths for reference proteins (in same directory as targets file)
+    targets_dir = args.targets.parent
+    bk_proteins_file = targets_dir.parent / "01_extracted_proteins" / "BK_proteins.faa"
 
     # Classify targets
-    print("\n[3] Classifying targets...")
-    classified_df = classify_targets(targets_df, blocks_df)
+    print("\n[3] Classifying targets...", flush=True)
+    classified_df = classify_targets(targets_df, blocks_df, targets_dir, bk_proteins_file, args.min_length)
 
     syntenic = classified_df[classified_df['placement'] == 'synteny']
     unplaceable = classified_df[classified_df['placement'] == 'unplaceable']
@@ -240,22 +275,22 @@ def main():
     print(f"  Unplaceable: {len(unplaceable)} ({len(unplaceable)/len(classified_df)*100:.1f}%)")
 
     # Save classifications
-    print("\n[4] Saving classifications...")
+    print("\n[4] Saving classifications...", flush=True)
 
     # Save all classifications
-    all_file = config.STEP05_CLASSIFIED / "all_targets_classified.tsv"
+    all_file = args.output_dir / "all_targets_classified.tsv"
     classified_df.to_csv(all_file, sep='\t', index=False)
-    print(f"  Saved all: {all_file.name}")
+    print(f"  Saved all: {all_file.name}", flush=True)
 
     # Save syntenic only (for matrix generation)
-    syntenic_file = config.STEP05_CLASSIFIED / "syntenic_targets.tsv"
+    syntenic_file = args.output_dir / "syntenic_targets.tsv"
     syntenic.to_csv(syntenic_file, sep='\t', index=False)
-    print(f"  Saved syntenic: {syntenic_file.name}")
+    print(f"  Saved syntenic: {syntenic_file.name}", flush=True)
 
     # Save unplaceable
-    unplaceable_file = config.STEP05_CLASSIFIED / "unplaceable_targets.tsv"
+    unplaceable_file = args.output_dir / "unplaceable_targets.tsv"
     unplaceable.to_csv(unplaceable_file, sep='\t', index=False)
-    print(f"  Saved unplaceable: {unplaceable_file.name}")
+    print(f"  Saved unplaceable: {unplaceable_file.name}", flush=True)
 
     # Summary by locus
     print("\n[5] Summary by locus:")
@@ -276,18 +311,18 @@ def main():
         print(f"    Pseudogenes: {len(pseudo)} ({len(pseudo)/len(locus_targets)*100:.1f}%)")
 
     # Overall summary
-    print("\n" + "=" * 80)
-    print("CLASSIFICATION COMPLETE")
-    print("=" * 80)
-    print(f"\nTotal targets classified: {len(classified_df)}")
-    print(f"Syntenic: {len(syntenic)} ({len(syntenic)/len(classified_df)*100:.1f}%)")
-    print(f"Unplaceable: {len(unplaceable)} ({len(unplaceable)/len(classified_df)*100:.1f}%)")
+    print("\n" + "=" * 80, flush=True)
+    print("CLASSIFICATION COMPLETE", flush=True)
+    print("=" * 80, flush=True)
+    print(f"\nTotal targets classified: {len(classified_df)}", flush=True)
+    print(f"Syntenic: {len(syntenic)} ({len(syntenic)/len(classified_df)*100:.1f}%)", flush=True)
+    print(f"Unplaceable: {len(unplaceable)} ({len(unplaceable)/len(classified_df)*100:.1f}%)", flush=True)
 
     functional = classified_df[classified_df['status'] == 'functional']
-    print(f"Functional: {len(functional)} ({len(functional)/len(classified_df)*100:.1f}%)")
+    print(f"Functional: {len(functional)} ({len(functional)/len(classified_df)*100:.1f}%)", flush=True)
 
-    print(f"\nOutputs saved to: {config.STEP05_CLASSIFIED}")
-    print("\nNext step: 06_swissprot_annotation.py")
+    print(f"\nOutputs saved to: {args.output_dir}", flush=True)
+    print("\nNext step: 06_extract_sequences.py", flush=True)
 
 if __name__ == "__main__":
     main()
