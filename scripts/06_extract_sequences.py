@@ -19,8 +19,119 @@ from pathlib import Path
 import pandas as pd
 import sys
 import argparse
+import shutil
+from Bio import SeqIO
+from collections import defaultdict
 sys.path.insert(0, str(Path(__file__).parent))
 import extract_with_exonerate
+
+def deduplicate_extracted_sequences(targets_df, output_dir):
+    """
+    Deduplicate extracted sequences within each (genome, parent_locus) group.
+
+    When multiple BLAST seeds lead to identical extracted proteins, keep only one.
+    This prevents overcounting genes when different BLAST fragments detect
+    different regions of the same gene.
+
+    Args:
+        targets_df: DataFrame of all targets that were extracted
+        output_dir: Directory containing extracted sequences
+
+    Returns:
+        Number of duplicate extractions removed
+    """
+
+    duplicates_removed = 0
+
+    # Group by (genome, parent_locus) - only check for duplicates within same genome/locus
+    for (genome, parent_locus), group in targets_df.groupby(['genome', 'parent_locus']):
+        if len(group) == 1:
+            # No duplicates possible
+            continue
+
+        # Load extracted protein sequences for all targets in this group
+        sequences = {}
+        target_info = {}
+
+        for _, target in group.iterrows():
+            target_name = target['locus_name']
+            extraction_dir = output_dir / genome / target_name
+
+            # Find protein FASTA file
+            protein_files = list(extraction_dir.glob("*_gene1_protein.fasta"))
+            if not protein_files:
+                # Extraction may have failed
+                continue
+
+            protein_file = protein_files[0]
+
+            # Read sequence
+            try:
+                for record in SeqIO.parse(protein_file, 'fasta'):
+                    seq = str(record.seq)
+                    sequences[target_name] = seq
+                    target_info[target_name] = {
+                        'evalue': target['best_evalue'],
+                        'extraction_dir': extraction_dir,
+                        'scaffold': target['scaffold'],
+                        'start': target['start'],
+                        'end': target['end']
+                    }
+                    break  # Only one sequence per file
+            except Exception as e:
+                print(f"    WARNING: Could not read {protein_file}: {e}")
+                continue
+
+        if len(sequences) <= 1:
+            # No duplicates possible
+            continue
+
+        # Compare all sequences to find duplicates
+        target_names = list(sequences.keys())
+        kept_targets = set()
+        removed_targets = set()
+
+        for i, target1 in enumerate(target_names):
+            if target1 in removed_targets:
+                continue
+
+            seq1 = sequences[target1]
+
+            # Compare with all subsequent targets
+            for target2 in target_names[i+1:]:
+                if target2 in removed_targets:
+                    continue
+
+                seq2 = sequences[target2]
+
+                # Check for identical sequences
+                if seq1 == seq2:
+                    # Sequences are identical - this is a duplicate
+                    # Keep the one with better e-value
+                    if target_info[target1]['evalue'] <= target_info[target2]['evalue']:
+                        # Keep target1, remove target2
+                        to_remove = target2
+                        to_keep = target1
+                    else:
+                        # Keep target2, remove target1
+                        to_remove = target1
+                        to_keep = target2
+
+                    print(f"    Duplicate in {genome}/{parent_locus}:")
+                    print(f"      Keeping:  {to_keep} (e-value: {target_info[to_keep]['evalue']:.2e})")
+                    print(f"      Removing: {to_remove} (e-value: {target_info[to_remove]['evalue']:.2e})")
+                    print(f"      Reason: Identical {len(seq1)} aa protein sequence")
+
+                    # Remove the duplicate extraction directory
+                    extraction_dir = target_info[to_remove]['extraction_dir']
+                    if extraction_dir.exists():
+                        shutil.rmtree(extraction_dir)
+                        duplicates_removed += 1
+
+                    removed_targets.add(to_remove)
+                    kept_targets.add(to_keep)
+
+    return duplicates_removed
 
 def parse_args():
     """Parse command-line arguments."""
@@ -138,7 +249,6 @@ def main():
                 temp_query = target_output_dir / f"query_{expected_query}.faa"
                 found_query = False
 
-                from Bio import SeqIO
                 with open(args.query_proteins, 'r') as infile:
                     for record in SeqIO.parse(infile, 'fasta'):
                         if expected_query in record.id:
@@ -171,11 +281,24 @@ def main():
                 except Exception as e:
                     print(f"    ERROR extracting {target_name}: {e}")
 
+    # Deduplicate extracted sequences
+    print("\n[4] Deduplicating extracted sequences...", flush=True)
+    print("  (Removing cases where multiple BLAST seeds extracted the same gene)", flush=True)
+
+    duplicates_removed = deduplicate_extracted_sequences(
+        targets_df=targets_df,
+        output_dir=args.output_dir
+    )
+
+    print(f"  Removed {duplicates_removed} duplicate extractions", flush=True)
+
     # Summary
     print("\n" + "=" * 80)
     print("SEQUENCE EXTRACTION COMPLETE")
     print("=" * 80)
     print(f"\nTotal genes extracted: {total_extracted}")
+    print(f"Duplicates removed: {duplicates_removed}")
+    print(f"Unique genes: {total_extracted - duplicates_removed}")
     print(f"Genomes processed: {len(genome_groups) - len(failed_genomes)}/{len(genome_groups)}")
     if failed_genomes:
         print(f"\nFailed genomes (no FASTA): {len(failed_genomes)}")
