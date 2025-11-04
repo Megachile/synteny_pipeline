@@ -13,6 +13,7 @@ Usage:
     python 01_discover_paralogs_gene_level.py \\
         --loc-ids LOC117167432,LOC117167433 \\
         --output-dir outputs/ferritin_phase1 \\
+        --gene-family ferritin_MC102 \\
         --flanking-distance 1000 \\
         --evalue 1e-3 \\
         --min-pident 40
@@ -429,6 +430,8 @@ def parse_args():
                         help=f'E-value threshold for DIAMOND search (default: {EVALUE_THRESHOLD})')
     parser.add_argument('--min-pident', type=float, default=MIN_PIDENT,
                         help=f'Minimum percent identity for paralogs (default: {MIN_PIDENT})')
+    parser.add_argument('--gene-family', type=str, default='unknown',
+                        help='Gene family name for classification (default: unknown)')
 
     return parser.parse_args()
 
@@ -590,6 +593,7 @@ def main():
 
             locus = {
                 'locus_id': locus_name,
+                'gene_family': args.gene_family,
                 'genome': genome_code,
                 'chromosome': chrom,
                 'target_gene': target_gene,
@@ -611,9 +615,9 @@ def main():
     # Step 5: Save results
     print("\n[5] Saving results...")
 
-    # Save locus summary
+    # Save locus summary (used by downstream pipeline scripts)
     locus_df = pd.DataFrame(unique_loci)
-    locus_df.to_csv(args.output_dir / "unique_loci.tsv", sep='\t', index=False)
+    locus_df.to_csv(args.output_dir / "locus_definitions.tsv", sep='\t', index=False)
 
     # Save detailed paralog info
     with open(args.output_dir / "paralog_details.json", 'w') as f:
@@ -623,7 +627,7 @@ def main():
         json.dump(all_paralogs, f, indent=2)
 
     print(f"\nResults saved to {args.output_dir}/")
-    print(f"  - unique_loci.tsv: {len(unique_loci)} loci across {len(LANDMARKS)} genomes")
+    print(f"  - locus_definitions.tsv: {len(unique_loci)} loci across {len(LANDMARKS)} genomes")
     print(f"  - paralog_details.json: Detailed BLAST results")
     print(f"  - *_flanking.faa: Flanking proteins for each locus (ORDERED: U1...Un, D1...Dn)")
 
