@@ -396,12 +396,14 @@ def name_locus(genome_code, chromosome, locus_number):
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python 01_discover_paralogs_gene_level.py <LOC_ID(s)> <output_dir>")
+        print("Usage: python 01_discover_paralogs_gene_level.py <LOC_ID(s)> <output_dir> [gene_family]")
         print("  LOC_ID(s): Single LOC or comma-separated LOCs (e.g., 'LOC117167432' or 'LOC117167432,LOC117167433')")
+        print("  gene_family: Optional gene family name for batch processing")
         sys.exit(1)
 
     target_input = sys.argv[1]
     output_dir = Path(sys.argv[2])
+    gene_family = sys.argv[3] if len(sys.argv) > 3 else "unknown"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Parse input LOCs (may be comma-separated)
@@ -536,7 +538,8 @@ def main():
                 'flanking_count': len(flanking_genes),
                 'tandem_count': len(tandems),
                 'is_tandem': len(tandems) > 0,
-                'flanking_file': str(flanking_file)
+                'flanking_file': str(flanking_file),
+                'gene_family': gene_family
             }
 
             unique_loci.append(locus)

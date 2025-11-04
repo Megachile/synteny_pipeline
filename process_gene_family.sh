@@ -33,8 +33,11 @@ cd "$BASE_DIR"
 source ~/.bashrc
 micromamba activate busco_env
 
+# Set gene family for downstream scripts
+export GENE_FAMILY="$FAMILY_NAME"
+
 echo "=== PHASE 1: Paralog Discovery ==="
-python scripts/01_discover_paralogs_gene_level.py "$LOC_LIST" "$FAMILY_OUTPUT/01_paralogs"
+python scripts/01_discover_paralogs_gene_level.py "$LOC_LIST" "$FAMILY_OUTPUT/01_paralogs" "$FAMILY_NAME"
 if [ $? -ne 0 ]; then
     echo "ERROR: Phase 1 failed for $FAMILY_NAME"
     exit 1
