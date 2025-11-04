@@ -31,7 +31,7 @@ cd "$BASE_DIR"
 
 # Load environment
 source ~/.bashrc
-micromamba activate trinity_new_env
+micromamba activate busco_env
 
 echo "=== PHASE 1: Paralog Discovery ==="
 python scripts/01_discover_paralogs_gene_level.py "$LOC_LIST" "$FAMILY_OUTPUT/01_paralogs"
