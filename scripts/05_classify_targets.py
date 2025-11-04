@@ -3,16 +3,13 @@
 Step 05: Classify target loci as syntenic or unplaceable.
 
 Checks if target loci overlap with synteny blocks to determine placement.
-Filters out tiny fragments (< min-span-kb) to remove likely spurious hits.
 
 Usage:
     python 05_classify_targets.py \\
         --targets <path/to/all_target_loci.tsv> \\
         --blocks <path/to/synteny_blocks_filtered.tsv> \\
         --output-dir <path/to/classified_targets> \\
-        [--min-span-kb 0.3] \\
-        [--unplaceable-evalue 1e-10] \\
-        [--unplaceable-bitscore 100]
+        [--min-length 30]
 """
 
 from pathlib import Path
@@ -114,17 +111,10 @@ def load_target_sequences(genome_id, parent_locus, output_dir):
 
     return sequences
 
-def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bitscore, min_span_kb):
+def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bitscore):
     """Classify each target as syntenic or unplaceable based on proximity to synteny blocks.
 
     Quality assessment happens AFTER Exonerate extraction (Phase 6).
-
-    Args:
-        targets_df: DataFrame of target loci from Phase 4
-        blocks_df: DataFrame of synteny blocks from Phase 3
-        unplaceable_evalue: E-value threshold for unplaceable targets
-        unplaceable_bitscore: Bitscore threshold for unplaceable targets
-        min_span_kb: Minimum genomic span in kb to keep (filters tiny fragments)
     """
 
     # Index synteny blocks by (genome, scaffold) for fast lookup
@@ -134,15 +124,8 @@ def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bits
         synteny_index[key].append(block)
 
     classifications = []
-    filtered_tiny = 0
 
     for _, target in targets_df.iterrows():
-        # Filter 1: Remove tiny fragments (likely spurious hits)
-        span_kb = target.get('span_kb', 0)
-        if span_kb < min_span_kb:
-            filtered_tiny += 1
-            continue
-
         # Check for overlap with synteny blocks
         key = (target['genome'], target['scaffold'])
         candidate_blocks = synteny_index.get(key, [])
@@ -155,7 +138,7 @@ def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bits
                 break
 
         if assigned_to:
-            # Syntenic hit - keep if passes span filter
+            # Syntenic hit - keep regardless of strength
             classification = {
                 **target.to_dict(),
                 'placement': 'synteny',
@@ -180,8 +163,6 @@ def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bits
                 }
                 classifications.append(classification)
             # Weak hits are silently filtered (not included in output)
-
-    print(f"  Filtered {filtered_tiny} tiny fragments (< {min_span_kb} kb)")
 
     return pd.DataFrame(classifications)
 
@@ -269,8 +250,6 @@ def parse_args():
                         help='Output directory for classified targets')
     parser.add_argument('--min-length', type=int, default=30,
                         help='Minimum ORF length in amino acids (default: 30)')
-    parser.add_argument('--min-span-kb', type=float, default=0.3,
-                        help='Minimum genomic span in kb to keep (filters tiny fragments, default: 0.3)')
     parser.add_argument('--unplaceable-evalue', type=float, default=1e-10,
                         help='E-value threshold for unplaceable targets (default: 1e-10)')
     parser.add_argument('--unplaceable-bitscore', type=float, default=100,
@@ -290,7 +269,6 @@ def main():
     print(f"  Synteny blocks: {args.blocks}")
     print(f"  Output directory: {args.output_dir}")
     print(f"\nParameters:")
-    print(f"  Minimum span: {args.min_span_kb} kb")
     print(f"  Unplaceable e-value threshold: {args.unplaceable_evalue}")
     print(f"  Unplaceable bitscore threshold: {args.unplaceable_bitscore}")
 
@@ -325,15 +303,13 @@ def main():
 
     # Classify targets
     print("\n[3] Classifying targets...", flush=True)
-    print(f"  Minimum span filter: {args.min_span_kb} kb")
     print(f"  Unplaceable filters: e-value <= {args.unplaceable_evalue}, bitscore >= {args.unplaceable_bitscore}")
 
     classified_df = classify_targets(
         targets_df,
         blocks_df,
         args.unplaceable_evalue,
-        args.unplaceable_bitscore,
-        args.min_span_kb
+        args.unplaceable_bitscore
     )
 
     if len(classified_df) == 0:
