@@ -166,6 +166,75 @@ def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bits
 
     return pd.DataFrame(classifications)
 
+def deduplicate_overlapping_targets(classified_df):
+    """Deduplicate overlapping target loci.
+
+    When BLAST finds multiple overlapping hits at the same genomic location,
+    merge them into a single target, keeping the one with the best e-value.
+
+    This is critical for accurate gene counts - overlapping hits often represent
+    the same gene detected multiple times with slightly different boundaries.
+    """
+
+    if len(classified_df) == 0:
+        return classified_df
+
+    print("\n  Deduplicating overlapping targets...", flush=True)
+    initial_count = len(classified_df)
+
+    deduplicated = []
+    duplicates_removed = 0
+
+    # Group by (genome, parent_locus) for deduplication
+    for (genome, parent_locus), group in classified_df.groupby(['genome', 'parent_locus']):
+        if len(group) == 1:
+            # No duplicates possible
+            deduplicated.append(group.iloc[0].to_dict())
+            continue
+
+        # Sort by start position
+        group = group.sort_values('start')
+
+        # Check for overlaps
+        kept_targets = []
+        current_target = group.iloc[0].to_dict()
+
+        for _, next_target in group.iloc[1:].iterrows():
+            # Check if next_target overlaps with current_target
+            overlap = not (next_target['end'] < current_target['start'] or
+                          next_target['start'] > current_target['end'])
+
+            if overlap:
+                # Overlapping - merge by keeping the one with best e-value
+                duplicates_removed += 1
+
+                if next_target['best_evalue'] < current_target['best_evalue']:
+                    # Next target is better, replace current
+                    print(f"    Merged {genome}/{parent_locus}: {current_target['locus_name']} "
+                          f"→ {next_target['locus_name']} (better e-value)", flush=True)
+                    current_target = next_target.to_dict()
+                else:
+                    # Current target is better, keep it
+                    print(f"    Merged {genome}/{parent_locus}: {next_target['locus_name']} "
+                          f"→ {current_target['locus_name']} (worse e-value)", flush=True)
+            else:
+                # No overlap - save current and move to next
+                kept_targets.append(current_target)
+                current_target = next_target.to_dict()
+
+        # Don't forget the last target
+        kept_targets.append(current_target)
+
+        deduplicated.extend(kept_targets)
+
+    deduplicated_df = pd.DataFrame(deduplicated)
+
+    print(f"  Before deduplication: {initial_count} targets", flush=True)
+    print(f"  After deduplication: {len(deduplicated_df)} targets", flush=True)
+    print(f"  Removed: {duplicates_removed} overlapping duplicates", flush=True)
+
+    return deduplicated_df
+
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -247,10 +316,18 @@ def main():
         print("  No targets passed classification filters!", flush=True)
         return
 
+    # Deduplicate overlapping targets
+    print("\n[3b] Deduplicating overlapping targets...", flush=True)
+    classified_df = deduplicate_overlapping_targets(classified_df)
+
+    if len(classified_df) == 0:
+        print("  No targets remained after deduplication!", flush=True)
+        return
+
     syntenic = classified_df[classified_df['placement'] == 'synteny']
     unplaceable = classified_df[classified_df['placement'] == 'unplaceable']
 
-    print(f"  Input targets: {len(targets_df)}")
+    print(f"\n  Input targets: {len(targets_df)}")
     print(f"  After filtering: {len(classified_df)} ({len(classified_df)/len(targets_df)*100:.1f}%)")
     print(f"  Syntenic: {len(syntenic)} ({len(syntenic)/len(classified_df)*100:.1f}%)")
     print(f"  Unplaceable: {len(unplaceable)} ({len(unplaceable)/len(classified_df)*100:.1f}%)")
