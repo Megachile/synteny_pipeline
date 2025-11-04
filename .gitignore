@@ -1,0 +1,44 @@
+# Outputs and data
+outputs/
+logs/
+data/
+inputs/
+test_outputs/
+*.out
+*.err
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Temporary files
+temp_*
+test_*
+*.fasta
+best_hit_per_genome.tsv
+exonerate_extraction_summary.tsv
+phase3_debug.log
+
+# Beads tracker
+.beads/
+
+# Deprecated scripts
+scripts/deprecated/
+
+# SLURM test scripts
+create_*.slurm
+rebuild_*.slurm
+reinstall_*.slurm
+test_*.slurm
+
+# Analysis scripts (keep run_*.slurm but not temporary ones)
+analyze_*.py
+check_*.py
+create_*.py
+fix_*.py
+select_*.py
+validate_*.py
+run_ferritin_phases.py
+run_ferritin_slurm.sh
+test_pipeline_phases.sh
