@@ -66,18 +66,64 @@ def load_species_and_phylo():
 
     return species_map, phylo_order_map
 
+def parse_flanking_proteins_from_faa(flanking_file):
+    """
+    Parse flanking protein file to extract protein IDs and descriptions.
+
+    Returns tuple of:
+    - protein_ids: list of protein IDs
+    - protein_names: list of protein descriptions
+    """
+    from Bio import SeqIO
+
+    protein_ids = []
+    protein_names = []
+
+    if not flanking_file.exists():
+        print(f"    Warning: Flanking file not found: {flanking_file}")
+        return [], []
+
+    for record in SeqIO.parse(flanking_file, "fasta"):
+        # Header format: >XP_033209112.1|LOC117167954 XP_033209112.1 description [species]
+        protein_id = record.id.split('|')[0]  # Get XP_ ID
+        protein_ids.append(protein_id)
+
+        # Extract description from full header
+        description = record.description
+        if ' ' in description:
+            # Skip the IDs at the start, get the description part
+            parts = description.split(' ', 2)  # Split into 3 parts max
+            if len(parts) >= 3:
+                desc = parts[2]  # The description part
+                # Remove species name in brackets
+                if '[' in desc:
+                    desc = desc.split('[')[0].strip()
+                protein_names.append(desc)
+            else:
+                protein_names.append(protein_id)
+        else:
+            protein_names.append(protein_id)
+
+    return protein_ids, protein_names
+
 def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_df, flanking_df, species_map, phylo_order_map, protein_names):
     """Create matrix for one locus."""
 
     print(f"\n  Processing {locus_id}...")
 
     # Get locus details
-    upstream_proteins = locus_info['true_upstream_proteins'].split(',')
-    downstream_proteins = locus_info['true_downstream_proteins'].split(',')
-    upstream_names = locus_info['true_upstream_names'].split(',')
-    downstream_names = locus_info['true_downstream_names'].split(',')
     gene_family = locus_info['gene_family']
-    total_expected = len(upstream_proteins) + len(downstream_proteins)
+    flanking_file = Path(locus_info['flanking_file'])
+
+    # Parse flanking proteins from .faa file
+    flanking_protein_ids, flanking_protein_names = parse_flanking_proteins_from_faa(flanking_file)
+
+    # For compatibility, treat all as "upstream" (no distinction in this pipeline)
+    upstream_proteins = flanking_protein_ids
+    downstream_proteins = []
+    upstream_names = flanking_protein_names
+    downstream_names = []
+    total_expected = len(flanking_protein_ids)
 
     # Get blocks for this locus
     locus_blocks = blocks_df[blocks_df['locus_id'] == locus_id]
@@ -154,8 +200,8 @@ def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_d
 
         if not genome_block.empty:
             block = genome_block.iloc[0]
-            row['synteny_pct'] = round(block['num_proteins'] / total_expected * 100, 1)
-            row['num_proteins_found'] = block['num_proteins']
+            row['synteny_pct'] = round(block['num_query_matches'] / total_expected * 100, 1)
+            row['num_proteins_found'] = block['num_query_matches']
             row['scaffold'] = block['scaffold']
             row['strand'] = block['strand']
             row['start'] = block['start']
