@@ -402,8 +402,6 @@ def main():
         print(f"Genomes with targets: {loci_df_out['genome'].nunique()}", flush=True)
         print(f"Average loci per genome: {len(all_target_loci) / loci_df_out['genome'].nunique():.1f}", flush=True)
 
-        with_mismatches = loci_df_out['also_matches'].notna().sum()
-        print(f"Loci with query mismatches: {with_mismatches} ({with_mismatches/len(all_target_loci)*100:.1f}%)", flush=True)
     else:
         print("\nNo target loci found", flush=True)
 
