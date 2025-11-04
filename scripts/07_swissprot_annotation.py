@@ -196,16 +196,33 @@ def annotate_locus_hits(locus_id, position_to_protein):
 
         # Add genome and locus info
         for query_id, annot in annotations.items():
-            # Parse query ID to extract components
-            # Format: GCA_XXXXXX_U1_scaffold_1000-2000
-            parts = query_id.split('_')
-            if len(parts) >= 3:
-                flanking_pos = parts[2]  # U1, D1, etc.
-            else:
-                flanking_pos = "unknown"
+            # Parse query ID to extract BK protein ID
+            # Format: GCA_037103525.1_XP_033209112.1|LOC117167954_CM021339.1_RagTag_...
+            # Extract XP_/NP_ protein ID (second underscore-separated part before pipe)
+            bk_protein = "unknown"
+            flanking_pos = "unknown"
 
-            # Map position to BK protein ID
-            bk_protein = position_to_protein.get(flanking_pos, "unknown")
+            try:
+                # Split by underscore to get parts
+                parts = query_id.split('_')
+                # Find part starting with XP_ or NP_
+                for part in parts:
+                    if part.startswith('XP') or part.startswith('NP'):
+                        # Extract up to pipe or next underscore
+                        if '|' in part:
+                            bk_protein = part.split('|')[0]
+                        else:
+                            bk_protein = part.split()[0]  # In case of spaces
+                        break
+
+                # Try to find flanking position from position_to_protein mapping
+                # by reverse lookup
+                for pos, prot_id in position_to_protein.items():
+                    if prot_id == bk_protein:
+                        flanking_pos = pos
+                        break
+            except Exception as e:
+                print(f"    Warning: Could not parse query_id {query_id}: {e}")
 
             annot_record = {
                 'locus': locus_id,

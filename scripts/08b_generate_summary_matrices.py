@@ -199,41 +199,8 @@ def main():
                 print(f"    Syntenic: {syntenic_count} ({syntenic_count/(syntenic_count+unplaceable_count)*100:.1f}%)")
                 print(f"    Unplaceable: {unplaceable_count} ({unplaceable_count/(syntenic_count+unplaceable_count)*100:.1f}%)")
 
-    # Create combined summary matrix (all gene families)
-    print("\n[3] Creating combined summary matrix...")
-
-    all_rows = []
-    for genome in species_map.keys():
-        row = OrderedDict()
-        row['genome_id'] = genome
-        row['species'] = species_map[genome]
-        row['phylo_order'] = phylo_order_map.get(genome, 999)
-
-        # Count targets by gene family
-        for gene_family in gene_families:
-            family_targets = all_targets_df[
-                (all_targets_df['genome'] == genome) &
-                (all_targets_df['gene_family'] == gene_family)
-            ]
-
-            syntenic = family_targets[family_targets['placement'] == 'synteny']
-            unplaceable = family_targets[family_targets['placement'] == 'unplaceable']
-
-            row[f"{gene_family}_syntenic"] = len(syntenic)
-            row[f"{gene_family}_unplaceable"] = len(unplaceable)
-            row[f"{gene_family}_total"] = len(family_targets)
-
-        row['grand_total'] = sum(row.get(f"{gf}_total", 0) for gf in gene_families)
-
-        all_rows.append(row)
-
-    combined_df = pd.DataFrame(all_rows)
-    combined_df = combined_df.sort_values('phylo_order', ascending=True)
-
-    # Save combined matrix
-    combined_file = config.SUMMARY_MATRICES_DIR / "all_genes_combined_summary.tsv"
-    combined_df.to_csv(combined_file, sep='\t', index=False)
-    print(f"  Saved: {combined_file.name}")
+    # NOTE: "All genes combined summary" removed as it's redundant for single gene families
+    # and confusing for users. Each gene family has its own summary matrix.
 
     # Overall summary
     print("\n" + "=" * 80)
