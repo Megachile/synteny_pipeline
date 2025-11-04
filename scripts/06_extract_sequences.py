@@ -119,7 +119,7 @@ def main():
             # Process each target
             for _, target in locus_targets.iterrows():
                 target_name = target['locus_name']
-                expected_query = target['expected_query']
+                expected_query = target['query_id']
 
                 # Create pseudo-block structure for Exonerate
                 block = {
