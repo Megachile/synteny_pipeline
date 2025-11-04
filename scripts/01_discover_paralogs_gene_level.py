@@ -4,21 +4,28 @@ Phase 1: Gene-level paralog discovery with isoform deduplication.
 
 Key improvements:
 1. Maps proteins to LOC IDs to handle isoforms properly
-2. Extracts flanking at GENE level (not protein level)
+2. Extracts flanking at GENE level (not protein level) in ORDERED upstream/downstream format
 3. Detects tandem duplications among input LOCs
 4. Detects tandem duplications among paralogs
 5. Names loci systematically by chromosome
 
 Usage:
-    python 01_discover_paralogs_gene_level.py <LOC_ID(s)> <output_dir>
-
-    LOC_ID(s): Single LOC or comma-separated LOCs
-               Single: LOC117167432
-               Multiple: LOC117167432,LOC117167433,LOC117167434
+    python 01_discover_paralogs_gene_level.py \\
+        --loc-ids LOC117167432,LOC117167433 \\
+        --output-dir outputs/ferritin_phase1 \\
+        --flanking-distance 1000 \\
+        --evalue 1e-3 \\
+        --min-pident 40
 
 When multiple LOCs are provided, the script detects if any are tandem duplications
 (adjacent on the same chromosome) and groups them into clusters. One representative
 from each cluster is used for paralog discovery.
+
+**NEW**: Flanking genes are now saved in genomic order with U/D labels:
+  - U1 = closest upstream gene
+  - U2 = second closest upstream gene
+  - D1 = closest downstream gene
+  - D2 = second closest downstream gene
 """
 
 import sys
@@ -30,6 +37,7 @@ import pandas as pd
 from Bio import SeqIO
 import json
 from datetime import datetime
+import argparse
 
 # Configuration
 LANDMARKS = {
@@ -181,21 +189,23 @@ class GenomicMapper:
         return None
 
     def get_flanking_genes(self, target_gene, flanking_distance_kb=1000):
-        """Get flanking genes within genomic distance, excluding target itself.
+        """Get flanking genes split into upstream and downstream, sorted by position.
 
         Args:
             target_gene: Gene ID to find flanking genes around
             flanking_distance_kb: Maximum distance in kb from target gene
 
         Returns:
-            List of gene IDs within genomic distance of target
+            Tuple of (upstream_genes, downstream_genes)
+            - upstream_genes: List sorted by position (closest to target first)
+            - downstream_genes: List sorted by position (closest to target first)
         """
 
         if target_gene not in self.gene_positions:
-            return []
+            return [], []
 
         chrom, target_pos = self.gene_positions[target_gene]
-        flanking_genes = []
+        candidates = []  # (position, gene_id)
 
         # Check if NCBI or BRAKER3
         if self.gene_order:  # BRAKER3
@@ -208,7 +218,7 @@ class GenomicMapper:
                     if g_chrom == chrom:
                         distance_kb = abs(g_pos - target_pos) / 1000
                         if distance_kb <= flanking_distance_kb:
-                            flanking_genes.append(gene)
+                            candidates.append((g_pos, gene))
         else:  # NCBI
             # For NCBI, chr_genes has [(pos, gene_id), ...]
             if chrom in self.chr_genes:
@@ -217,9 +227,18 @@ class GenomicMapper:
                         continue
                     distance_kb = abs(pos - target_pos) / 1000
                     if distance_kb <= flanking_distance_kb:
-                        flanking_genes.append(gene_id)
+                        candidates.append((pos, gene_id))
 
-        return flanking_genes
+        # Sort by position and split into upstream/downstream
+        candidates.sort()
+
+        upstream = [gene for pos, gene in candidates if pos < target_pos]
+        downstream = [gene for pos, gene in candidates if pos >= target_pos]
+
+        # Reverse upstream so closest to target is first
+        upstream.reverse()
+
+        return upstream, downstream
 
     def get_representative_protein(self, gene_id):
         """Get one representative protein for a gene."""
@@ -393,26 +412,52 @@ def name_locus(genome_code, chromosome, locus_number):
     return f"{genome_code}_{chr_name}_{locus_letter}"
 
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: python 01_discover_paralogs_gene_level.py <LOC_ID(s)> <output_dir>")
-        print("  LOC_ID(s): Single LOC or comma-separated LOCs (e.g., 'LOC117167432' or 'LOC117167432,LOC117167433')")
-        sys.exit(1)
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Gene-level paralog discovery with ordered upstream/downstream flanking genes",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
 
-    target_input = sys.argv[1]
-    output_dir = Path(sys.argv[2])
-    output_dir.mkdir(parents=True, exist_ok=True)
+    parser.add_argument('--loc-ids', required=True, type=str,
+                        help='LOC ID(s) - single or comma-separated (e.g., LOC117167432,LOC117167433)')
+    parser.add_argument('--output-dir', required=True, type=Path,
+                        help='Output directory for locus definitions and flanking proteins')
+    parser.add_argument('--flanking-distance', type=int, default=FLANKING_DISTANCE_KB,
+                        help=f'Maximum distance (kb) to extract flanking genes (default: {FLANKING_DISTANCE_KB})')
+    parser.add_argument('--evalue', type=float, default=EVALUE_THRESHOLD,
+                        help=f'E-value threshold for DIAMOND search (default: {EVALUE_THRESHOLD})')
+    parser.add_argument('--min-pident', type=float, default=MIN_PIDENT,
+                        help=f'Minimum percent identity for paralogs (default: {MIN_PIDENT})')
+
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+
+    # Create output directory
+    args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # Parse input LOCs (may be comma-separated)
-    input_locs = [loc.strip() for loc in target_input.split(',')]
+    input_locs = [loc.strip() for loc in args.loc_ids.split(',')]
+
+    # Update global parameters from arguments
+    global FLANKING_DISTANCE_KB, EVALUE_THRESHOLD, MIN_PIDENT
+    FLANKING_DISTANCE_KB = args.flanking_distance
+    EVALUE_THRESHOLD = args.evalue
+    MIN_PIDENT = args.min_pident
 
     print("="*80)
     print("GENE-LEVEL PARALOG DISCOVERY WITH SYNTENY")
     print("="*80)
+    print(f"\nParameters:")
+    print(f"  Flanking distance: {FLANKING_DISTANCE_KB} kb")
+    print(f"  E-value threshold: {EVALUE_THRESHOLD}")
+    print(f"  Min percent identity: {MIN_PIDENT}%")
     print(f"\nInput LOCs: {len(input_locs)}")
     for loc in input_locs:
         print(f"  - {loc}")
-    print(f"Output: {output_dir}")
+    print(f"Output: {args.output_dir}")
 
     # Step 1: Build mappers for all genomes
     print("\n[1] Building genome mappers...")
@@ -443,7 +488,7 @@ def main():
         'representatives': representative_locs,
         'tandem_cluster_count': sum(1 for c in tandem_clusters if len(c) > 1)
     }
-    with open(output_dir / "input_tandem_clusters.json", 'w') as f:
+    with open(args.output_dir / "input_tandem_clusters.json", 'w') as f:
         json.dump(cluster_info, f, indent=2)
 
     # Step 2: Find query protein in BK for first representative
@@ -495,15 +540,16 @@ def main():
         print(f"\n  {genome_code}: {paralog_data['gene_count']} unique genes")
 
         for target_gene in paralog_data['unique_genes']:
-            # Get flanking genes
-            flanking_genes = mappers[genome_code].get_flanking_genes(target_gene, FLANKING_DISTANCE_KB)
+            # Get flanking genes (now returns upstream, downstream)
+            upstream_genes, downstream_genes = mappers[genome_code].get_flanking_genes(target_gene, FLANKING_DISTANCE_KB)
 
-            if not flanking_genes:
+            if not upstream_genes and not downstream_genes:
                 print(f"    Warning: No flanking genes found for {target_gene}")
                 continue
 
-            # Detect tandems
-            tandems = detect_tandems(paralog_data['unique_genes'], flanking_genes)
+            # Detect tandems (combine both sides)
+            all_flanking = upstream_genes + downstream_genes
+            tandems = detect_tandems(paralog_data['unique_genes'], all_flanking)
 
             # Get chromosome
             if target_gene in mappers[genome_code].gene_positions:
@@ -515,24 +561,41 @@ def main():
             locus_name = name_locus(genome_code, chrom, locus_counter[genome_code])
             locus_counter[genome_code] += 1
 
-            # Extract flanking proteins
-            flanking_proteins = extract_flanking_proteins(
-                flanking_genes, mappers[genome_code], LANDMARKS[genome_code]['proteome']
+            # Extract flanking proteins (upstream and downstream separately)
+            upstream_proteins = extract_flanking_proteins(
+                upstream_genes, mappers[genome_code], LANDMARKS[genome_code]['proteome']
+            )
+            downstream_proteins = extract_flanking_proteins(
+                downstream_genes, mappers[genome_code], LANDMARKS[genome_code]['proteome']
             )
 
-            # Save flanking proteins
-            flanking_file = output_dir / f"{locus_name}_flanking.faa"
+            # Save flanking proteins in order: upstream (U), then downstream (D)
+            flanking_file = args.output_dir / f"{locus_name}_flanking.faa"
             with open(flanking_file, 'w') as f:
-                for gene, seq in flanking_proteins.items():
-                    seq.id = f"{seq.id}|{gene}"
-                    SeqIO.write([seq], f, 'fasta')
+                # Write upstream (already in reverse order - closest to target first)
+                for i, gene in enumerate(upstream_genes, 1):
+                    if gene in upstream_proteins:
+                        seq = upstream_proteins[gene]
+                        seq.id = f"{seq.id}|{gene}"
+                        seq.description = f"U{i} {seq.description}"
+                        SeqIO.write([seq], f, 'fasta')
+
+                # Write downstream
+                for i, gene in enumerate(downstream_genes, 1):
+                    if gene in downstream_proteins:
+                        seq = downstream_proteins[gene]
+                        seq.id = f"{seq.id}|{gene}"
+                        seq.description = f"D{i} {seq.description}"
+                        SeqIO.write([seq], f, 'fasta')
 
             locus = {
                 'locus_id': locus_name,
                 'genome': genome_code,
                 'chromosome': chrom,
                 'target_gene': target_gene,
-                'flanking_count': len(flanking_genes),
+                'upstream_count': len(upstream_genes),
+                'downstream_count': len(downstream_genes),
+                'flanking_count': len(upstream_genes) + len(downstream_genes),
                 'tandem_count': len(tandems),
                 'is_tandem': len(tandems) > 0,
                 'flanking_file': str(flanking_file)
@@ -542,7 +605,7 @@ def main():
 
             print(f"    {locus_name}:")
             print(f"      Target: {target_gene}")
-            print(f"      Flanking: {len(flanking_genes)} genes -> {len(flanking_proteins)} proteins")
+            print(f"      Flanking: {len(upstream_genes)}U + {len(downstream_genes)}D = {len(all_flanking)} genes -> {len(upstream_proteins)+len(downstream_proteins)} proteins")
             print(f"      Tandems: {len(tandems)}")
 
     # Step 5: Save results
@@ -550,19 +613,19 @@ def main():
 
     # Save locus summary
     locus_df = pd.DataFrame(unique_loci)
-    locus_df.to_csv(output_dir / "unique_loci.tsv", sep='\t', index=False)
+    locus_df.to_csv(args.output_dir / "unique_loci.tsv", sep='\t', index=False)
 
     # Save detailed paralog info
-    with open(output_dir / "paralog_details.json", 'w') as f:
+    with open(args.output_dir / "paralog_details.json", 'w') as f:
         # Convert DataFrames to dicts for JSON serialization
         for genome in all_paralogs:
             all_paralogs[genome]['hits'] = all_paralogs[genome]['hits'].to_dict('records')
         json.dump(all_paralogs, f, indent=2)
 
-    print(f"\nResults saved to {output_dir}/")
+    print(f"\nResults saved to {args.output_dir}/")
     print(f"  - unique_loci.tsv: {len(unique_loci)} loci across {len(LANDMARKS)} genomes")
     print(f"  - paralog_details.json: Detailed BLAST results")
-    print(f"  - *_flanking.faa: Flanking proteins for each locus")
+    print(f"  - *_flanking.faa: Flanking proteins for each locus (ORDERED: U1...Un, D1...Dn)")
 
     # Summary
     print("\n" + "="*80)

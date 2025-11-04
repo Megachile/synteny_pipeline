@@ -80,43 +80,60 @@ def load_species_and_phylo(species_map_file):
 
 def parse_flanking_proteins_from_faa(flanking_file):
     """
-    Parse flanking protein file to extract protein IDs and descriptions.
+    Parse flanking protein file to extract protein IDs, descriptions, and U/D positions.
 
     Returns tuple of:
-    - protein_ids: list of protein IDs
-    - protein_names: list of protein descriptions
+    - upstream_proteins: list of (protein_id, protein_name) for upstream genes
+    - downstream_proteins: list of (protein_id, protein_name) for downstream genes
+
+    Expects Phase 1 format with U/D labels in descriptions:
+      >XP_033209112.1|LOC117167954 U1 XP_033209112.1 description [species]
+      >XP_033209139.1|LOC117167973 D1 XP_033209139.1 description [species]
     """
     from Bio import SeqIO
 
-    protein_ids = []
-    protein_names = []
+    upstream_proteins = []
+    downstream_proteins = []
 
     if not flanking_file.exists():
         print(f"    Warning: Flanking file not found: {flanking_file}")
         return [], []
 
     for record in SeqIO.parse(flanking_file, "fasta"):
-        # Header format: >XP_033209112.1|LOC117167954 XP_033209112.1 description [species]
+        # Header format: >XP_033209112.1|LOC117167954 U1 XP_033209112.1 description [species]
         protein_id = record.id.split('|')[0]  # Get XP_ ID
-        protein_ids.append(protein_id)
 
-        # Extract description from full header
+        # Extract description and position label
         description = record.description
-        if ' ' in description:
-            # Skip the IDs at the start, get the description part
-            parts = description.split(' ', 2)  # Split into 3 parts max
-            if len(parts) >= 3:
-                desc = parts[2]  # The description part
-                # Remove species name in brackets
-                if '[' in desc:
-                    desc = desc.split('[')[0].strip()
-                protein_names.append(desc)
-            else:
-                protein_names.append(protein_id)
-        else:
-            protein_names.append(protein_id)
+        parts = description.split()
 
-    return protein_ids, protein_names
+        if len(parts) < 2:
+            # Malformed header, skip
+            continue
+
+        # Check for U/D label (should be 2nd element)
+        position_label = parts[1] if len(parts) > 1 else None
+
+        # Extract description (skip ID, position label, and protein ID repeat)
+        if len(parts) >= 4:
+            desc_parts = parts[3:]  # Everything after "U1 XP_..."
+            desc = ' '.join(desc_parts)
+            # Remove species name in brackets
+            if '[' in desc:
+                desc = desc.split('[')[0].strip()
+        else:
+            desc = protein_id
+
+        # Add to appropriate list based on U/D label
+        if position_label and position_label.startswith('U'):
+            upstream_proteins.append((protein_id, desc))
+        elif position_label and position_label.startswith('D'):
+            downstream_proteins.append((protein_id, desc))
+        else:
+            # No label - legacy format, treat as upstream
+            upstream_proteins.append((protein_id, desc))
+
+    return upstream_proteins, downstream_proteins
 
 def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_df, flanking_df, species_map, phylo_order_map, protein_names, synteny_dir):
     """Create matrix for one locus."""
@@ -130,15 +147,16 @@ def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_d
     # Construct flanking file path from Phase 2 outputs
     flanking_file = synteny_dir / locus_id / f"{locus_id}_flanking_filtered.faa"
 
-    # Parse flanking proteins from .faa file
-    flanking_protein_ids, flanking_protein_names = parse_flanking_proteins_from_faa(flanking_file)
+    # Parse flanking proteins from .faa file (now returns (upstream, downstream) tuples)
+    upstream_data, downstream_data = parse_flanking_proteins_from_faa(flanking_file)
 
-    # For compatibility, treat all as "upstream" (no distinction in this pipeline)
-    upstream_proteins = flanking_protein_ids
-    downstream_proteins = []
-    upstream_names = flanking_protein_names
-    downstream_names = []
-    total_expected = len(flanking_protein_ids)
+    # Unpack tuples
+    upstream_proteins = [protein_id for protein_id, _ in upstream_data]
+    upstream_names = [name for _, name in upstream_data]
+    downstream_proteins = [protein_id for protein_id, _ in downstream_data]
+    downstream_names = [name for _, name in downstream_data]
+
+    total_expected = len(upstream_proteins) + len(downstream_proteins)
 
     # Get blocks for this locus
     if not blocks_df.empty and 'locus_id' in blocks_df.columns:
