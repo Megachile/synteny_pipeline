@@ -309,39 +309,28 @@ def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_d
                 ]
 
                 # Map protein IDs to their positions (U1, U2, D1, D2, etc)
-                # Query IDs in BLAST are like "metacluster211_chr9a_U1"
+                # Query IDs are like "XP_033209222.1|LOC117168016"
                 for _, hit in block_hits.iterrows():
                     query_id = hit['qseqid']
 
-                    # Extract the position from the query ID
-                    # Format is like: "metacluster211_chr9a_U1" or "metacluster211_chr9a_D1"
-                    if '_U' in query_id:
-                        # Extract position number
-                        position_num = query_id.split('_U')[-1]
+                    # Extract protein ID (part before |)
+                    protein_id = query_id.split('|')[0] if '|' in query_id else query_id
+
+                    # Check if this protein is in our upstream list
+                    if protein_id in upstream_proteins:
+                        idx = upstream_proteins.index(protein_id)
+                        position_num = len(upstream_proteins) - idx  # U14, U13, ..., U1
                         position_id = f"U{position_num}"
                         proteins_found.add(position_id)
+                        proteins_found.add(protein_id)  # Also add for SwissProt lookup
 
-                        # Also add the actual protein ID for SwissProt lookup
-                        try:
-                            idx = int(position_num) - 1
-                            if 0 <= idx < len(upstream_proteins):
-                                proteins_found.add(upstream_proteins[len(upstream_proteins) - idx - 1])
-                        except (ValueError, IndexError):
-                            pass
-
-                    elif '_D' in query_id:
-                        # Extract position number
-                        position_num = query_id.split('_D')[-1]
+                    # Check if this protein is in our downstream list
+                    elif protein_id in downstream_proteins:
+                        idx = downstream_proteins.index(protein_id)
+                        position_num = idx + 1  # D1, D2, D3, ...
                         position_id = f"D{position_num}"
                         proteins_found.add(position_id)
-
-                        # Also add the actual protein ID for SwissProt lookup
-                        try:
-                            idx = int(position_num) - 1
-                            if 0 <= idx < len(downstream_proteins):
-                                proteins_found.add(downstream_proteins[idx])
-                        except (ValueError, IndexError):
-                            pass
+                        proteins_found.add(protein_id)  # Also add for SwissProt lookup
         else:
             # No synteny block for this genome
             row['synteny_pct'] = 0
