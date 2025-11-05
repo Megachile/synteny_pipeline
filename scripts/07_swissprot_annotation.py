@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Step 07: Annotate flanking proteins with SwissProt.
+Step 07: Annotate flanking proteins with SwissProt - ONLY proteins in synteny blocks.
 
-Searches extracted hit sequences from each genome against SwissProt
-to get functional annotations for comparative analysis.
+CRITICAL FIX: Only annotates proteins that are actually members of the filtered synteny blocks,
+not all DIAMOND hits. Uses synteny_blocks_filtered.tsv to identify which block to use per genome,
+then filters flanking_blast_all.tsv to get only proteins in those blocks.
 
 Usage:
-    python 07_swissprot_annotation.py \\
-        --synteny-dir <path/to/02_synteny_blocks> \\
-        --swissprot-db <path/to/swissprot.dmnd> \\
-        --output-dir <path/to/swissprot_annotations> \\
-        [--evalue 1e-5] \\
+    python 07_swissprot_annotation.py \
+        --synteny-dir <path/to/02_synteny_blocks> \
+        --filtered-blocks <path/to/synteny_blocks_filtered.tsv> \
+        --swissprot-db <path/to/swissprot.dmnd> \
+        --output-dir <path/to/swissprot_annotations> \
+        [--evalue 1e-5] \
         [--threads 16]
 """
 
@@ -21,6 +23,7 @@ import xml.etree.ElementTree as ET
 from Bio import SeqIO
 import argparse
 import re
+from collections import defaultdict
 
 def run_diamond(query_file, output_xml, swissprot_db, evalue, threads, use_diamond=True):
     """Run DIAMOND against SwissProt database (100-1000x faster than BLASTP)."""
@@ -107,6 +110,83 @@ def parse_swissprot_xml(xml_file):
 
     return annotations
 
+def load_synteny_block_proteins(locus_id, synteny_dir, filtered_blocks_df):
+    """
+    Load the list of protein IDs that are in the filtered synteny blocks.
+
+    Returns dict: genome_id -> set of protein IDs (sseqid) in that genome's best block
+    """
+    # Get the filtered blocks for this locus
+    locus_blocks = filtered_blocks_df[filtered_blocks_df['locus_id'] == locus_id]
+
+    if locus_blocks.empty:
+        print(f"  WARNING: No filtered blocks found for {locus_id}")
+        return {}
+
+    # Load flanking_blast_all.tsv which has block assignments
+    blast_file = synteny_dir / locus_id / "flanking_blast_all.tsv"
+    if not blast_file.exists():
+        print(f"  WARNING: Flanking BLAST file not found: {blast_file}")
+        return {}
+
+    blast_df = pd.read_csv(blast_file, sep='\t')
+
+    # For each genome, get the proteins in its best block
+    genome_to_proteins = {}
+
+    for _, block_row in locus_blocks.iterrows():
+        genome = block_row['genome']
+        block_id = block_row['block_id']
+
+        # Get all proteins in this block
+        block_proteins = blast_df[
+            (blast_df['genome'] == genome) &
+            (blast_df['block_id'] == block_id)
+        ]['sseqid'].unique()
+
+        genome_to_proteins[genome] = set(block_proteins)
+
+    return genome_to_proteins
+
+def filter_fasta_by_proteins(input_fasta, protein_ids, output_fasta):
+    """
+    Filter a FASTA file to only include sequences matching the given protein IDs.
+
+    Matches sseqid (scaffold names) from BLAST results against FASTA headers.
+    """
+    kept_seqs = []
+
+    for record in SeqIO.parse(input_fasta, "fasta"):
+        # Header format: genome_bkprotein_scaffold_coords_hitN
+        # Example: GCA_037103525.1_XP_033209112.1|LOC117167954_CM021339.1_RagTag_53458720-53459925_hit1
+        # The sseqid from BLAST is the scaffold name (e.g., CM021339.1_RagTag)
+
+        # Extract scaffold from header
+        # Look for pattern like "scaffold:coords" in description
+        header_parts = record.description.split()
+        matched = False
+
+        for part in header_parts:
+            if ':' in part:
+                # Extract scaffold (before colon)
+                scaffold_coords = part.split('|')[0]  # Remove trailing pipes
+                scaffold = scaffold_coords.split(':')[0]
+
+                if scaffold in protein_ids:
+                    kept_seqs.append(record)
+                    matched = True
+                    break
+
+        if not matched:
+            # Try matching the ID directly against protein_ids
+            if any(pid in record.id for pid in protein_ids):
+                kept_seqs.append(record)
+
+    if kept_seqs:
+        SeqIO.write(kept_seqs, output_fasta, "fasta")
+
+    return len(kept_seqs)
+
 def load_flanking_protein_mapping(locus_id, synteny_dir):
     """Load flanking proteins and create position mapping for this locus."""
     from Bio import SeqIO
@@ -150,10 +230,22 @@ def load_flanking_protein_mapping(locus_id, synteny_dir):
 
     return position_to_protein
 
-def annotate_locus_hits(locus_id, position_to_protein, synteny_dir, output_dir, swissprot_db, evalue, threads, use_diamond):
-    """Annotate hit sequences for one locus."""
+def annotate_locus_hits(locus_id, position_to_protein, synteny_dir, output_dir, filtered_blocks_df,
+                        swissprot_db, evalue, threads, use_diamond):
+    """Annotate hit sequences for one locus - ONLY proteins in synteny blocks."""
 
     print(f"\n  Processing {locus_id}...", flush=True)
+
+    # Load which proteins are in the filtered synteny blocks
+    print(f"    Loading synteny block protein assignments...", flush=True)
+    genome_to_proteins = load_synteny_block_proteins(locus_id, synteny_dir, filtered_blocks_df)
+
+    if not genome_to_proteins:
+        print(f"    No synteny blocks found for {locus_id}", flush=True)
+        return []
+
+    total_proteins = sum(len(prots) for prots in genome_to_proteins.values())
+    print(f"    Found {total_proteins} proteins in synteny blocks across {len(genome_to_proteins)} genomes", flush=True)
 
     # Find hit sequences directory
     hit_seqs_dir = synteny_dir / locus_id / "hit_sequences"
@@ -178,15 +270,32 @@ def annotate_locus_hits(locus_id, position_to_protein, synteny_dir, output_dir, 
     # Process each genome's hits
     for hit_file in hit_files:
         genome_id = hit_file.stem.replace('_hit_proteins', '')
-        print(f"    {genome_id}...", end='', flush=True)
 
-        # Run SwissProt search (DIAMOND or BLAST)
+        if genome_id not in genome_to_proteins:
+            # This genome has no synteny block for this locus
+            continue
+
+        block_protein_ids = genome_to_proteins[genome_id]
+
+        print(f"    {genome_id} ({len(block_protein_ids)} proteins in block)...", end='', flush=True)
+
+        # Filter FASTA to only proteins in the synteny block
+        filtered_fasta = locus_output / f"{genome_id}_block_proteins.fasta"
+        n_kept = filter_fasta_by_proteins(hit_file, block_protein_ids, filtered_fasta)
+
+        if n_kept == 0:
+            print(f" no proteins kept after filtering - SKIP", flush=True)
+            continue
+
+        print(f" {n_kept} seqs filtered...", end='', flush=True)
+
+        # Run SwissProt search (DIAMOND or BLAST) on filtered set
         swissprot_xml = locus_output / f"{genome_id}_swissprot.xml"
 
         if swissprot_xml.exists():
             print(" using existing result", end='', flush=True)
         else:
-            if run_diamond(hit_file, swissprot_xml, swissprot_db, evalue, threads, use_diamond):
+            if run_diamond(filtered_fasta, swissprot_xml, swissprot_db, evalue, threads, use_diamond):
                 print(" search done", end='', flush=True)
             else:
                 print(" search FAILED", flush=True)
@@ -238,12 +347,14 @@ def annotate_locus_hits(locus_id, position_to_protein, synteny_dir, output_dir, 
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Annotate flanking proteins with SwissProt",
+        description="Annotate flanking proteins with SwissProt (ONLY proteins in synteny blocks)",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
     parser.add_argument('--synteny-dir', required=True, type=Path,
                         help='Path to 02_synteny_blocks directory')
+    parser.add_argument('--filtered-blocks', required=True, type=Path,
+                        help='Path to synteny_blocks_filtered.tsv (from Phase 3)')
     parser.add_argument('--swissprot-db', required=True, type=Path,
                         help='Path to SwissProt DIAMOND database (.dmnd)')
     parser.add_argument('--output-dir', required=True, type=Path,
@@ -260,10 +371,11 @@ def main():
     args = parse_args()
 
     print("=" * 80, flush=True)
-    print("STEP 07: SWISSPROT ANNOTATION OF HIT SEQUENCES", flush=True)
+    print("STEP 07: SWISSPROT ANNOTATION (SYNTENY BLOCK PROTEINS ONLY)", flush=True)
     print("=" * 80, flush=True)
     print(f"\nInput files:")
     print(f"  Synteny directory: {args.synteny_dir}")
+    print(f"  Filtered blocks: {args.filtered_blocks}")
     print(f"  SwissProt database: {args.swissprot_db}")
     print(f"  Output directory: {args.output_dir}")
     print(f"\nParameters:")
@@ -290,32 +402,23 @@ def main():
     if not db_exists:
         print(f"  WARNING: SwissProt database not found: {args.swissprot_db}", flush=True)
         print("  Skipping SwissProt annotation...", flush=True)
-        if use_diamond:
-            print("\n  NOTE: Install DIAMOND SwissProt database:")
-            print("    1. Download: ftp://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz")
-            print("    2. Extract: gunzip uniprot_sprot.fasta.gz")
-            print("    3. Format: diamond makedb --in uniprot_sprot.fasta --db swissprot.dmnd")
-        else:
-            print("\n  NOTE: Install SwissProt for functional annotations:")
-            print("    1. Download: ftp://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz")
-            print("    2. Extract and format: makeblastdb -in uniprot_sprot.fasta -dbtype prot")
         return
 
-    # Load locus definitions from synteny directory
-    print("\n[2] Loading locus definitions...", flush=True)
-    loci_def_file = args.synteny_dir.parent / "locus_definitions.tsv"
-
-    if not loci_def_file.exists():
-        print(f"  ERROR: Locus definitions not found: {loci_def_file}", flush=True)
-        print("  Expected at parent of synteny-dir", flush=True)
+    # Load filtered synteny blocks
+    print("\n[2] Loading filtered synteny blocks...", flush=True)
+    if not args.filtered_blocks.exists():
+        print(f"  ERROR: Filtered blocks file not found: {args.filtered_blocks}", flush=True)
         return
 
-    loci_df = pd.read_csv(loci_def_file, sep='\t')
-    loci = loci_df['locus_id'].tolist()
-    print(f"  Loaded {len(loci)} loci", flush=True)
+    filtered_blocks_df = pd.read_csv(args.filtered_blocks, sep='\t')
+    print(f"  Loaded {len(filtered_blocks_df)} synteny blocks", flush=True)
+
+    # Get unique loci
+    loci = filtered_blocks_df['locus_id'].unique().tolist()
+    print(f"  Found {len(loci)} loci", flush=True)
 
     # Process each locus
-    print("\n[3] Annotating hit sequences...", flush=True)
+    print("\n[3] Annotating synteny block proteins...", flush=True)
     all_annotations = []
 
     for locus_id in loci:
@@ -325,7 +428,7 @@ def main():
 
         locus_annotations = annotate_locus_hits(
             locus_id, position_to_protein, args.synteny_dir, args.output_dir,
-            args.swissprot_db, args.evalue, args.threads, use_diamond
+            filtered_blocks_df, args.swissprot_db, args.evalue, args.threads, use_diamond
         )
         all_annotations.extend(locus_annotations)
 
@@ -352,7 +455,8 @@ def main():
             locus_annot = annot_df[annot_df['locus'] == locus_id]
             matches = len(locus_annot[locus_annot['swissprot_id'] != 'No match'])
             total = len(locus_annot)
-            print(f"  {locus_id}: {matches}/{total} ({matches/total*100:.1f}%) with SwissProt match")
+            if total > 0:
+                print(f"  {locus_id}: {matches}/{total} ({matches/total*100:.1f}%) with SwissProt match")
 
     else:
         # Create empty file

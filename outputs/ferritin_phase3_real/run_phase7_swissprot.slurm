@@ -14,9 +14,10 @@ cd /carc/scratch/projects/emartins/2016456/adam/synteny_scanning/hpc_deployment_
 source ~/.bashrc
 micromamba activate busco_env
 
-# Run Phase 7: SwissProt annotation of flanking proteins
+# Run Phase 7: SwissProt annotation of flanking proteins (ONLY those in synteny blocks)
 python scripts/07_swissprot_annotation.py \
     --synteny-dir outputs/ferritin_phase3_real/02_synteny_blocks \
+    --filtered-blocks outputs/ferritin_phase3_real/03_filtered_blocks/synteny_blocks_filtered.tsv \
     --swissprot-db data/reference/swissprot.dmnd \
     --output-dir outputs/ferritin_phase3_real/07_swissprot_annotations \
     --evalue 1e-5 \
