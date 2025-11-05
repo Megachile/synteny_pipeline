@@ -165,11 +165,15 @@ def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_d
         locus_blocks = pd.DataFrame()
 
     # Index SwissProt annotations
+    # KEY: Use bk_protein_id (the landmark protein accession) for matching
     swissprot_map = {}
     if not swissprot_df.empty:
         for _, row in swissprot_df.iterrows():
             if row['locus'] == locus_id:
-                key = (row['genome'], row['locus'], row['bk_protein'])
+                # Use bk_protein_id (e.g., XP_033209112.1) for the key, not bk_protein_annotation
+                protein_id_key = row.get('bk_protein_id', row.get('bk_protein', 'unknown'))
+                key = (row['genome'], row['locus'], protein_id_key)
+
                 # Format annotation
                 if row['swissprot_description'] == 'No SwissProt match' or pd.isna(row['swissprot_description']):
                     annotation = "no match"

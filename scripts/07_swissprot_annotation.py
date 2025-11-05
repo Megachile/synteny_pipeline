@@ -367,7 +367,8 @@ def annotate_locus_hits(locus_id, position_to_protein, synteny_dir, output_dir, 
             annot_record = {
                 'locus': locus_id,
                 'genome': genome_id,
-                'bk_protein': bk_protein_annotation,  # SwissProt functional name
+                'bk_protein_id': bk_protein_id,  # Landmark protein accession (e.g., XP_033209112.1) - KEY FOR PHASE 8
+                'bk_protein_annotation': bk_protein_annotation,  # SwissProt functional name (e.g., "Ferritin")
                 'query_id': query_id,
                 'flanking_position': flanking_pos,
                 **annot
