@@ -24,6 +24,56 @@ import pandas as pd
 from collections import OrderedDict
 import argparse
 import sys
+import re
+
+def load_extracted_seq_metadata(extraction_dir):
+    """
+    Load metadata from Phase 6 extracted sequences.
+
+    Returns dict: {locus_name: {'length_aa': int, 'status': str}}
+    """
+    metadata = {}
+
+    if not extraction_dir or not Path(extraction_dir).exists():
+        return metadata
+
+    extraction_path = Path(extraction_dir)
+
+    # Traverse genome directories
+    for genome_dir in extraction_path.iterdir():
+        if not genome_dir.is_dir():
+            continue
+
+        # Traverse locus directories
+        for locus_dir in genome_dir.iterdir():
+            if not locus_dir.is_dir():
+                continue
+
+            locus_name = locus_dir.name
+
+            # Find CDS FASTA for status
+            cds_files = list(locus_dir.glob("*_gene1_cds.fasta"))
+            protein_files = list(locus_dir.glob("*_gene1_protein.fasta"))
+
+            if cds_files and protein_files:
+                # Parse status from CDS header
+                with open(cds_files[0]) as f:
+                    header = f.readline().strip()
+                    status_match = re.search(r'status:(\w+)', header)
+                    status = status_match.group(1) if status_match else 'unknown'
+
+                # Parse length from protein header
+                with open(protein_files[0]) as f:
+                    header = f.readline().strip()
+                    length_match = re.search(r'length:(\d+)aa', header)
+                    length_aa = int(length_match.group(1)) if length_match else 0
+
+                metadata[locus_name] = {
+                    'length_aa': length_aa,
+                    'status': status
+                }
+
+    return metadata
 
 def get_protein_names_from_faa(proteins_file):
     """Extract protein names from protein.faa for better column headers."""
@@ -135,7 +185,7 @@ def parse_flanking_proteins_from_faa(flanking_file):
 
     return upstream_proteins, downstream_proteins
 
-def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_df, flanking_df, species_map, phylo_order_map, protein_names, synteny_dir):
+def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_df, flanking_df, species_map, phylo_order_map, protein_names, synteny_dir, seq_metadata):
     """Create matrix for one locus."""
 
     print(f"\n  Processing {locus_id}...")
@@ -325,13 +375,22 @@ def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_d
         genome_targets = targets_index.get(genome, [])
 
         if genome_targets:
-            # Format: "gene_family [301F; 305P]"
+            # Format: "gene_family [301I; 305P]" - use extraction metadata
             parts = []
+            locus_metadata = seq_metadata.get(locus_id, {})
+
             for target in genome_targets:
-                length = int(target.get('orf_length_aa', 0))
-                status = target.get('status', 'unknown')
-                status_letter = 'F' if status == 'functional' else 'P'
-                parts.append(f"{length}{status_letter}")
+                target_id = target['target_id']
+
+                # Look up length/status from extraction metadata
+                if target_id in locus_metadata:
+                    length = locus_metadata[target_id]['length']
+                    status = locus_metadata[target_id]['status']
+                    status_letter = 'I' if status == 'intact' else 'F' if status == 'fragment' else 'P'
+                    parts.append(f"{length}{status_letter}")
+                else:
+                    # Target wasn't extracted (likely filtered by Phase 6 deduplication)
+                    parts.append("0?")
 
             target_str = f"{gene_family} [{'; '.join(parts)}]"
             row['TARGET'] = target_str
@@ -389,6 +448,8 @@ def parse_args():
                         help='Path to genome_specific_swissprot_annotations.tsv (optional)')
     parser.add_argument('--reference-proteins', required=False, type=Path,
                         help='Path to reference protein.faa file (for column headers). Optional - will derive from SwissProt if not provided.')
+    parser.add_argument('--extracted-seqs', required=False, type=Path,
+                        help='Path to extracted sequences directory (for target length/status metadata)')
     parser.add_argument('--species-map', required=True, type=Path,
                         help='Path to gca_to_species.tsv')
     parser.add_argument('--output-dir', required=True, type=Path,
@@ -453,6 +514,14 @@ def main():
     species_map, phylo_order_map = load_species_and_phylo(args.species_map)
     print(f"  Loaded species mapping for {len(species_map)} genomes")
 
+    # Load extraction metadata (length and status from FASTA headers)
+    if args.extracted_seqs and args.extracted_seqs.exists():
+        seq_metadata = load_extracted_seq_metadata(args.extracted_seqs)
+        print(f"  Loaded extraction metadata for {len(seq_metadata)} loci")
+    else:
+        seq_metadata = {}
+        print("  No extraction metadata found")
+
     # Get protein names for better column headers
     if args.reference_proteins and args.reference_proteins.exists():
         protein_names = get_protein_names_from_faa(args.reference_proteins)
@@ -497,7 +566,7 @@ def main():
         matrix_df = create_locus_matrix(
             locus_id, locus_info, blocks_df, syntenic_targets,
             swissprot_df, flanking_df, species_map, phylo_order_map, protein_names,
-            args.synteny_dir
+            args.synteny_dir, seq_metadata
         )
 
         if not matrix_df.empty:
