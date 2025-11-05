@@ -359,6 +359,69 @@ def main():
     with open(loci_dir / "synteny_groups.json", 'w') as f:
         json.dump(synteny_groups, f, indent=2)
 
+    # Create deduplicated flanking files (remove target genes for Phase 3)
+    print("\n" + "="*80)
+    print("CREATING DEDUPLICATED FLANKING FILES")
+    print("-"*80)
+    print("\nRemoving target genes from flanking sets for downstream Phase 3 use...")
+
+    # Collect ALL target genes across entire dataset
+    all_target_genes = set()
+    for _, locus in loci_df.iterrows():
+        target_gene = locus['target_gene']
+        all_target_genes.add(target_gene)
+
+        # Also add tandem cluster members
+        if locus.get('input_is_tandem') and pd.notna(locus.get('input_cluster_members')):
+            cluster_members = str(locus['input_cluster_members']).split(',')
+            all_target_genes.update(cluster_members)
+
+    print(f"  Total target genes to filter: {len(all_target_genes)}")
+
+    # Process each locus
+    for _, locus in loci_df.iterrows():
+        locus_id = locus['locus_id']
+        flanking_file = Path(locus['flanking_file'])
+
+        if not flanking_file.exists():
+            continue
+
+        # Read flanking sequences
+        flanking_seqs = list(SeqIO.parse(flanking_file, 'fasta'))
+
+        # Filter out target genes
+        # Header format: >protein_id|LOC_ID position ...
+        dedup_seqs = []
+        removed_targets = []
+
+        for seq in flanking_seqs:
+            # Extract LOC from header
+            import re
+            match = re.search(r'LOC\d+|g\d+', seq.description)
+            if match:
+                loc_id = match.group()
+                if loc_id in all_target_genes:
+                    removed_targets.append(loc_id)
+                    continue  # Skip target genes
+
+            dedup_seqs.append(seq)
+
+        # Save deduplicated file
+        dedup_file = flanking_file.parent / f"{locus_id}_flanking_dedup.faa"
+        SeqIO.write(dedup_seqs, dedup_file, 'fasta')
+
+        original_count = len(flanking_seqs)
+        dedup_count = len(dedup_seqs)
+        removed_count = len(removed_targets)
+
+        if removed_count > 0:
+            print(f"  {locus_id}: {original_count} → {dedup_count} genes ({removed_count} targets removed)")
+            if removed_count > 5:
+                print(f"    ⚠️  High contamination: {removed_targets[:5]}...")
+
+    print(f"\n✓ Deduplicated flanking files saved as: *_flanking_dedup.faa")
+    print(f"  These files are clean for Phase 3 tblastn searches")
+
     # Summary
     print("\n" + "="*80)
     print("SUMMARY")
