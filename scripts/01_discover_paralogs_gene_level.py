@@ -61,10 +61,16 @@ LANDMARKS = {
     }
 }
 
-FLANKING_DISTANCE_KB = 1000  # Genomic distance (kb) to extract flanking genes
+# Genome-specific flanking distance caps to normalize gene counts
+# BK: 10.4 genes/Mb, LB: 42.5 genes/Mb (4.1x difference)
+# Target: ~35 flanking genes per locus for fair synteny comparison
+FLANKING_DISTANCE_KB = {
+    'BK': 1500,  # 1.5 Mb → ~31 genes expected
+    'LB': 400    # 400 kb → ~34 genes expected
+}
+MAX_FLANKING_GENES = 50  # Hard cap to prevent outliers
 EVALUE_THRESHOLD = 1e-3
 MIN_PIDENT = 40.0  # Minimum percent identity to avoid distant paralogs
-MIN_SYNTENY_MATCHES = 9  # Out of 80 flanking genes
 
 
 class GenomicMapper:
@@ -186,12 +192,13 @@ class GenomicMapper:
 
         return None
 
-    def get_flanking_genes(self, target_gene, flanking_distance_kb=1000):
+    def get_flanking_genes(self, target_gene, flanking_distance_kb=1000, max_genes=None):
         """Get flanking genes split into upstream and downstream, sorted by position.
 
         Args:
             target_gene: Gene ID to find flanking genes around
             flanking_distance_kb: Maximum distance in kb from target gene
+            max_genes: Maximum total flanking genes to return (splits evenly between upstream/downstream)
 
         Returns:
             Tuple of (upstream_genes, downstream_genes)
@@ -203,7 +210,7 @@ class GenomicMapper:
             return [], []
 
         chrom, target_pos = self.gene_positions[target_gene]
-        candidates = []  # (position, gene_id)
+        candidates = []  # (distance, position, gene_id) - track distance for sorting
 
         # Check if NCBI or BRAKER3
         if self.gene_order:  # BRAKER3
@@ -216,7 +223,7 @@ class GenomicMapper:
                     if g_chrom == chrom:
                         distance_kb = abs(g_pos - target_pos) / 1000
                         if distance_kb <= flanking_distance_kb:
-                            candidates.append((g_pos, gene))
+                            candidates.append((distance_kb, g_pos, gene))
         else:  # NCBI
             # For NCBI, chr_genes has [(pos, gene_id), ...]
             if chrom in self.chr_genes:
@@ -225,18 +232,27 @@ class GenomicMapper:
                         continue
                     distance_kb = abs(pos - target_pos) / 1000
                     if distance_kb <= flanking_distance_kb:
-                        candidates.append((pos, gene_id))
+                        candidates.append((distance_kb, pos, gene_id))
 
         # Sort by position and split into upstream/downstream
-        candidates.sort()
+        upstream = [(dist, pos, gene) for dist, pos, gene in candidates if pos < target_pos]
+        downstream = [(dist, pos, gene) for dist, pos, gene in candidates if pos >= target_pos]
 
-        upstream = [gene for pos, gene in candidates if pos < target_pos]
-        downstream = [gene for pos, gene in candidates if pos >= target_pos]
+        # Sort upstream by distance (closest first) then extract genes
+        upstream.sort(key=lambda x: x[0])
+        upstream_genes = [gene for dist, pos, gene in upstream]
 
-        # Reverse upstream so closest to target is first
-        upstream.reverse()
+        # Sort downstream by distance (closest first) then extract genes
+        downstream.sort(key=lambda x: x[0])
+        downstream_genes = [gene for dist, pos, gene in downstream]
 
-        return upstream, downstream
+        # Apply max_genes cap if specified
+        if max_genes is not None:
+            max_per_side = max_genes // 2
+            upstream_genes = upstream_genes[:max_per_side]
+            downstream_genes = downstream_genes[:max_per_side]
+
+        return upstream_genes, downstream_genes
 
     def get_representative_protein(self, gene_id):
         """Get one representative protein for a gene."""
@@ -663,8 +679,8 @@ def parse_args():
                         help='LOC ID(s) - single or comma-separated (e.g., LOC117167432,LOC117167433)')
     parser.add_argument('--output-dir', required=True, type=Path,
                         help='Output directory for locus definitions and flanking proteins')
-    parser.add_argument('--flanking-distance', type=int, default=FLANKING_DISTANCE_KB,
-                        help=f'Maximum distance (kb) to extract flanking genes (default: {FLANKING_DISTANCE_KB})')
+    # Note: flanking-distance is now genome-specific (hardcoded in script constants)
+    # BK: 1500 kb, LB: 400 kb to normalize gene counts
     parser.add_argument('--evalue', type=float, default=EVALUE_THRESHOLD,
                         help=f'E-value threshold for DIAMOND search (default: {EVALUE_THRESHOLD})')
     parser.add_argument('--min-pident', type=float, default=MIN_PIDENT,
@@ -684,8 +700,7 @@ def main():
     input_locs = [loc.strip() for loc in args.loc_ids.split(',')]
 
     # Update global parameters from arguments
-    global FLANKING_DISTANCE_KB, EVALUE_THRESHOLD, MIN_PIDENT
-    FLANKING_DISTANCE_KB = args.flanking_distance
+    global EVALUE_THRESHOLD, MIN_PIDENT
     EVALUE_THRESHOLD = args.evalue
     MIN_PIDENT = args.min_pident
 
@@ -693,7 +708,10 @@ def main():
     print("GENE-LEVEL PARALOG DISCOVERY WITH SYNTENY")
     print("="*80)
     print(f"\nParameters:")
-    print(f"  Flanking distance: {FLANKING_DISTANCE_KB} kb")
+    print(f"  Flanking distance (genome-specific):")
+    for genome, dist_kb in FLANKING_DISTANCE_KB.items():
+        print(f"    {genome}: {dist_kb} kb")
+    print(f"  Max flanking genes: {MAX_FLANKING_GENES}")
     print(f"  E-value threshold: {EVALUE_THRESHOLD}")
     print(f"  Min percent identity: {MIN_PIDENT}%")
     print(f"\nInput LOCs: {len(input_locs)}")
@@ -818,8 +836,13 @@ def main():
         print(f"\n  {genome_code}: {paralog_data['gene_count']} unique genes")
 
         for target_gene in paralog_data['unique_genes']:
-            # Get flanking genes (now returns upstream, downstream)
-            upstream_genes, downstream_genes = mappers[genome_code].get_flanking_genes(target_gene, FLANKING_DISTANCE_KB)
+            # Get flanking genes with genome-specific distance cap and max genes
+            distance_cap = FLANKING_DISTANCE_KB.get(genome_code, 1000)  # Default to 1000 if genome not specified
+            upstream_genes, downstream_genes = mappers[genome_code].get_flanking_genes(
+                target_gene,
+                flanking_distance_kb=distance_cap,
+                max_genes=MAX_FLANKING_GENES
+            )
 
             if not upstream_genes and not downstream_genes:
                 print(f"    Warning: No flanking genes found for {target_gene}")
