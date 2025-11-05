@@ -24,8 +24,8 @@ echo "===== PHASE 8a: Generate Locus Matrices ====="
 python3 scripts/08a_generate_locus_matrices.py \
   --locus-defs outputs/ferritin_phase3_real/locus_definitions.tsv \
   --synteny-dir outputs/ferritin_phase3_real/02_synteny_blocks \
-  --blocks outputs/ferritin_phase3_real/03_synteny_filtering/synteny_blocks_filtered.tsv \
-  --targets outputs/ferritin_phase3_real/04_target_genes/all_targets_classified.tsv \
+  --blocks outputs/ferritin_phase3_real/03_filtered_blocks/synteny_blocks_filtered.tsv \
+  --targets outputs/ferritin_phase3_real/05_classified/all_targets_classified.tsv \
   --swissprot outputs/ferritin_phase3_real/07_swissprot_annotations/genome_specific_swissprot_annotations.tsv \
   --extracted-seqs outputs/ferritin_phase3_real/04_target_genes/extracted_sequences \
   --species-map data/gca_to_species.tsv \

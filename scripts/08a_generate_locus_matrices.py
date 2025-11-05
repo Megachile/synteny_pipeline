@@ -377,20 +377,22 @@ def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_d
         if genome_targets:
             # Format: "gene_family [301I; 305P]" - use extraction metadata
             parts = []
-            locus_metadata = seq_metadata.get(locus_id, {})
 
             for target in genome_targets:
-                target_id = target['target_id']
+                target_id = target['locus_name']  # Use locus_name column
 
-                # Look up length/status from extraction metadata
-                if target_id in locus_metadata:
-                    length = locus_metadata[target_id]['length']
-                    status = locus_metadata[target_id]['status']
+                # Look up length/status from extraction metadata (flat dict)
+                if target_id in seq_metadata:
+                    length = seq_metadata[target_id]['length_aa']
+                    status = seq_metadata[target_id]['status']
+
+                    # Skip targets that failed extraction (Phase 6 deduplication removes these)
+                    if length == 0:
+                        continue
+
                     status_letter = 'I' if status == 'intact' else 'F' if status == 'fragment' else 'P'
                     parts.append(f"{length}{status_letter}")
-                else:
-                    # Target wasn't extracted (likely filtered by Phase 6 deduplication)
-                    parts.append("0?")
+                # If not in metadata at all, it wasn't extracted - skip it
 
             target_str = f"{gene_family} [{'; '.join(parts)}]"
             row['TARGET'] = target_str
