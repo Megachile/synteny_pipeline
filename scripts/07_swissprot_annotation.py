@@ -110,11 +110,11 @@ def parse_swissprot_xml(xml_file):
 
     return annotations
 
-def load_synteny_block_proteins(locus_id, synteny_dir, filtered_blocks_df):
+def load_synteny_block_hits(locus_id, synteny_dir, filtered_blocks_df):
     """
-    Load the list of protein IDs that are in the filtered synteny blocks.
+    Load the specific BLAST hits that are in the filtered synteny blocks.
 
-    Returns dict: genome_id -> set of protein IDs (sseqid) in that genome's best block
+    Returns dict: genome_id -> set of (qseqid, sseqid, coord_start, coord_end) tuples
     """
     # Get the filtered blocks for this locus
     locus_blocks = filtered_blocks_df[filtered_blocks_df['locus_id'] == locus_id]
@@ -131,56 +131,82 @@ def load_synteny_block_proteins(locus_id, synteny_dir, filtered_blocks_df):
 
     blast_df = pd.read_csv(blast_file, sep='\t')
 
-    # For each genome, get the proteins in its best block
-    genome_to_proteins = {}
+    # For each genome, get the SPECIFIC HITS in its best block
+    genome_to_hits = {}
 
     for _, block_row in locus_blocks.iterrows():
         genome = block_row['genome']
         block_id = block_row['block_id']
 
-        # Get all proteins in this block
-        block_proteins = blast_df[
+        # Get all BLAST hits in this specific block
+        block_hits = blast_df[
             (blast_df['genome'] == genome) &
             (blast_df['block_id'] == block_id)
-        ]['sseqid'].unique()
+        ]
 
-        genome_to_proteins[genome] = set(block_proteins)
+        # Create set of (qseqid, sseqid, coord_start, coord_end) tuples
+        hit_set = set()
+        for _, hit in block_hits.iterrows():
+            hit_set.add((
+                hit['qseqid'],
+                hit['sseqid'],
+                int(hit['coord_start']),
+                int(hit['coord_end'])
+            ))
 
-    return genome_to_proteins
+        genome_to_hits[genome] = hit_set
 
-def filter_fasta_by_proteins(input_fasta, protein_ids, output_fasta):
+    return genome_to_hits
+
+def filter_fasta_by_hits(input_fasta, hit_set, output_fasta):
     """
-    Filter a FASTA file to only include sequences matching the given protein IDs.
+    Filter a FASTA file to only include sequences matching specific BLAST hits.
 
-    Matches sseqid (scaffold names) from BLAST results against FASTA headers.
+    Matches by (qseqid, sseqid, coords) from BLAST results against FASTA headers.
+
+    Header format: genome_qseqid_sseqid_coords_hitN
+    Example: GCA_011634705.1_XP_033209112.1|LOC117167954_JAABKJ010027599_782-1942_hit1
+    Description: GCA_011634705.1 | XP_033209112.1|LOC117167954 hit | JAABKJ010027599:782-1942(+) | ...
     """
     kept_seqs = []
 
     for record in SeqIO.parse(input_fasta, "fasta"):
-        # Header format: genome_bkprotein_scaffold_coords_hitN
-        # Example: GCA_037103525.1_XP_033209112.1|LOC117167954_CM021339.1_RagTag_53458720-53459925_hit1
-        # The sseqid from BLAST is the scaffold name (e.g., CM021339.1_RagTag)
+        # Parse FASTA header to extract qseqid, sseqid, coordinates
+        # Description format: "genome | qseqid hit | sseqid:start-end(strand) | ..."
+        desc_parts = record.description.split('|')
 
-        # Extract scaffold from header
-        # Look for pattern like "scaffold:coords" in description
-        header_parts = record.description.split()
-        matched = False
+        if len(desc_parts) < 3:
+            continue
 
-        for part in header_parts:
-            if ':' in part:
-                # Extract scaffold (before colon)
-                scaffold_coords = part.split('|')[0]  # Remove trailing pipes
-                scaffold = scaffold_coords.split(':')[0]
+        try:
+            # Extract qseqid from second field (e.g., " XP_033209112.1|LOC117167954 hit ")
+            qseqid = desc_parts[1].strip().replace(' hit', '').strip()
 
-                if scaffold in protein_ids:
-                    kept_seqs.append(record)
-                    matched = True
-                    break
+            # Extract sseqid and coords from third field (e.g., " JAABKJ010027599:782-1942(+) ")
+            scaffold_info = desc_parts[2].strip().split(':')
+            if len(scaffold_info) < 2:
+                continue
 
-        if not matched:
-            # Try matching the ID directly against protein_ids
-            if any(pid in record.id for pid in protein_ids):
+            sseqid = scaffold_info[0].strip()
+            coords_strand = scaffold_info[1].strip()  # e.g., "782-1942(+)"
+
+            # Extract coordinates (remove strand info)
+            coords = coords_strand.split('(')[0]  # Remove "(+)" or "(-)"
+            coord_parts = coords.split('-')
+            if len(coord_parts) != 2:
+                continue
+
+            coord_start = int(coord_parts[0])
+            coord_end = int(coord_parts[1])
+
+            # Check if this hit is in our set
+            hit_tuple = (qseqid, sseqid, coord_start, coord_end)
+            if hit_tuple in hit_set:
                 kept_seqs.append(record)
+
+        except (ValueError, IndexError) as e:
+            # Skip malformed headers
+            continue
 
     if kept_seqs:
         SeqIO.write(kept_seqs, output_fasta, "fasta")
@@ -232,20 +258,20 @@ def load_flanking_protein_mapping(locus_id, synteny_dir):
 
 def annotate_locus_hits(locus_id, position_to_protein, synteny_dir, output_dir, filtered_blocks_df,
                         swissprot_db, evalue, threads, use_diamond):
-    """Annotate hit sequences for one locus - ONLY proteins in synteny blocks."""
+    """Annotate hit sequences for one locus - ONLY hits in synteny blocks."""
 
     print(f"\n  Processing {locus_id}...", flush=True)
 
-    # Load which proteins are in the filtered synteny blocks
-    print(f"    Loading synteny block protein assignments...", flush=True)
-    genome_to_proteins = load_synteny_block_proteins(locus_id, synteny_dir, filtered_blocks_df)
+    # Load which BLAST hits are in the filtered synteny blocks
+    print(f"    Loading synteny block hit assignments...", flush=True)
+    genome_to_hits = load_synteny_block_hits(locus_id, synteny_dir, filtered_blocks_df)
 
-    if not genome_to_proteins:
+    if not genome_to_hits:
         print(f"    No synteny blocks found for {locus_id}", flush=True)
         return []
 
-    total_proteins = sum(len(prots) for prots in genome_to_proteins.values())
-    print(f"    Found {total_proteins} proteins in synteny blocks across {len(genome_to_proteins)} genomes", flush=True)
+    total_hits = sum(len(hits) for hits in genome_to_hits.values())
+    print(f"    Found {total_hits} BLAST hits in synteny blocks across {len(genome_to_hits)} genomes", flush=True)
 
     # Find hit sequences directory
     hit_seqs_dir = synteny_dir / locus_id / "hit_sequences"
@@ -271,17 +297,17 @@ def annotate_locus_hits(locus_id, position_to_protein, synteny_dir, output_dir, 
     for hit_file in hit_files:
         genome_id = hit_file.stem.replace('_hit_proteins', '')
 
-        if genome_id not in genome_to_proteins:
+        if genome_id not in genome_to_hits:
             # This genome has no synteny block for this locus
             continue
 
-        block_protein_ids = genome_to_proteins[genome_id]
+        block_hit_set = genome_to_hits[genome_id]
 
-        print(f"    {genome_id} ({len(block_protein_ids)} proteins in block)...", end='', flush=True)
+        print(f"    {genome_id} ({len(block_hit_set)} hits in block)...", end='', flush=True)
 
-        # Filter FASTA to only proteins in the synteny block
-        filtered_fasta = locus_output / f"{genome_id}_block_proteins.fasta"
-        n_kept = filter_fasta_by_proteins(hit_file, block_protein_ids, filtered_fasta)
+        # Filter FASTA to only hits in the synteny block
+        filtered_fasta = locus_output / f"{genome_id}_block_hits.fasta"
+        n_kept = filter_fasta_by_hits(hit_file, block_hit_set, filtered_fasta)
 
         if n_kept == 0:
             print(f" no proteins kept after filtering - SKIP", flush=True)
