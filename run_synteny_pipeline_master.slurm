@@ -81,19 +81,21 @@ log ""
 # Load environment
 log "Loading environment..."
 set +u  # Temporarily disable for bashrc
-source ~/.bashrc
-micromamba activate busco_env
+source ~/.bashrc || { log "ERROR: Failed to source ~/.bashrc"; exit 1; }
+micromamba activate busco_env || { log "ERROR: Failed to activate busco_env"; exit 1; }
 set -u
+log "Environment activated: busco_env"
 
 # Verify tools available
 log "Verifying tools..."
-python --version || { log "ERROR: Python not found"; exit 1; }
-tblastn -version | head -1 || { log "ERROR: tblastn not found"; exit 1; }
-diamond --version | head -1 || { log "ERROR: diamond not found"; exit 1; }
+python --version 2>&1 | head -1 || { log "ERROR: Python not found"; exit 1; }
+tblastn -version 2>&1 | head -1 || { log "ERROR: tblastn not found"; exit 1; }
+diamond --version 2>&1 | head -1 || { log "ERROR: diamond not found"; exit 1; }
 
 # Load Exonerate module
+log "Loading Exonerate module..."
 module load exonerate/2.4.0-yl7q || { log "ERROR: Failed to load exonerate module"; exit 1; }
-exonerate --version | head -1 || { log "ERROR: exonerate not found"; exit 1; }
+which exonerate > /dev/null || { log "ERROR: exonerate not found in PATH"; exit 1; }
 
 log "Environment ready"
 log ""
@@ -106,28 +108,41 @@ log_phase "PHASE 1: PARALOG DISCOVERY IN LANDMARK GENOMES"
 PHASE12_DIR="outputs/${OUTPUT_DIR}/phase12_landmark"
 mkdir -p ${PHASE12_DIR}
 
-log "Input: inputs/${GENE_FAMILY}_mc*_test.tsv (auto-detected)"
+log "Input: inputs/${GENE_FAMILY}*_test.tsv (auto-detected)"
 log "Output: ${PHASE12_DIR}/"
 
-# Find input file (allow flexible naming)
-INPUT_FILE=$(ls inputs/${GENE_FAMILY}*.tsv 2>/dev/null | head -1)
+# Find input file (prefer *_test.tsv, skip *_locus_definitions.tsv which is Phase 2 output)
+INPUT_FILE=$(ls inputs/${GENE_FAMILY}*_test.tsv 2>/dev/null | head -1)
 if [ -z "$INPUT_FILE" ]; then
-    log "ERROR: No input file found matching inputs/${GENE_FAMILY}*.tsv"
+    # Fallback: try any .tsv file that's NOT locus_definitions
+    INPUT_FILE=$(ls inputs/${GENE_FAMILY}*.tsv 2>/dev/null | grep -v "locus_definitions" | head -1)
+fi
+if [ -z "$INPUT_FILE" ]; then
+    log "ERROR: No input file found matching inputs/${GENE_FAMILY}*_test.tsv"
     exit 1
 fi
 log "Using input: $INPUT_FILE"
 
+# Extract LOC IDs from the target_genes column (skip header, get 2nd column)
+LOC_IDS=$(tail -n +2 "$INPUT_FILE" | cut -f2 | tr -d '\r')
+if [ -z "$LOC_IDS" ]; then
+    log "ERROR: No LOC IDs found in $INPUT_FILE"
+    exit 1
+fi
+log "LOC IDs: $LOC_IDS"
+
 if python scripts/01_discover_paralogs_gene_level.py \
-    --input "$INPUT_FILE" \
+    --loc-ids "$LOC_IDS" \
     --output-dir ${PHASE12_DIR} \
+    --gene-family ${GENE_FAMILY} \
     2>&1 | tee -a logs/phase1_${GENE_FAMILY}.log; then
 
     log "✓ Phase 1 complete"
 
     # Verify outputs
-    check_file "${PHASE12_DIR}/unique_loci.tsv"
-    NUM_LOCI=$(tail -n +2 "${PHASE12_DIR}/unique_loci.tsv" | wc -l)
-    log "  Found ${NUM_LOCI} unique loci"
+    check_file "${PHASE12_DIR}/locus_definitions.tsv"
+    NUM_LOCI=$(tail -n +2 "${PHASE12_DIR}/locus_definitions.tsv" | wc -l)
+    log "  Found ${NUM_LOCI} loci across landmark genomes"
 else
     log "❌ Phase 1 failed - check logs/phase1_${GENE_FAMILY}.log"
     exit 1
@@ -138,26 +153,20 @@ fi
 ################################################################################
 log_phase "PHASE 2: SYNTENY-BASED DEDUPLICATION"
 
-log "Input: ${PHASE12_DIR}/unique_loci.tsv"
-log "Output: ${PHASE12_DIR}/locus_definitions.tsv"
+log "Input: ${PHASE12_DIR}/locus_definitions.tsv"
+log "Output: ${PHASE12_DIR}/synteny_comparisons.tsv"
 
-if python scripts/02_compare_synteny_gene_level.py \
-    --input ${PHASE12_DIR}/unique_loci.tsv \
-    --output-dir ${PHASE12_DIR} \
+if python scripts/02_compare_synteny_gene_level.py ${PHASE12_DIR} \
     2>&1 | tee -a logs/phase2_${GENE_FAMILY}.log; then
 
     log "✓ Phase 2 complete"
 
     # Verify outputs
-    check_file "${PHASE12_DIR}/locus_definitions.tsv"
-    NUM_DEFS=$(tail -n +2 "${PHASE12_DIR}/locus_definitions.tsv" | wc -l)
-    log "  Generated ${NUM_DEFS} locus definitions for genome-wide search"
+    check_file "${PHASE12_DIR}/synteny_comparisons.tsv"
+    check_file "${PHASE12_DIR}/synteny_groups.json"
 
-    # Show locus IDs
-    log "  Loci to search:"
-    tail -n +2 "${PHASE12_DIR}/locus_definitions.tsv" | cut -f1 | while read locus; do
-        log "    - ${locus}"
-    done
+    NUM_GROUPS=$(python -c "import json; print(len(json.load(open('${PHASE12_DIR}/synteny_groups.json'))))")
+    log "  Created ${NUM_GROUPS} synteny groups after deduplication"
 else
     log "❌ Phase 2 failed - check logs/phase2_${GENE_FAMILY}.log"
     exit 1
@@ -172,12 +181,12 @@ PHASE3_DIR="outputs/${OUTPUT_DIR}"
 mkdir -p ${PHASE3_DIR}
 
 log "Input: ${PHASE12_DIR}/locus_definitions.tsv"
-log "Genome databases: data/blast_dbs/"
+log "Genome databases: data/ragtag_dbs/"
 log "Output: ${PHASE3_DIR}/02_synteny_blocks/"
 
 if python scripts/02_synteny_detection.py \
     --locus-defs ${PHASE12_DIR}/locus_definitions.tsv \
-    --genome-db-dir data/blast_dbs \
+    --genome-db-dir data/ragtag_dbs \
     --output-dir ${PHASE3_DIR}/02_synteny_blocks \
     --evalue 1e-5 \
     --max-targets 50 \

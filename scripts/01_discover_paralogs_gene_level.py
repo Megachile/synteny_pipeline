@@ -315,8 +315,8 @@ def detect_input_tandem_clusters(input_locs, mapper, max_distance_kb=50):
     positions = {}
     for loc in input_locs:
         if loc in mapper.gene_positions:
-            chrom, start, end, strand = mapper.gene_positions[loc]
-            positions[loc] = {'chrom': chrom, 'start': start, 'end': end, 'strand': strand}
+            chrom, start = mapper.gene_positions[loc]
+            positions[loc] = {'chrom': chrom, 'start': start}
         else:
             print(f"  Warning: {loc} not found in BK genome")
 
@@ -335,8 +335,9 @@ def detect_input_tandem_clusters(input_locs, mapper, max_distance_kb=50):
             prev_loc = current_cluster[-1]
 
             # Check if on same chromosome and within max distance
+            # Use start-to-start distance since we don't store gene end positions
             if (positions[loc]['chrom'] == positions[prev_loc]['chrom'] and
-                abs(positions[loc]['start'] - positions[prev_loc]['end']) < max_distance_kb * 1000):
+                abs(positions[loc]['start'] - positions[prev_loc]['start']) < max_distance_kb * 1000):
                 current_cluster.append(loc)
             else:
                 # Start new cluster

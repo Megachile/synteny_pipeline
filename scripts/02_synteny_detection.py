@@ -27,6 +27,10 @@ from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 
+# Configuration constants
+MIN_PROTEINS_FOR_BLOCK = 3  # Minimum target proteins to call a synteny block
+MAX_FLANKING_FOR_SYNTENY = 80  # Maximum flanking proteins to use (40 upstream + 40 downstream)
+
 def run_tblastn(query_file, genome_db, output_xml, evalue="1e-5", max_targets=50, threads=16):
     """Run tBLASTn search."""
     cmd = [
@@ -132,7 +136,7 @@ def cluster_into_blocks(hits, max_gap_kb=500):
                 # Save current block and start new one
                 # Count unique TARGET proteins (sseqid) in the genome, not query proteins
                 unique_target_proteins = len(set((h['sseqid'], h['coord_start'], h['coord_end']) for h in current_block_hits))
-                if unique_target_proteins >= config.MIN_PROTEINS_FOR_BLOCK:
+                if unique_target_proteins >= MIN_PROTEINS_FOR_BLOCK:
                     blocks.append({
                         'block_id': f"block_{block_id:05d}",
                         'scaffold': scaffold,
@@ -150,7 +154,7 @@ def cluster_into_blocks(hits, max_gap_kb=500):
         # Don't forget the last block
         # Count unique TARGET proteins (sseqid) in the genome, not query proteins
         unique_target_proteins = len(set((h['sseqid'], h['coord_start'], h['coord_end']) for h in current_block_hits))
-        if unique_target_proteins >= config.MIN_PROTEINS_FOR_BLOCK:
+        if unique_target_proteins >= MIN_PROTEINS_FOR_BLOCK:
             blocks.append({
                 'block_id': f"block_{block_id:05d}",
                 'scaffold': scaffold,
@@ -205,7 +209,7 @@ def save_hit_sequences(hits, genome_id, locus_output):
     
     return len(sequences)
 
-def filter_flanking_proteins(flanking_file, locus_id):
+def filter_flanking_proteins(flanking_file, locus_id, output_dir):
     """
     Filter flanking proteins to top N for synteny detection.
 
@@ -215,6 +219,7 @@ def filter_flanking_proteins(flanking_file, locus_id):
     Args:
         flanking_file: Path to original flanking proteins file
         locus_id: Locus identifier for naming
+        output_dir: Base output directory for filtered files
 
     Returns:
         Path to filtered flanking file, or None on error
@@ -224,7 +229,7 @@ def filter_flanking_proteins(flanking_file, locus_id):
         filtered_seqs = []
         with open(flanking_file, 'r') as f:
             for i, record in enumerate(SeqIO.parse(f, 'fasta')):
-                if i >= config.MAX_FLANKING_FOR_SYNTENY:
+                if i >= MAX_FLANKING_FOR_SYNTENY:
                     break
                 filtered_seqs.append(record)
 
@@ -233,7 +238,7 @@ def filter_flanking_proteins(flanking_file, locus_id):
             return None
 
         # Save filtered file in output directory
-        filtered_path = config.STEP02_SYNTENY / locus_id / f"{locus_id}_flanking_filtered.faa"
+        filtered_path = Path(output_dir) / locus_id / f"{locus_id}_flanking_filtered.faa"
         filtered_path.parent.mkdir(exist_ok=True, parents=True)
 
         with open(filtered_path, 'w') as f:
@@ -258,7 +263,7 @@ def process_locus(locus_id, flanking_file, genome_dbs, output_dir, evalue="1e-5"
         return []
 
     # Filter flanking proteins to top N for efficiency
-    filtered_flanking = filter_flanking_proteins(flanking_file, locus_id)
+    filtered_flanking = filter_flanking_proteins(flanking_file, locus_id, output_dir)
     if filtered_flanking is None:
         print(f"    ERROR: Failed to filter flanking proteins")
         return []
