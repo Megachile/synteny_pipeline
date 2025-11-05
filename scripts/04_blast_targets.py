@@ -105,85 +105,209 @@ def parse_blast_xml(xml_file):
 
     return hits
 
-def cluster_into_loci(hits, locus_id, gene_family, gap_kb=50, min_hits=1):
-    """Cluster target hits into loci based on proximity.
+def merge_intervals(intervals):
+    """Merge overlapping intervals to create coverage track.
 
     Args:
-        gap_kb: Maximum gap in kb between hits to cluster together
-        min_hits: Minimum number of hits to call a locus (default 1 for target genes)
+        intervals: List of (start, end) tuples
+
+    Returns:
+        List of non-overlapping (start, end) tuples sorted by start position
+    """
+    if not intervals:
+        return []
+
+    # Sort by start position
+    sorted_intervals = sorted(intervals, key=lambda x: x[0])
+    merged = [sorted_intervals[0]]
+
+    for current in sorted_intervals[1:]:
+        last_merged = merged[-1]
+
+        # If current overlaps with last merged, extend the last merged
+        if current[0] <= last_merged[1]:
+            merged[-1] = (last_merged[0], max(last_merged[1], current[1]))
+        else:
+            # No overlap, start new interval
+            merged.append(current)
+
+    return merged
+
+
+def find_coverage_gaps(coverage_track, min_gap_kb=10):
+    """Find zero-coverage gaps >= min_gap_kb between coverage segments.
+
+    Args:
+        coverage_track: List of (start, end) coverage intervals
+        min_gap_kb: Minimum gap size in kb to be considered a breakpoint
+
+    Returns:
+        List of (gap_start, gap_end, gap_size_kb) tuples
+    """
+    gaps = []
+    for i in range(len(coverage_track) - 1):
+        gap_start = coverage_track[i][1]  # end of current segment
+        gap_end = coverage_track[i+1][0]  # start of next segment
+        gap_size_kb = (gap_end - gap_start) / 1000
+
+        if gap_size_kb >= min_gap_kb:
+            gaps.append((gap_start, gap_end, gap_size_kb))
+
+    return gaps
+
+
+def chain_hsps_simple(hits, segment_start, segment_end):
+    """Chain HSPs within a coverage segment using simple colinear scoring.
+
+    Args:
+        hits: List of HSP hits within this segment
+        segment_start: Start of coverage segment
+        segment_end: End of coverage segment
+
+    Returns:
+        List of chains (each chain is a list of hits)
     """
     if not hits:
         return []
 
-    # Group by scaffold, strand, and reading frame
-    # Reading frame is critical - HSPs in different frames cannot be the same gene
+    # Sort by subject start position
+    hits = sorted(hits, key=lambda h: h['start'])
+
+    # For now, use simple greedy chaining:
+    # All hits in the segment belong to one chain (they share coverage)
+    # Future enhancement: DP-based chaining considering bitscore and gaps
+
+    # Filter hits that actually fall within segment bounds
+    segment_hits = [h for h in hits if h['start'] >= segment_start and h['end'] <= segment_end]
+
+    if segment_hits:
+        return [segment_hits]  # Single chain containing all hits
+    else:
+        return []
+
+
+def cluster_into_loci(hits, locus_id, gene_family, min_split_gap_kb=10, min_hits=1):
+    """Cluster target hits into loci using coverage-track-based splitting.
+
+    NEW ALGORITHM:
+    1. Group by scaffold and strand ONLY (ignore frame - it flips at exon boundaries)
+    2. Build HSP coverage track (union of all HSP intervals, any frame)
+    3. Split at zero-coverage gaps >= min_split_gap_kb (hard breakpoints)
+    4. Within each segment, chain HSPs by colinear order
+    5. Each chain becomes a locus
+
+    Args:
+        hits: List of BLAST HSP hits
+        locus_id: Base locus ID for naming
+        gene_family: Gene family name
+        min_split_gap_kb: Minimum zero-coverage gap (kb) to split clusters (default 10kb)
+        min_hits: Minimum number of hits to call a locus (default 1)
+
+    Returns:
+        List of locus dictionaries
+    """
+    if not hits:
+        return []
+
+    # Group by scaffold and strand ONLY (no frame)
     scaffold_hits = defaultdict(list)
     for hit in hits:
-        frame = hit.get('frame', 0)  # Default to 0 if frame not present
-        key = (hit['scaffold'], hit['strand'], frame)
+        key = (hit['scaffold'], hit['strand'])
         scaffold_hits[key].append(hit)
 
     loci = []
     locus_num = 1
 
-    for (scaffold, strand, frame), s_hits in scaffold_hits.items():
-        # Sort by position
-        s_hits.sort(key=lambda x: x['start'])
+    for (scaffold, strand), s_hits in scaffold_hits.items():
+        # Build coverage track: union of all HSP intervals (any frame)
+        intervals = [(h['start'], h['end']) for h in s_hits]
+        coverage_track = merge_intervals(intervals)
 
-        # Cluster by gap
-        current_cluster = [s_hits[0]]
+        # Find coverage gaps >= min_split_gap_kb
+        gaps = find_coverage_gaps(coverage_track, min_split_gap_kb)
 
-        for hit in s_hits[1:]:
-            prev_end = current_cluster[-1]['end']
-            gap = (hit['start'] - prev_end) / 1000  # kb
+        # Create split points from gaps
+        split_points = []
+        for gap_start, gap_end, gap_size_kb in gaps:
+            split_points.append(gap_start)  # End of segment before gap
+            split_points.append(gap_end)    # Start of segment after gap
 
-            if gap <= gap_kb:
-                current_cluster.append(hit)
-            else:
-                # Save current cluster as locus
-                if len(current_cluster) >= min_hits:
+        # If no splits, all hits belong to one locus
+        if not split_points:
+            # No large gaps - all hits form one locus
+            if len(s_hits) >= min_hits:
+                locus_name = f"{locus_id}_{scaffold}_{locus_num:03d}"
+                start = min(h['start'] for h in s_hits)
+                end = max(h['end'] for h in s_hits)
+                best_evalue = min(h['evalue'] for h in s_hits)
+                frames = {h.get('frame', 0) for h in s_hits}
+
+                loci.append({
+                    'locus_name': locus_name,
+                    'scaffold': scaffold,
+                    'strand': strand,
+                    'frame': list(frames)[0] if len(frames) == 1 else 0,
+                    'frames_present': ','.join(map(str, sorted(frames))),
+                    'start': start,
+                    'end': end,
+                    'span_kb': (end - start) / 1000,
+                    'num_hits': len(s_hits),
+                    'gene_family': gene_family,
+                    'best_evalue': best_evalue
+                })
+                locus_num += 1
+        else:
+            # Split hits based on gap boundaries
+            split_points.sort()
+
+            # Add boundaries at start and end
+            all_positions = sorted([h['start'] for h in s_hits] + [h['end'] for h in s_hits])
+            region_start = all_positions[0]
+            region_end = all_positions[-1]
+
+            # Create segments between split points
+            segments = []
+            current_start = region_start
+
+            for i in range(0, len(split_points), 2):
+                segment_end = split_points[i]  # End before gap
+                segments.append((current_start, segment_end))
+
+                if i + 1 < len(split_points):
+                    current_start = split_points[i + 1]  # Start after gap
+
+            # Add final segment
+            if current_start < region_end:
+                segments.append((current_start, region_end))
+
+            # Assign hits to segments and create loci
+            for seg_start, seg_end in segments:
+                segment_hits = [
+                    h for h in s_hits
+                    if not (h['end'] < seg_start or h['start'] > seg_end)
+                ]
+
+                if len(segment_hits) >= min_hits:
                     locus_name = f"{locus_id}_{scaffold}_{locus_num:03d}"
-                    start = min(h['start'] for h in current_cluster)
-                    end = max(h['end'] for h in current_cluster)
-                    best_evalue = min(h['evalue'] for h in current_cluster)
+                    start = min(h['start'] for h in segment_hits)
+                    end = max(h['end'] for h in segment_hits)
+                    best_evalue = min(h['evalue'] for h in segment_hits)
+                    frames = {h.get('frame', 0) for h in segment_hits}
 
                     loci.append({
                         'locus_name': locus_name,
                         'scaffold': scaffold,
                         'strand': strand,
-                        'frame': frame,
+                        'frame': list(frames)[0] if len(frames) == 1 else 0,
+                        'frames_present': ','.join(map(str, sorted(frames))),
                         'start': start,
                         'end': end,
                         'span_kb': (end - start) / 1000,
-                        'num_hits': len(current_cluster),
+                        'num_hits': len(segment_hits),
                         'gene_family': gene_family,
                         'best_evalue': best_evalue
                     })
                     locus_num += 1
-
-                # Start new cluster
-                current_cluster = [hit]
-
-        # Save final cluster
-        if len(current_cluster) >= min_hits:
-            locus_name = f"{locus_id}_{scaffold}_{locus_num:03d}"
-            start = min(h['start'] for h in current_cluster)
-            end = max(h['end'] for h in current_cluster)
-            best_evalue = min(h['evalue'] for h in current_cluster)
-
-            loci.append({
-                'locus_name': locus_name,
-                'scaffold': scaffold,
-                'strand': strand,
-                'frame': frame,
-                'start': start,
-                'end': end,
-                'span_kb': (end - start) / 1000,
-                'num_hits': len(current_cluster),
-                'gene_family': gene_family,
-                'best_evalue': best_evalue
-            })
-            locus_num += 1
 
     return loci
 
@@ -318,11 +442,13 @@ def main():
 
     print(f"  Completed {len(genome_hits)} genomes", flush=True)
 
-    # Infer gap_kb from config or use default
-    gap_kb = 50  # Default clustering gap
+    # Set minimum coverage gap for splitting clusters
+    # Gaps >= this size (kb) with zero coverage will split loci
+    min_split_gap_kb = 10  # Default: 10kb zero-coverage gap splits clusters
 
     # Process all hits - NO per-locus duplication
-    print("\n[6] Clustering target hits (frame-aware)...", flush=True)
+    print("\n[6] Clustering target hits (coverage-track-based)...", flush=True)
+    print(f"    Algorithm: Split at zero-coverage gaps >= {min_split_gap_kb}kb", flush=True)
     all_target_loci = []
 
     for genome_name, hits in genome_hits.items():
@@ -332,6 +458,7 @@ def main():
         print(f"  Processing {genome_name}: {len(hits)} hits", flush=True)
 
         # Filter multi-frame artifacts: keep only best frame per genomic location
+        # NOTE: Frame is no longer used for clustering, but we still filter obvious artifacts
         hits_by_location = defaultdict(list)
         for hit in hits:
             # Group by scaffold + approximate location (5kb bins)
@@ -363,8 +490,8 @@ def main():
             # Create a locus_id placeholder (will be assigned by Phase 5)
             locus_id_placeholder = f"{query_id.split('.')[0]}_targets"
 
-            # Cluster into loci (min_hits=1 for single-protein targets)
-            target_loci = cluster_into_loci(query_hits, locus_id_placeholder, args.gene_family, gap_kb, min_hits=1)
+            # Cluster into loci using coverage-track-based algorithm
+            target_loci = cluster_into_loci(query_hits, locus_id_placeholder, args.gene_family, min_split_gap_kb, min_hits=1)
 
             for target_locus in target_loci:
                 target_locus['genome'] = genome_name
