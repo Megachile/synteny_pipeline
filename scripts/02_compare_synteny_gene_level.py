@@ -20,20 +20,9 @@ import numpy as np
 from collections import defaultdict
 import json
 import subprocess
-import re
 
 # Import universal synteny detection
 from synteny_utils import SyntenyComparator, MIN_SYNTENY_PERCENT, SLIDING_WINDOW_SIZE, MIN_WINDOW_PERCENT, EVALUE_THRESHOLD
-
-# Import GenomicMapper and configuration from Phase 1
-import importlib.util
-spec = importlib.util.spec_from_file_location("phase1", Path("scripts/01_discover_paralogs_gene_level.py"))
-phase1 = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(phase1)
-GenomicMapper = phase1.GenomicMapper
-LANDMARKS = phase1.LANDMARKS
-FLANKING_DISTANCE_KB = phase1.FLANKING_DISTANCE_KB
-MAX_FLANKING_GENES = phase1.MAX_FLANKING_GENES
 
 # Full landmark proteomes for proper synteny detection
 LANDMARK_PROTEOMES = {
@@ -42,9 +31,6 @@ LANDMARK_PROTEOMES = {
     'TR': Path('data/proteomes/GCA_020615435.1.faa'),  # Telenomus remus (labeled as TR)
     'DR': Path('data/proteomes/GCA_030998225.1.faa')   # Diplolepis rosae (labeled as DR)
 }
-
-# Target flanking gene count for fair synteny comparison
-TARGET_FLANKING_COUNT = 35
 
 
 class Phase2SyntenyComparator(SyntenyComparator):
@@ -211,46 +197,6 @@ class Phase2SyntenyComparator(SyntenyComparator):
                 return "unrelated"  # Different genome, no synteny
 
 
-def extend_flanking_if_needed(locus_id, target_gene, genome, dedup_count, mapper, all_target_genes, target_count=TARGET_FLANKING_COUNT):
-    """Extend flanking window if deduplication left too few genes.
-
-    Args:
-        locus_id: Locus identifier
-        target_gene: Target gene to get flanking genes around
-        genome: Genome code (BK, LB, etc.)
-        dedup_count: Current number of deduplicated flanking genes
-        mapper: GenomicMapper instance for this genome
-        all_target_genes: Set of genes to exclude
-        target_count: Target number of flanking genes (default: 35)
-
-    Returns:
-        List of additional gene IDs to include, or empty list if target already met
-    """
-
-    if dedup_count >= target_count:
-        return []  # Already have enough
-
-    needed = target_count - dedup_count
-
-    # Get additional flanking genes with extended window, pre-filtering targets
-    flanking_distance_kb = FLANKING_DISTANCE_KB.get(genome, 1000)
-
-    # Get flanking genes with exclusion
-    upstream_genes, downstream_genes = mapper.get_flanking_genes(
-        target_gene,
-        flanking_distance_kb=flanking_distance_kb,
-        max_genes=MAX_FLANKING_GENES,  # Respect hard cap
-        exclude_genes=all_target_genes
-    )
-
-    all_flanking = upstream_genes + downstream_genes
-
-    # Return the closest genes we need
-    additional = all_flanking[:needed] if len(all_flanking) >= needed else all_flanking
-
-    return additional
-
-
 def main():
     if len(sys.argv) < 2:
         print("Usage: python 02_compare_synteny_gene_level.py <loci_dir>")
@@ -412,119 +358,6 @@ def main():
     # Save synteny groups
     with open(loci_dir / "synteny_groups.json", 'w') as f:
         json.dump(synteny_groups, f, indent=2)
-
-    # Create deduplicated flanking files (remove target genes for Phase 3)
-    print("\n" + "="*80)
-    print("CREATING DEDUPLICATED FLANKING FILES")
-    print("-"*80)
-    print("\nRemoving target genes from flanking sets for downstream Phase 3 use...")
-
-    # Collect ALL target genes across entire dataset
-    all_target_genes = set()
-    for _, locus in loci_df.iterrows():
-        target_gene = locus['target_gene']
-        all_target_genes.add(target_gene)
-
-        # Also add tandem cluster members
-        if locus.get('input_is_tandem') and pd.notna(locus.get('input_cluster_members')):
-            cluster_members = str(locus['input_cluster_members']).split(',')
-            all_target_genes.update(cluster_members)
-
-    print(f"  Total target genes to filter: {len(all_target_genes)}")
-
-    # Initialize genomic mappers for extension
-    print("\n  Initializing genomic mappers for potential extension...")
-    mappers = {}
-    for genome_code in LANDMARKS:
-        genome_info = LANDMARKS[genome_code]
-        mappers[genome_code] = GenomicMapper(
-            genome_code,
-            gff_file=genome_info.get('gff'),
-            proteome_file=genome_info.get('proteome')
-        )
-
-    # Process each locus
-    extension_count = 0
-    for _, locus in loci_df.iterrows():
-        locus_id = locus['locus_id']
-        flanking_file = Path(locus['flanking_file'])
-        genome = locus['genome']
-        target_gene = locus['target_gene']
-
-        if not flanking_file.exists():
-            continue
-
-        # Read flanking sequences
-        flanking_seqs = list(SeqIO.parse(flanking_file, 'fasta'))
-
-        # Filter out target genes
-        # Header format: >protein_id|LOC_ID position ...
-        dedup_seqs = []
-        removed_targets = []
-        existing_genes = set()
-
-        for seq in flanking_seqs:
-            # Extract LOC from header
-            match = re.search(r'LOC\d+', seq.description)
-            if match:
-                loc_id = match.group()
-                existing_genes.add(loc_id)
-                if loc_id in all_target_genes:
-                    removed_targets.append(loc_id)
-                    continue  # Skip target genes
-
-            dedup_seqs.append(seq)
-
-        original_count = len(flanking_seqs)
-        dedup_count = len(dedup_seqs)
-        removed_count = len(removed_targets)
-
-        # Check if extension needed (only for NCBI genomes with mappers)
-        if genome in mappers and dedup_count < TARGET_FLANKING_COUNT:
-            print(f"  {locus_id}: {original_count} → {dedup_count} genes ({removed_count} targets removed) - EXTENDING...")
-
-            # Get additional genes
-            mapper = mappers[genome]
-            additional_genes = extend_flanking_if_needed(
-                locus_id, target_gene, genome, dedup_count,
-                mapper, all_target_genes, TARGET_FLANKING_COUNT
-            )
-
-            if additional_genes:
-                # Add additional genes to dedup_seqs
-                # We need to get protein sequences for these genes
-                proteome_file = LANDMARKS[genome]['proteome']
-                proteome_seqs = {rec.id: rec for rec in SeqIO.parse(proteome_file, 'fasta')}
-
-                added_count = 0
-                for gene_id in additional_genes:
-                    # Skip if already in existing genes
-                    if gene_id in existing_genes:
-                        continue
-
-                    # Get representative protein for this gene
-                    protein_id = mapper.get_representative_protein(gene_id)
-                    if protein_id and protein_id in proteome_seqs:
-                        seq = proteome_seqs[protein_id]
-                        dedup_seqs.append(seq)
-                        added_count += 1
-
-                dedup_count = len(dedup_seqs)
-                extension_count += 1
-                print(f"    → Extended to {dedup_count} genes (+{added_count} additional)")
-        else:
-            if removed_count > 0:
-                print(f"  {locus_id}: {original_count} → {dedup_count} genes ({removed_count} targets removed)")
-                if removed_count > 5:
-                    print(f"    ⚠️  High contamination: {removed_targets[:5]}...")
-
-        # Save deduplicated file
-        dedup_file = flanking_file.parent / f"{locus_id}_flanking_dedup.faa"
-        SeqIO.write(dedup_seqs, dedup_file, 'fasta')
-
-    print(f"\n✓ Deduplicated flanking files saved as: *_flanking_dedup.faa")
-    print(f"  Extended {extension_count} loci to reach target ~{TARGET_FLANKING_COUNT} flanking genes")
-    print(f"  These files are clean for Phase 3 tblastn searches")
 
     # Summary
     print("\n" + "="*80)

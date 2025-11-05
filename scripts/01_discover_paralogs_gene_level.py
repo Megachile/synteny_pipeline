@@ -192,14 +192,13 @@ class GenomicMapper:
 
         return None
 
-    def get_flanking_genes(self, target_gene, flanking_distance_kb=1000, max_genes=None, exclude_genes=None):
+    def get_flanking_genes(self, target_gene, flanking_distance_kb=1000, max_genes=None):
         """Get flanking genes split into upstream and downstream, sorted by position.
 
         Args:
             target_gene: Gene ID to find flanking genes around
             flanking_distance_kb: Maximum distance in kb from target gene
             max_genes: Maximum total flanking genes to return (splits evenly between upstream/downstream)
-            exclude_genes: Set of gene IDs to exclude from results (e.g., known target genes)
 
         Returns:
             Tuple of (upstream_genes, downstream_genes)
@@ -210,9 +209,6 @@ class GenomicMapper:
         if target_gene not in self.gene_positions:
             return [], []
 
-        if exclude_genes is None:
-            exclude_genes = set()
-
         chrom, target_pos = self.gene_positions[target_gene]
         candidates = []  # (distance, position, gene_id) - track distance for sorting
 
@@ -220,7 +216,7 @@ class GenomicMapper:
         if self.gene_order:  # BRAKER3
             # For BRAKER3, get all genes on same scaffold within distance
             for gene in self.gene_order:
-                if gene == target_gene or gene in exclude_genes:
+                if gene == target_gene:
                     continue
                 if gene in self.gene_positions:
                     g_chrom, g_pos = self.gene_positions[gene]
@@ -232,7 +228,7 @@ class GenomicMapper:
             # For NCBI, chr_genes has [(pos, gene_id), ...]
             if chrom in self.chr_genes:
                 for pos, gene_id in self.chr_genes[chrom]:
-                    if gene_id == target_gene or gene_id in exclude_genes:
+                    if gene_id == target_gene:
                         continue
                     distance_kb = abs(pos - target_pos) / 1000
                     if distance_kb <= flanking_distance_kb:
