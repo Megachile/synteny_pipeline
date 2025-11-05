@@ -13,6 +13,7 @@ Usage:
         --blocks <path/to/synteny_blocks_filtered.tsv> \\
         --targets <path/to/all_targets_classified.tsv> \\
         --species-map <path/to/gca_to_species.tsv> \\
+        --extracted-seqs <path/to/06_extracted_sequences> \\
         --output-dir <path/to/gene_type_summaries>
 """
 
@@ -20,6 +21,7 @@ from pathlib import Path
 import pandas as pd
 from collections import OrderedDict, defaultdict
 import argparse
+import re
 
 def load_species_and_phylo(species_map_file):
     """Load species mapping and phylogenetic order."""
@@ -40,7 +42,56 @@ def load_species_and_phylo(species_map_file):
 
     return species_map, phylo_order_map
 
-def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_blocks_df, species_map, phylo_order_map):
+def load_extracted_seq_metadata(extraction_dir):
+    """
+    Load metadata from Phase 6 extracted sequences.
+
+    Returns dict: {locus_name: {'length_aa': int, 'status': str}}
+    """
+    metadata = {}
+
+    if not extraction_dir or not Path(extraction_dir).exists():
+        return metadata
+
+    extraction_path = Path(extraction_dir)
+
+    # Traverse genome directories
+    for genome_dir in extraction_path.iterdir():
+        if not genome_dir.is_dir():
+            continue
+
+        # Traverse locus directories
+        for locus_dir in genome_dir.iterdir():
+            if not locus_dir.is_dir():
+                continue
+
+            locus_name = locus_dir.name
+
+            # Find CDS FASTA for status
+            cds_files = list(locus_dir.glob("*_gene1_cds.fasta"))
+            protein_files = list(locus_dir.glob("*_gene1_protein.fasta"))
+
+            if cds_files and protein_files:
+                # Parse status from CDS header
+                with open(cds_files[0]) as f:
+                    header = f.readline().strip()
+                    status_match = re.search(r'status:(\w+)', header)
+                    status = status_match.group(1) if status_match else 'unknown'
+
+                # Parse length from protein header
+                with open(protein_files[0]) as f:
+                    header = f.readline().strip()
+                    length_match = re.search(r'length:(\d+)aa', header)
+                    length_aa = int(length_match.group(1)) if length_match else 0
+
+                metadata[locus_name] = {
+                    'length_aa': length_aa,
+                    'status': status
+                }
+
+    return metadata
+
+def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_blocks_df, species_map, phylo_order_map, seq_metadata):
     """Create summary matrix for one gene family."""
 
     print(f"\n  Processing {gene_family}...")
@@ -83,10 +134,6 @@ def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_bl
         row['species'] = species_map.get(genome, genome)
         row['phylo_order'] = phylo_order_map.get(genome, 999)
 
-        # Add synteny block presence
-        has_synteny_block = genome in synteny_by_genome
-        row[f'{gene_family}_synteny_block'] = 'Y' if has_synteny_block else 'N'
-
         # Count targets by category
         genome_targets = targets_by_genome.get(genome, [])
 
@@ -98,11 +145,27 @@ def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_bl
         category_counts = defaultdict(list)
         for target in genome_targets:
             assigned_to = target.get('assigned_to', target.get('description', 'unknown'))
+            locus_name = target.get('locus_name', 'unknown')
 
-            # Build target string with length and status
-            length = int(target.get('orf_length_aa', 0))
-            status = target.get('status', 'unknown')
-            status_letter = 'F' if status == 'functional' else 'P'
+            # Get metadata from extracted sequences
+            meta = seq_metadata.get(locus_name, {})
+            length = meta.get('length_aa', 0)
+            status = meta.get('status', 'unknown')
+
+            # Skip targets that failed extraction (Phase 6 deduplication removes these)
+            if length == 0:
+                continue
+
+            # Status letters: I=intact, P=pseudogene, F=fragment
+            if status == 'intact':
+                status_letter = 'I'
+            elif status == 'pseudogene':
+                status_letter = 'P'
+            elif status == 'fragment':
+                status_letter = 'F'
+            else:
+                status_letter = '?'
+
             target_str = f"{length}{status_letter}"
 
             category_counts[assigned_to].append(target_str)
@@ -113,8 +176,8 @@ def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_bl
                 if target_list:
                     row[category] = f"[{'; '.join(target_list)}]"
 
-        # Add total count
-        row['total'] = len(genome_targets)
+        # Add total count (only successfully extracted targets)
+        row['total'] = sum(len(targets) for targets in category_counts.values())
 
         matrix_rows.append(row)
 
@@ -141,6 +204,8 @@ def parse_args():
                         help='Path to all_targets_classified.tsv (optional)')
     parser.add_argument('--species-map', required=True, type=Path,
                         help='Path to gca_to_species.tsv')
+    parser.add_argument('--extracted-seqs', type=Path,
+                        help='Path to 06_extracted_sequences directory (for length/status metadata)')
     parser.add_argument('--output-dir', required=True, type=Path,
                         help='Output directory for summary matrices')
 
@@ -190,6 +255,14 @@ def main():
     species_map, phylo_order_map = load_species_and_phylo(args.species_map)
     print(f"  Loaded species mapping for {len(species_map)} genomes")
 
+    # Load sequence metadata from extracted sequences
+    if args.extracted_seqs and args.extracted_seqs.exists():
+        seq_metadata = load_extracted_seq_metadata(args.extracted_seqs)
+        print(f"  Loaded metadata for {len(seq_metadata)} extracted sequences")
+    else:
+        seq_metadata = {}
+        print("  No extracted sequences found - lengths/status will be missing")
+
     # Get unique gene families
     gene_families = loci_df['gene_family'].unique()
     print(f"  Gene families: {', '.join(gene_families)}")
@@ -204,7 +277,7 @@ def main():
         # Create matrix
         matrix_df = create_gene_family_matrix(
             gene_family, family_loci, all_targets_df, synteny_blocks_df,
-            species_map, phylo_order_map
+            species_map, phylo_order_map, seq_metadata
         )
 
         if not matrix_df.empty:
