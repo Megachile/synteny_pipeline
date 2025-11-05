@@ -68,8 +68,13 @@ class Phase2SyntenyComparator(SyntenyComparator):
         # Create unique temp files to avoid race conditions in parallel array jobs
         import os
         pid = os.getpid()
-        temp_db = Path(f"temp_db_{label}_{pid}")
-        temp_output = Path(f"temp_compare_{label}_{pid}.tsv")
+
+        # Put temp files in dedicated directory
+        temp_dir = Path("temp_diamond_dbs")
+        temp_dir.mkdir(exist_ok=True)
+
+        temp_db = temp_dir / f"temp_db_{label}_{pid}"
+        temp_output = temp_dir / f"temp_compare_{label}_{pid}.tsv"
 
         try:
             # Check if this is a full proteome with existing database

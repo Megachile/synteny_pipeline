@@ -137,9 +137,12 @@ def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_bl
         # Count targets by category
         genome_targets = targets_by_genome.get(genome, [])
 
-        # Initialize all columns
+        # Initialize all columns with "No block" (no synteny)
         for category in locus_categories:
-            row[category] = ""
+            if category.endswith('_unplaceable'):
+                row[category] = ""  # Unplaceable is special
+            else:
+                row[category] = "No block"
 
         # Fill in target counts
         category_counts = defaultdict(list)
@@ -175,6 +178,14 @@ def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_bl
             if category in row:  # Only if it's a known category
                 if target_list:
                     row[category] = f"[{'; '.join(target_list)}]"
+
+        # Check for synteny blocks without targets
+        # For loci where this genome has a synteny block but no extracted target
+        genome_loci_with_blocks = synteny_by_genome.get(genome, [])
+        for locus in genome_loci_with_blocks:
+            if locus in row and row[locus] == "No block":
+                # Synteny block exists but no target found/extracted
+                row[locus] = "[empty]"
 
         # Add total count (only successfully extracted targets)
         row['total'] = sum(len(targets) for targets in category_counts.values())
