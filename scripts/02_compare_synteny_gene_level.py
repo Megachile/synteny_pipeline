@@ -22,7 +22,7 @@ import json
 import subprocess
 
 # Import universal synteny detection
-from synteny_utils import SyntenyComparator, MIN_SYNTENY_MATCHES, SLIDING_WINDOW_SIZE, MIN_WINDOW_MATCHES, EVALUE_THRESHOLD
+from synteny_utils import SyntenyComparator, MIN_SYNTENY_PERCENT, SLIDING_WINDOW_SIZE, MIN_WINDOW_PERCENT, EVALUE_THRESHOLD
 
 # Full landmark proteomes for proper synteny detection
 LANDMARK_PROTEOMES = {
@@ -37,9 +37,9 @@ class Phase2SyntenyComparator(SyntenyComparator):
     """Compare loci based on flanking gene conservation."""
 
     def __init__(self):
-        self.min_global = MIN_SYNTENY_MATCHES
+        self.min_global_percent = MIN_SYNTENY_PERCENT  # 25% of flanking genes
         self.window_size = SLIDING_WINDOW_SIZE
-        self.min_window = 3  # Lower threshold for divergent genomes - just need SOME clustering
+        self.min_window_percent = MIN_WINDOW_PERCENT  # 30% within window
 
     def compare_flanking(self, flanking_file1, flanking_file2, locus1_name, locus2_name):
         """Compare two sets of flanking proteins directly.
@@ -113,12 +113,13 @@ class Phase2SyntenyComparator(SyntenyComparator):
 
                 # Get total queries
                 total_queries = len(list(SeqIO.parse(query_file, 'fasta')))
+                percent = (unique_matches / total_queries) if total_queries > 0 else 0
 
                 return {
                     'matches': unique_matches,
                     'total': total_queries,
-                    'percent': (unique_matches / total_queries * 100) if total_queries > 0 else 0,
-                    'passes_global': unique_matches >= self.min_global,
+                    'percent': percent * 100,  # Store as percentage for display
+                    'passes_global': percent >= self.min_global_percent,  # Use percentage threshold
                     'hits_df': hits
                 }
             else:
@@ -165,7 +166,9 @@ class Phase2SyntenyComparator(SyntenyComparator):
                 best_matches = window_matches
                 best_position = i
 
-        passes_window = best_matches >= self.min_window
+        # Use percentage threshold: best_matches / window_size
+        window_percent = best_matches / self.window_size if self.window_size > 0 else 0
+        passes_window = window_percent >= self.min_window_percent
 
         return passes_window, best_matches, best_position
 
@@ -206,8 +209,9 @@ def main():
     print("="*80)
     print(f"\nInput directory: {loci_dir}")
     print(f"Synteny thresholds (BOTH required):")
-    print(f"  Global: ≥{MIN_SYNTENY_MATCHES} matches")
-    print(f"  Window: ≥3/{SLIDING_WINDOW_SIZE} matches (lowered for divergent genomes)")
+    print(f"  Global: ≥{MIN_SYNTENY_PERCENT*100:.0f}% of flanking genes must match")
+    print(f"  Window: ≥{MIN_WINDOW_PERCENT*100:.0f}% within {SLIDING_WINDOW_SIZE}-gene sliding window")
+    print(f"\nThese percentage-based thresholds adapt to variable flanking gene counts (13-92 genes observed)")
 
     # Load loci information
     loci_file = loci_dir / "locus_definitions.tsv"
@@ -287,12 +291,24 @@ def main():
 
             comparisons.append(comparison)
 
-            # Show significant relationships
-            if result['passes_global'] or passes_window:
-                print(f"  {locus1['locus_id']} ↔ {locus2['locus_id']}:")
-                print(f"    Matches: {result['matches']}/{result['total']} ({result['percent']:.1f}%)")
-                print(f"    Window: {window_matches}/{SLIDING_WINDOW_SIZE}")
-                print(f"    → {relationship}")
+            # Show ALL comparisons with detailed threshold info
+            print(f"    {result['matches']}/{result['total']} matches ({result['percent']:.1f}%)", end='')
+
+            # Show which thresholds passed
+            threshold_status = []
+            if result['passes_global']:
+                threshold_status.append("GLOBAL✓")
+            else:
+                threshold_status.append(f"global✗ (need ≥{MIN_SYNTENY_PERCENT*100:.0f}%)")
+
+            window_percent = (window_matches / SLIDING_WINDOW_SIZE * 100) if SLIDING_WINDOW_SIZE > 0 else 0
+            if passes_window:
+                threshold_status.append(f"WINDOW✓ ({window_matches}/{SLIDING_WINDOW_SIZE}={window_percent:.0f}%)")
+            else:
+                threshold_status.append(f"window✗ ({window_matches}/{SLIDING_WINDOW_SIZE}={window_percent:.0f}%, need ≥{MIN_WINDOW_PERCENT*100:.0f}%)")
+
+            print(f" | {' '.join(threshold_status)}")
+            print(f"    → {relationship}")
 
     # Save comparison results
     print(f"\n[2] Saving results...")

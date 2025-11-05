@@ -42,6 +42,12 @@ import argparse
 import xml.etree.ElementTree as ET
 
 # Configuration
+# NOTE: Only using BK/LB (NCBI genomes) as landmarks
+# TR/DR (BRAKER3 genomes) removed due to unreliable annotations:
+# - Low-complexity repetitive sequences annotated as proteins
+# - Possible translated introns in protein predictions
+# - SwissProt validation fails (no real homologs)
+# - Synteny blocks cannot be validated
 LANDMARKS = {
     'BK': {
         'proteome': 'data/proteomes/GCF_010883055.1_Bkinseyi_NCBI.faa',
@@ -52,20 +58,6 @@ LANDMARKS = {
         'proteome': 'data/proteomes/GCF_019393585.1_Lboulardi_NCBI.faa',
         'gff': 'data/genomes/GCF_019393585.1_Lboulardi.gff',
         'db': 'data/proteomes/GCF_019393585.1_Lboulardi_NCBI.dmnd'
-    },
-    'TR': {
-        'proteome': 'data/proteomes/GCA_020615435.1.faa',
-        'gff': 'data/genomes/GCA_020615435.1.gff3',  # BRAKER3 GFF3
-        'db': 'data/proteomes/GCA_020615435.1.dmnd',
-        'genome_fasta': 'data/ragtag_output/GCA_020615435.1/ragtag.scaffold.fasta',
-        'genome_db': 'data/ragtag_dbs/GCA_020615435.1'  # BLAST database
-    },
-    'DR': {
-        'proteome': 'data/proteomes/GCA_030998225.1.faa',
-        'gff': 'data/genomes/GCA_030998225.1.gff3',  # BRAKER3 GFF3
-        'db': 'data/proteomes/GCA_030998225.1.dmnd',
-        'genome_fasta': 'data/ragtag_output/GCA_030998225.1/ragtag.scaffold.fasta',
-        'genome_db': 'data/ragtag_dbs/GCA_030998225.1'  # BLAST database
     }
 }
 
@@ -812,6 +804,16 @@ def main():
     unique_loci = []
     locus_counter = defaultdict(int)
 
+    # Create mapping of target genes to their input tandem cluster info
+    input_tandem_map = {}
+    for cluster in tandem_clusters:
+        for gene in cluster:
+            input_tandem_map[gene] = {
+                'is_input_tandem': len(cluster) > 1,
+                'cluster_size': len(cluster),
+                'cluster_members': cluster
+            }
+
     for genome_code, paralog_data in all_paralogs.items():
         print(f"\n  {genome_code}: {paralog_data['gene_count']} unique genes")
 
@@ -864,6 +866,13 @@ def main():
                         seq.description = f"D{i} {seq.description}"
                         SeqIO.write([seq], f, 'fasta')
 
+            # Check if this target gene is part of an input tandem cluster
+            input_tandem_info = input_tandem_map.get(target_gene, {
+                'is_input_tandem': False,
+                'cluster_size': 1,
+                'cluster_members': [target_gene]
+            })
+
             locus = {
                 'locus_id': locus_name,
                 'gene_family': args.gene_family,
@@ -875,6 +884,9 @@ def main():
                 'flanking_count': len(upstream_genes) + len(downstream_genes),
                 'tandem_count': len(tandems),
                 'is_tandem': len(tandems) > 0,
+                'input_is_tandem': input_tandem_info['is_input_tandem'],
+                'input_cluster_size': input_tandem_info['cluster_size'],
+                'input_cluster_members': ','.join(input_tandem_info['cluster_members']),
                 'flanking_file': str(flanking_file)
             }
 

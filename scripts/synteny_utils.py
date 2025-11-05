@@ -11,19 +11,22 @@ from pathlib import Path
 from Bio import SeqIO
 
 # Universal thresholds
-MIN_SYNTENY_MATCHES = 9       # Global threshold
-SLIDING_WINDOW_SIZE = 10      # Window size
-MIN_WINDOW_MATCHES = 6        # Window threshold
+MIN_SYNTENY_PERCENT = 0.25     # Global threshold: 25% of flanking genes must match
+SLIDING_WINDOW_SIZE = 10       # Window size
+MIN_WINDOW_PERCENT = 0.30      # Window threshold: 30% within window (3/10)
 EVALUE_THRESHOLD = 1e-3
+
+# Legacy absolute thresholds (DEPRECATED - do not use)
+# MIN_SYNTENY_MATCHES = 9 was too stringent for small loci and too lenient for large loci
 
 
 class SyntenyComparator:
     """Universal synteny detection using proven Phase 2 logic."""
 
     def __init__(self):
-        self.min_global = MIN_SYNTENY_MATCHES
+        self.min_global_percent = MIN_SYNTENY_PERCENT
         self.window_size = SLIDING_WINDOW_SIZE
-        self.min_window = MIN_WINDOW_MATCHES
+        self.min_window_percent = MIN_WINDOW_PERCENT
 
     def search_flanking_against_proteome(self, flanking_file, proteome_file, label):
         """
@@ -74,12 +77,13 @@ class SyntenyComparator:
 
                 # Get total queries
                 total_queries = len(list(SeqIO.parse(flanking_file, 'fasta')))
+                percent_decimal = (unique_matches / total_queries) if total_queries > 0 else 0
 
                 return {
                     'matches': unique_matches,
                     'total': total_queries,
-                    'percent': (unique_matches / total_queries * 100) if total_queries > 0 else 0,
-                    'passes_global': unique_matches >= self.min_global,
+                    'percent': percent_decimal * 100,  # Store as percentage for display
+                    'passes_global': percent_decimal >= self.min_global_percent,  # Use percentage threshold
                     'hits_df': hits
                 }
             else:
@@ -126,7 +130,9 @@ class SyntenyComparator:
                 best_matches = window_matches
                 best_position = i
 
-        passes_window = best_matches >= self.min_window
+        # Use percentage threshold: best_matches / window_size
+        window_percent = best_matches / self.window_size if self.window_size > 0 else 0
+        passes_window = window_percent >= self.min_window_percent
 
         return passes_window, best_matches, best_position
 
@@ -145,9 +151,10 @@ class SyntenyComparator:
         unique_matches = blast_hits['qseqid'].nunique() if not blast_hits.empty else 0
         total_queries = len(query_proteins)
 
-        # Global threshold
-        passes_global = unique_matches >= self.min_global
-        global_percent = (unique_matches / total_queries * 100) if total_queries > 0 else 0
+        # Global threshold (use percentage)
+        global_percent_decimal = (unique_matches / total_queries) if total_queries > 0 else 0
+        passes_global = global_percent_decimal >= self.min_global_percent
+        global_percent = global_percent_decimal * 100  # For display
 
         # Window threshold
         passes_window, best_window, _ = self.check_sliding_window(blast_hits, query_proteins)
