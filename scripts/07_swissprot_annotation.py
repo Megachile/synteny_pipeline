@@ -20,6 +20,7 @@ import pandas as pd
 import xml.etree.ElementTree as ET
 from Bio import SeqIO
 import argparse
+import re
 
 def run_diamond(query_file, output_xml, swissprot_db, evalue, threads, use_diamond=True):
     """Run DIAMOND against SwissProt database (100-1000x faster than BLASTP)."""
@@ -106,17 +107,16 @@ def parse_swissprot_xml(xml_file):
 
     return annotations
 
-def load_flanking_protein_mapping(locus_id, loci_df):
+def load_flanking_protein_mapping(locus_id, synteny_dir):
     """Load flanking proteins and create position mapping for this locus."""
     from Bio import SeqIO
 
-    # Find this locus in loci_df
-    locus_row = loci_df[loci_df['locus_id'] == locus_id]
-    if locus_row.empty:
-        return {}
+    # Construct path to flanking protein file
+    # File is in synteny_dir/locus_id/locus_id_flanking_filtered.faa
+    flanking_file = synteny_dir / locus_id / f"{locus_id}_flanking_filtered.faa"
 
-    flanking_file = locus_row.iloc[0]['flanking_file']
-    if not Path(flanking_file).exists():
+    if not flanking_file.exists():
+        print(f"    Warning: Flanking file not found: {flanking_file}")
         return {}
 
     # Read proteins in order
@@ -197,38 +197,34 @@ def annotate_locus_hits(locus_id, position_to_protein, synteny_dir, output_dir, 
 
         # Add genome and locus info
         for query_id, annot in annotations.items():
-            # Parse query ID to extract BK protein ID
+            # Extract BK protein ID from query_id for position mapping
             # Format: GCA_037103525.1_XP_033209112.1|LOC117167954_CM021339.1_RagTag_...
-            # Extract XP_/NP_ protein ID (second underscore-separated part before pipe)
-            bk_protein = "unknown"
+            bk_protein_id = "unknown"
             flanking_pos = "unknown"
 
             try:
-                # Split by underscore to get parts
-                parts = query_id.split('_')
-                # Find part starting with XP_ or NP_
-                for part in parts:
-                    if part.startswith('XP') or part.startswith('NP'):
-                        # Extract up to pipe or next underscore
-                        if '|' in part:
-                            bk_protein = part.split('|')[0]
-                        else:
-                            bk_protein = part.split()[0]  # In case of spaces
-                        break
+                # Extract XP_/NP_ accession number for position lookup
+                match = re.search(r'([XN]P_\d+\.\d+)', query_id)
+                if match:
+                    bk_protein_id = match.group(1)
 
                 # Try to find flanking position from position_to_protein mapping
-                # by reverse lookup
+                # by reverse lookup using the protein accession
                 for pos, prot_id in position_to_protein.items():
-                    if prot_id == bk_protein:
+                    if prot_id == bk_protein_id:
                         flanking_pos = pos
                         break
             except Exception as e:
                 print(f"    Warning: Could not parse query_id {query_id}: {e}")
 
+            # Use SwissProt functional annotation as bk_protein
+            # This gives us readable names like "Soma ferritin" instead of accessions
+            bk_protein_annotation = annot.get('swissprot_description', 'No annotation')
+
             annot_record = {
                 'locus': locus_id,
                 'genome': genome_id,
-                'bk_protein': bk_protein,
+                'bk_protein': bk_protein_annotation,  # SwissProt functional name
                 'query_id': query_id,
                 'flanking_position': flanking_pos,
                 **annot
@@ -324,7 +320,7 @@ def main():
 
     for locus_id in loci:
         # Load position → protein mapping for this locus
-        position_to_protein = load_flanking_protein_mapping(locus_id, loci_df)
+        position_to_protein = load_flanking_protein_mapping(locus_id, args.synteny_dir)
         print(f"  Loaded {len(position_to_protein)} protein position mappings for {locus_id}", flush=True)
 
         locus_annotations = annotate_locus_hits(
