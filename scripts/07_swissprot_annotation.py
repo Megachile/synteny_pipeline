@@ -167,23 +167,31 @@ def filter_fasta_by_hits(input_fasta, hit_set, output_fasta):
     Header format: genome_qseqid_sseqid_coords_hitN
     Example: GCA_011634705.1_XP_033209112.1|LOC117167954_JAABKJ010027599_782-1942_hit1
     Description: GCA_011634705.1 | XP_033209112.1|LOC117167954 hit | JAABKJ010027599:782-1942(+) | ...
+
+    CRITICAL: qseqid contains a pipe (e.g., XP_033209112.1|LOC117167954), so when split by '|':
+      desc_parts[0] = "genome_id ..."
+      desc_parts[1] = " genome_id again "
+      desc_parts[2] = " XP_033209112.1"
+      desc_parts[3] = "LOC117167954 hit "
+      desc_parts[4] = " scaffold:coords(strand) "
     """
     kept_seqs = []
 
     for record in SeqIO.parse(input_fasta, "fasta"):
         # Parse FASTA header to extract qseqid, sseqid, coordinates
-        # Description format: "genome | qseqid hit | sseqid:start-end(strand) | ..."
         desc_parts = record.description.split('|')
 
-        if len(desc_parts) < 3:
+        if len(desc_parts) < 5:  # Need at least 5 parts now
             continue
 
         try:
-            # Extract qseqid from second field (e.g., " XP_033209112.1|LOC117167954 hit ")
-            qseqid = desc_parts[1].strip().replace(' hit', '').strip()
+            # Extract qseqid by reconstructing from desc_parts[2] and [3]
+            # desc_parts[2] = " XP_033209112.1"
+            # desc_parts[3] = "LOC117167954 hit "
+            qseqid = desc_parts[2].strip() + '|' + desc_parts[3].replace(' hit', '').strip()
 
-            # Extract sseqid and coords from third field (e.g., " JAABKJ010027599:782-1942(+) ")
-            scaffold_info = desc_parts[2].strip().split(':')
+            # Extract sseqid and coords from desc_parts[4] (e.g., " JAABKJ010027599:782-1942(+) ")
+            scaffold_info = desc_parts[4].strip().split(':')
             if len(scaffold_info) < 2:
                 continue
 
