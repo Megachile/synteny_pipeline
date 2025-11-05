@@ -385,8 +385,8 @@ def parse_args():
                         help='Path to all_targets_classified.tsv (optional)')
     parser.add_argument('--swissprot', type=Path,
                         help='Path to genome_specific_swissprot_annotations.tsv (optional)')
-    parser.add_argument('--reference-proteins', required=True, type=Path,
-                        help='Path to reference protein.faa file (for column headers)')
+    parser.add_argument('--reference-proteins', required=False, type=Path,
+                        help='Path to reference protein.faa file (for column headers). Optional - will derive from SwissProt if not provided.')
     parser.add_argument('--species-map', required=True, type=Path,
                         help='Path to gca_to_species.tsv')
     parser.add_argument('--output-dir', required=True, type=Path,
@@ -452,8 +452,31 @@ def main():
     print(f"  Loaded species mapping for {len(species_map)} genomes")
 
     # Get protein names for better column headers
-    protein_names = get_protein_names_from_faa(args.reference_proteins)
-    print(f"  Loaded protein names for {len(protein_names)} proteins")
+    if args.reference_proteins and args.reference_proteins.exists():
+        protein_names = get_protein_names_from_faa(args.reference_proteins)
+        print(f"  Loaded protein names for {len(protein_names)} proteins from reference")
+    elif not swissprot_df.empty:
+        # Derive from SwissProt annotations (use bk_protein_id and bk_protein_annotation)
+        protein_names = {}
+        for _, row in swissprot_df.iterrows():
+            protein_id = row['bk_protein_id']
+            if protein_id not in protein_names and 'bk_protein_annotation' in row:
+                # Simplify SwissProt description for column header
+                desc = row['bk_protein_annotation']
+                if 'RecName: Full=' in desc:
+                    name = desc.split('RecName: Full=')[1].split(';')[0].strip()
+                elif ' ' in desc:
+                    name = desc.split('[')[0].strip() if '[' in desc else desc
+                else:
+                    name = desc
+                # Shorten if too long
+                if len(name) > 30:
+                    name = name[:27] + '...'
+                protein_names[protein_id] = name
+        print(f"  Derived protein names for {len(protein_names)} proteins from SwissProt")
+    else:
+        protein_names = {}
+        print(f"  No protein names available - using IDs only")
 
     # Process each locus
     print("\n[2] Generating matrices...")
