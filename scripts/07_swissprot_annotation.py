@@ -398,6 +398,8 @@ def parse_args():
                         help='E-value threshold (default: 1e-5)')
     parser.add_argument('--threads', type=int, default=16,
                         help='Number of threads for DIAMOND (default: 16)')
+    parser.add_argument('--locus', type=str,
+                        help='Process only this specific locus (for SLURM arrays)')
 
     return parser.parse_args()
 
@@ -450,7 +452,17 @@ def main():
 
     # Get unique loci
     loci = filtered_blocks_df['locus_id'].unique().tolist()
-    print(f"  Found {len(loci)} loci", flush=True)
+
+    # Filter to specific locus if requested
+    if args.locus:
+        if args.locus in loci:
+            loci = [args.locus]
+            print(f"  Processing single locus: {args.locus}", flush=True)
+        else:
+            print(f"  ERROR: Locus '{args.locus}' not found in filtered blocks", flush=True)
+            return
+    else:
+        print(f"  Found {len(loci)} loci", flush=True)
 
     # Process each locus
     print("\n[3] Annotating synteny block proteins...", flush=True)
@@ -469,7 +481,12 @@ def main():
 
     # Save all annotations
     print("\n[4] Saving annotations...", flush=True)
-    output_file = args.output_dir / "genome_specific_swissprot_annotations.tsv"
+
+    # Use locus-specific filename if processing single locus
+    if args.locus:
+        output_file = args.output_dir / f"{args.locus}_swissprot_annotations.tsv"
+    else:
+        output_file = args.output_dir / "genome_specific_swissprot_annotations.tsv"
 
     if all_annotations:
         annot_df = pd.DataFrame(all_annotations)
