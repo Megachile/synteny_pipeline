@@ -388,7 +388,11 @@ if [ -f "${PHASE3_DIR}/08_matrices/summary_matrix.tsv" ]; then
     echo "✓ Phase 8b already complete (skipping)"
 else
     if python scripts/08b_generate_summary_matrices.py \
-        --locus-matrices-dir "${PHASE3_DIR}/08_matrices" \
+        --locus-defs "${PHASE3_DIR}/locus_definitions.tsv" \
+        --blocks "${PHASE3_DIR}/03_filtered_blocks/synteny_blocks_filtered.tsv" \
+        --targets "${PHASE3_DIR}/05_classified/all_targets_classified.tsv" \
+        --species-map data/gca_to_species.tsv \
+        --extracted-seqs "${PHASE3_DIR}/06_extracted_sequences" \
         --output-dir "${PHASE3_DIR}/08_matrices" \
         2>&1 | tee "logs/phase8b_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
         echo "✓ Phase 8b complete"
