@@ -321,12 +321,25 @@ else
     # Aggregate per-locus results into single file
     echo "  Aggregating results from ${NLOCI} loci..."
 
-    # Create header
-    head -1 $(ls ${ANNOT_DIR}/*_swissprot_annotations.tsv | head -1) > "$FINAL_OUTPUT"
+    # Create header from first locus file
+    shopt -s nullglob
+    locus_files=(${ANNOT_DIR}/*_swissprot_annotations.tsv)
+    if [ ${#locus_files[@]} -eq 0 ]; then
+        echo "❌ Phase 7 failed - no locus annotation files found"
+        exit 1
+    fi
+
+    # Get first non-genome_specific file for header
+    for first_file in "${locus_files[@]}"; do
+        if [[ ! "$first_file" =~ "genome_specific" ]]; then
+            head -1 "$first_file" > "$FINAL_OUTPUT"
+            break
+        fi
+    done
 
     # Concatenate all per-locus results (skip headers)
-    for locus_file in ${ANNOT_DIR}/*_swissprot_annotations.tsv; do
-        if [ -f "$locus_file" ] && [[ ! "$locus_file" =~ "genome_specific" ]]; then
+    for locus_file in "${locus_files[@]}"; do
+        if [[ ! "$locus_file" =~ "genome_specific" ]]; then
             tail -n +2 "$locus_file" >> "$FINAL_OUTPUT"
         fi
     done
