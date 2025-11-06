@@ -63,15 +63,14 @@ OUTPUT_DIR="${GENE_FAMILY}_BK_LB_batch"
 
 # Load environment
 echo "Loading environment..."
-set +u
-source ~/.bashrc
-micromamba activate busco_env
-set -u
-
-# Load Exonerate module (allow failure as it may already be loaded)
-set +e
+set +e  # Disable exit on error for environment setup
+set +u  # Disable unbound variable check
+source ~/.bashrc 2>&1 | grep -v "cannot access" | grep -v "No such file" || true
+eval "$(micromamba shell hook --shell bash)" 2>/dev/null || true
+micromamba activate busco_env 2>&1 | grep -v "already activated" || true
 module load exonerate/2.4.0-yl7q 2>/dev/null || true
-set -e
+set -u  # Re-enable unbound variable check
+set -e  # Re-enable exit on error
 
 echo "Environment ready"
 echo ""
