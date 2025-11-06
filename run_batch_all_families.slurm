@@ -431,6 +431,7 @@ else
         --targets "${PHASE3_DIR}/05_classified/all_targets_classified.tsv" \
         --swissprot "${PHASE3_DIR}/07_swissprot_annotations/genome_specific_swissprot_annotations.tsv" \
         --reference-proteins data/reference/protein.faa \
+        --extracted-seqs "${PHASE3_DIR}/06_extracted_sequences" \
         --species-map data/gca_to_species.tsv \
         --output-dir "${PHASE3_DIR}/08_matrices" \
         2>&1 | tee "logs/phase8a_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
