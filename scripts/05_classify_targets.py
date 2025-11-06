@@ -17,8 +17,9 @@ import pandas as pd
 from collections import defaultdict
 from Bio import SeqIO
 import argparse
+import os
 
-def check_proximity(target, block, max_distance_kb=500):
+def check_proximity(target, block, max_distance_kb=100):
     """Check if target gene is near synteny block (within max_distance_kb).
 
     Synteny blocks are defined by flanking proteins, so the target gene
@@ -44,6 +45,12 @@ def check_proximity(target, block, max_distance_kb=500):
         distance = target['start'] - block['end']
 
     return distance <= max_distance_bp
+
+def check_overlap(target, block):
+    """Require overlap between target and block on same genome/scaffold."""
+    if target['genome'] != block['genome'] or target['scaffold'] != block['scaffold']:
+        return False
+    return not (target['end'] < block['start'] or target['start'] > block['end'])
 
 def assess_target_quality(hsp_seq, ref_length, pident, min_length):
     """
@@ -111,7 +118,8 @@ def load_target_sequences(genome_id, parent_locus, output_dir):
 
     return sequences
 
-def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bitscore):
+def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bitscore,
+                    allow_nearby=False, proximity_kb=100):
     """Classify each target as syntenic or unplaceable based on proximity to synteny blocks.
 
     Quality assessment happens AFTER Exonerate extraction (Phase 6).
@@ -124,6 +132,7 @@ def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bits
         synteny_index[key].append(block)
 
     classifications = []
+    dropped = []
 
     for _, target in targets_df.iterrows():
         # Check for overlap with synteny blocks
@@ -131,11 +140,46 @@ def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bits
         candidate_blocks = synteny_index.get(key, [])
 
         assigned_to = None
+        best_overlap = -1
+        best_distance = None
+        best_block = None
+
+        # Choose the best block by overlap first, then by nearest distance
         for block in candidate_blocks:
-            # Check proximity - accept ANY target hit near synteny block
-            if check_proximity(target, block):
-                assigned_to = block['locus_id']
-                break
+            # Compute overlap in bp
+            start, end = int(target['start']), int(target['end'])
+            bstart, bend = int(block['start']), int(block['end'])
+            overlap = max(0, min(end, bend) - max(start, bstart) + 1)
+
+            if overlap > 0:
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_block = block
+                    best_distance = 0
+                elif overlap == best_overlap and best_overlap > 0 and best_block is not None:
+                    # Tie-breaker: choose block whose center is closest to target center
+                    t_center = (start + end) // 2
+                    b_center_curr = (bstart + bend) // 2
+                    b_center_best = (int(best_block['start']) + int(best_block['end'])) // 2
+                    if abs(t_center - b_center_curr) < abs(t_center - b_center_best):
+                        best_block = block
+                        best_distance = 0
+                continue
+
+            # If no overlap, consider proximity when enabled
+            if allow_nearby:
+                # Distance to nearest edge
+                if end < bstart:
+                    distance = bstart - end
+                else:
+                    distance = start - bend
+                if distance <= proximity_kb * 1000:
+                    if best_distance is None or distance < best_distance:
+                        best_distance = distance
+                        best_block = block
+
+        if best_block is not None and (best_overlap > 0 or (allow_nearby and best_distance is not None)):
+            assigned_to = best_block['locus_id']
 
         if assigned_to:
             # Syntenic hit - keep regardless of strength
@@ -162,9 +206,21 @@ def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bits
                     'description': f"{target['gene_family']}_unplaceable"
                 }
                 classifications.append(classification)
-            # Weak hits are silently filtered (not included in output)
-
-    return pd.DataFrame(classifications)
+            else:
+                dropped.append({
+                    'locus_name': target.get('locus_name', ''),
+                    'scaffold': target.get('scaffold', ''),
+                    'strand': target.get('strand', ''),
+                    'frame': target.get('frame', 0),
+                    'start': target.get('start', 0),
+                    'end': target.get('end', 0),
+                    'genome': target.get('genome', ''),
+                    'query_id': target.get('query_id', ''),
+                    'best_evalue': evalue,
+                    'bitscore': bitscore,
+                    'drop_reason': 'outside_block_and_below_thresholds'
+                })
+    return pd.DataFrame(classifications), pd.DataFrame(dropped)
 
 def deduplicate_overlapping_targets(classified_df):
     """Deduplicate overlapping target loci.
@@ -235,6 +291,10 @@ def deduplicate_overlapping_targets(classified_df):
 
     return deduplicated_df
 
+def cap_targets_by_expected_count(classified_df, locus_defs_path: Path):
+    """No-op capping: return input unchanged to remain agnostic on tandem counts."""
+    return classified_df
+
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -250,10 +310,14 @@ def parse_args():
                         help='Output directory for classified targets')
     parser.add_argument('--min-length', type=int, default=30,
                         help='Minimum ORF length in amino acids (default: 30)')
-    parser.add_argument('--unplaceable-evalue', type=float, default=1e-10,
-                        help='E-value threshold for unplaceable targets (default: 1e-10)')
-    parser.add_argument('--unplaceable-bitscore', type=float, default=100,
-                        help='Bitscore threshold for unplaceable targets (default: 100)')
+    parser.add_argument('--unplaceable-evalue', type=float, default=1e-5,
+                        help='E-value threshold for unplaceable targets (default: 1e-5)')
+    parser.add_argument('--unplaceable-bitscore', type=float, default=50,
+                        help='Bitscore threshold for unplaceable targets (default: 50)')
+    parser.add_argument('--allow-nearby', action='store_true',
+                        help='Allow targets near (not overlapping) a block to be syntenic')
+    parser.add_argument('--proximity-kb', type=int, default=100,
+                        help='Max distance in kb for nearby classification (default: 100)')
 
     return parser.parse_args()
 
@@ -304,12 +368,15 @@ def main():
     # Classify targets
     print("\n[3] Classifying targets...", flush=True)
     print(f"  Unplaceable filters: e-value <= {args.unplaceable_evalue}, bitscore >= {args.unplaceable_bitscore}")
+    print(f"  Synteny placement: {'overlap-only' if not args.allow_nearby else f'overlap-or-within {args.proximity_kb}kb'}")
 
-    classified_df = classify_targets(
+    classified_df, dropped_df = classify_targets(
         targets_df,
         blocks_df,
         args.unplaceable_evalue,
-        args.unplaceable_bitscore
+        args.unplaceable_bitscore,
+        allow_nearby=args.allow_nearby,
+        proximity_kb=args.proximity_kb
     )
 
     if len(classified_df) == 0:
@@ -323,6 +390,20 @@ def main():
     if len(classified_df) == 0:
         print("  No targets remained after deduplication!", flush=True)
         return
+
+    # Cap per-locus targets using expected counts from locus_definitions.tsv
+    locus_defs_candidate = None
+    # Prefer sibling of targets file (family root)/locus_definitions.tsv
+    try:
+        locus_defs_candidate = (args.targets.parent.parent / 'locus_definitions.tsv')
+    except Exception:
+        locus_defs_candidate = None
+
+    if locus_defs_candidate and locus_defs_candidate.exists():
+        print(f"\n[3c] Capping targets by expected locus counts using: {locus_defs_candidate}", flush=True)
+        before = len(classified_df)
+        classified_df = cap_targets_by_expected_count(classified_df, locus_defs_candidate)
+        print(f"  After capping: {len(classified_df)} targets (was {before})", flush=True)
 
     syntenic = classified_df[classified_df['placement'] == 'synteny']
     unplaceable = classified_df[classified_df['placement'] == 'unplaceable']
@@ -349,6 +430,11 @@ def main():
     unplaceable_file = args.output_dir / "unplaceable_targets.tsv"
     unplaceable.to_csv(unplaceable_file, sep='\t', index=False)
     print(f"  Saved unplaceable: {unplaceable_file.name}", flush=True)
+    # Save dropped targets, if any
+    if 'dropped_df' in locals() and len(dropped_df) > 0:
+        dropped_file = args.output_dir / "dropped_targets.tsv"
+        dropped_df.to_csv(dropped_file, sep='\t', index=False)
+        print(f"  Saved dropped: {dropped_file.name}", flush=True)
 
     # Summary by locus
     print("\n[5] Summary by assigned locus:")
@@ -369,6 +455,8 @@ def main():
     print(f"\nTotal targets classified: {len(classified_df)}", flush=True)
     print(f"Syntenic: {len(syntenic)} ({len(syntenic)/len(classified_df)*100:.1f}%)", flush=True)
     print(f"Unplaceable: {len(unplaceable)} ({len(unplaceable)/len(classified_df)*100:.1f}%)", flush=True)
+    if 'dropped_df' in locals():
+        print(f"Dropped: {len(dropped_df)}", flush=True)
 
     print(f"\nOutputs saved to: {args.output_dir}", flush=True)
     print("\nNext step: 06_extract_sequences.py (Exonerate will extract full gene structures)", flush=True)
