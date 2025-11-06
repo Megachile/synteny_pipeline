@@ -273,6 +273,7 @@ else
         --query-proteins "${PHASE3_DIR}/01_extracted_proteins" \
         --genome-db-dir data/ragtag_dbs \
         --output-dir "${PHASE3_DIR}/04_target_genes" \
+        --gene-family "${GENE_FAMILY}" \
         --threads 16 \
         2>&1 | tee "logs/phase4_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
         echo "✓ Phase 4 complete"
