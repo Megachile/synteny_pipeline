@@ -30,6 +30,8 @@ from Bio.SeqRecord import SeqRecord
 # Configuration constants
 MIN_PROTEINS_FOR_BLOCK = 3  # Minimum target proteins to call a synteny block
 MAX_FLANKING_FOR_SYNTENY = 80  # Maximum flanking proteins to use (40 upstream + 40 downstream)
+# Hard maximum span for a single synteny block; prevents chains across neighboring loci
+MAX_BLOCK_SPAN_KB = 300
 
 def run_tblastn(query_file, genome_db, output_xml, evalue="1e-5", max_targets=50, threads=16):
     """Run tBLASTn search."""
@@ -106,10 +108,117 @@ def parse_blast_xml(xml_file):
 
     return hits
 
-def cluster_into_blocks(hits, max_gap_kb=500):
-    """Cluster BLAST hits into synteny blocks."""
+def _build_query_order_map(filtered_flanking_fasta):
+    """Return mapping of query_id -> index based on FASTA order (0-based)."""
+    order = {}
+    try:
+        for i, rec in enumerate(SeqIO.parse(str(filtered_flanking_fasta), 'fasta')):
+            order[rec.id.split()[0]] = i
+    except Exception:
+        pass
+    return order
 
-    # Group by scaffold and strand
+def _select_blocks_by_chain(scaffold_hits, strand, q_order_map, block_id_start):
+    """Select synteny blocks by colinear chains (LIS-like) and span constraint."""
+    blocks = []
+    block_id = block_id_start
+    max_span_bp = MAX_BLOCK_SPAN_KB * 1000
+
+    # Choose best hit per qseqid (lowest evalue, highest bitscore as tie-breaker)
+    best_by_q = {}
+    for h in scaffold_hits:
+        q = h['qseqid']
+        cur = best_by_q.get(q)
+        if cur is None:
+            best_by_q[q] = h
+        else:
+            # Lower evalue preferred; tie-break by higher bitscore
+            if (h['evalue'] < cur['evalue']) or (h['evalue'] == cur['evalue'] and h['bitscore'] > cur['bitscore']):
+                best_by_q[q] = h
+
+    # Build sequence of (pos, q_index, hit)
+    seq = []
+    for q, h in best_by_q.items():
+        q_idx = q_order_map.get(q)
+        if q_idx is None:
+            # try stripping after '|' (NCBI headers sometimes include pipes)
+            q_base = q.split('|')[0]
+            q_idx = q_order_map.get(q_base)
+        if q_idx is None:
+            continue
+        pos = h['coord_start'] if strand == '+' else -h['coord_start']
+        seq.append((pos, q_idx, h))
+
+    if not seq:
+        return blocks, block_id
+
+    # Sort by genomic position (pos)
+    seq.sort(key=lambda x: x[0])
+
+    # Greedy extraction of increasing chains by q_idx (LIS-like)
+    unused = seq[:]
+    while unused:
+        chain = []
+        last_q = -1
+        new_unused = []
+        for pos, q_idx, h in unused:
+            inc_ok = q_idx > last_q if strand == '+' else q_idx < last_q or last_q == -1
+            if inc_ok:
+                chain.append((pos, q_idx, h))
+                last_q = q_idx
+            else:
+                new_unused.append((pos, q_idx, h))
+
+        if len(chain) < MIN_PROTEINS_FOR_BLOCK:
+            break
+
+        # Segment the chain if span exceeds max_span_bp
+        seg = []
+        seg_start = chain[0][2]['coord_start']
+        seg_end = chain[0][2]['coord_end']
+        current_hits = [chain[0][2]]
+        for _, _, h in chain[1:]:
+            seg_end = max(seg_end, h['coord_end'])
+            if (seg_end - seg_start) > max_span_bp:
+                if len(current_hits) >= MIN_PROTEINS_FOR_BLOCK:
+                    blocks.append({
+                        'block_id': f"block_{block_id:05d}",
+                        'scaffold': current_hits[0]['sseqid'],
+                        'strand': strand,
+                        'start': min(x['coord_start'] for x in current_hits),
+                        'end': max(x['coord_end'] for x in current_hits),
+                        'num_target_proteins': len(set(x['qseqid'] for x in current_hits)),
+                        'num_query_matches': len(set(x['qseqid'] for x in current_hits)),
+                        'hits': current_hits
+                    })
+                    block_id += 1
+                # start new segment
+                seg_start = h['coord_start']
+                seg_end = h['coord_end']
+                current_hits = [h]
+            else:
+                current_hits.append(h)
+        if len(current_hits) >= MIN_PROTEINS_FOR_BLOCK:
+            blocks.append({
+                'block_id': f"block_{block_id:05d}",
+                'scaffold': current_hits[0]['sseqid'],
+                'strand': strand,
+                'start': min(x['coord_start'] for x in current_hits),
+                'end': max(x['coord_end'] for x in current_hits),
+                'num_target_proteins': len(set(x['qseqid'] for x in current_hits)),
+                'num_query_matches': len(set(x['qseqid'] for x in current_hits)),
+                'hits': current_hits
+            })
+            block_id += 1
+
+        # Remove used qseqids from unused
+        used_q = set(h['qseqid'] for _, _, h in chain)
+        unused = [t for t in new_unused if t[2]['qseqid'] not in used_q]
+
+    return blocks, block_id
+
+def cluster_into_blocks(hits, q_order_map, max_gap_kb=500):
+    """Cluster BLAST hits into synteny blocks using colinear chains and span limits."""
     grouped = defaultdict(list)
     for hit in hits:
         key = (hit['sseqid'], hit['strand'])
@@ -117,55 +226,9 @@ def cluster_into_blocks(hits, max_gap_kb=500):
 
     blocks = []
     block_id = 1
-
     for (scaffold, strand), scaffold_hits in grouped.items():
-        # Sort by position
-        scaffold_hits = sorted(scaffold_hits, key=lambda x: x['coord_start'])
-
-        # Cluster into blocks
-        current_block_hits = [scaffold_hits[0]]
-
-        for hit in scaffold_hits[1:]:
-            # Check if within max_gap of current block
-            block_end = max(h['coord_end'] for h in current_block_hits)
-            gap = hit['coord_start'] - block_end
-
-            if gap <= max_gap_kb * 1000:  # Convert kb to bp
-                current_block_hits.append(hit)
-            else:
-                # Save current block and start new one
-                # Count unique TARGET proteins (sseqid) in the genome, not query proteins
-                unique_target_proteins = len(set((h['sseqid'], h['coord_start'], h['coord_end']) for h in current_block_hits))
-                if unique_target_proteins >= MIN_PROTEINS_FOR_BLOCK:
-                    blocks.append({
-                        'block_id': f"block_{block_id:05d}",
-                        'scaffold': scaffold,
-                        'strand': strand,
-                        'start': min(h['coord_start'] for h in current_block_hits),
-                        'end': max(h['coord_end'] for h in current_block_hits),
-                        'num_target_proteins': unique_target_proteins,
-                        'num_query_matches': len(set(h['qseqid'] for h in current_block_hits)),
-                        'hits': current_block_hits
-                    })
-                    block_id += 1
-
-                current_block_hits = [hit]
-
-        # Don't forget the last block
-        # Count unique TARGET proteins (sseqid) in the genome, not query proteins
-        unique_target_proteins = len(set((h['sseqid'], h['coord_start'], h['coord_end']) for h in current_block_hits))
-        if unique_target_proteins >= MIN_PROTEINS_FOR_BLOCK:
-            blocks.append({
-                'block_id': f"block_{block_id:05d}",
-                'scaffold': scaffold,
-                'strand': strand,
-                'start': min(h['coord_start'] for h in current_block_hits),
-                'end': max(h['coord_end'] for h in current_block_hits),
-                'num_target_proteins': unique_target_proteins,
-                'num_query_matches': len(set(h['qseqid'] for h in current_block_hits)),
-                'hits': current_block_hits
-            })
-            block_id += 1
+        b, block_id = _select_blocks_by_chain(scaffold_hits, strand, q_order_map, block_id)
+        blocks.extend(b)
 
     return blocks
 
@@ -308,8 +371,10 @@ def process_locus(locus_id, flanking_file, genome_dbs, output_dir, evalue="1e-5"
         # Save HSP sequences for flanking proteins (for SwissProt validation)
         num_seqs = save_hit_sequences(hits, genome_id, locus_output)
 
-        # Cluster into blocks
-        blocks = cluster_into_blocks(hits, max_gap_kb)
+        # Build query order mapping from filtered flanking FASTA for colinearity
+        q_order_map = _build_query_order_map(filtered_flanking)
+        # Cluster into blocks using colinear chains with span limit
+        blocks = cluster_into_blocks(hits, q_order_map, max_gap_kb)
         print(f" - {len(blocks)} synteny blocks, {num_seqs} HSP sequences saved")
 
         # Add genome and locus info to blocks
