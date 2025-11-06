@@ -180,7 +180,8 @@ fi
 # Phase 3c: Extract target proteins from proteomes
 echo ""
 echo "--- PHASE 3c: EXTRACT TARGET PROTEINS ---"
-if [ -d "${PHASE3_DIR}/01_extracted_proteins" ] && [ -n "$(ls -A ${PHASE3_DIR}/01_extracted_proteins/*.faa 2>/dev/null)" ]; then
+# Check if extracted proteins exist (they're in subdirectories per locus)
+if [ -d "${PHASE3_DIR}/01_extracted_proteins" ] && [ -n "$(find ${PHASE3_DIR}/01_extracted_proteins -name '*_targets.faa' -type f 2>/dev/null)" ]; then
     echo "✓ Phase 3c already complete (skipping)"
 else
     if python scripts/03c_extract_target_proteins.py \
