@@ -314,7 +314,8 @@ else
     echo "  Checking for failed tasks..." >&2
     FAILED_TASKS=0
     if compgen -G "logs/phase7_${GENE_FAMILY}_${PHASE7_JOB}_*.err" > /dev/null; then
-        FAILED_TASKS=$(grep -l "Phase 7 failed" logs/phase7_${GENE_FAMILY}_${PHASE7_JOB}_*.err 2>/dev/null | wc -l)
+        # grep returns 1 when no matches found, so use || true to prevent pipefail
+        FAILED_TASKS=$(grep -l "Phase 7 failed" logs/phase7_${GENE_FAMILY}_${PHASE7_JOB}_*.err 2>/dev/null | wc -l || true)
     fi
     echo "  Failed tasks: ${FAILED_TASKS}" >&2
     if [ $FAILED_TASKS -gt 0 ]; then
