@@ -832,10 +832,22 @@ def main():
                 'cluster_members': cluster
             }
 
+    # Build set of representative genes from input tandem clusters
+    # Only create loci for representatives to avoid duplicate loci for tandem clusters
+    representative_genes = set(representative_locs)
+
     for genome_code, paralog_data in all_paralogs.items():
         print(f"\n  {genome_code}: {paralog_data['gene_count']} unique genes")
 
+        # Track skipped tandem duplicates
+        skipped_count = 0
+
         for target_gene in paralog_data['unique_genes']:
+            # Skip non-representative genes from input tandem clusters
+            if target_gene in input_tandem_map and target_gene not in representative_genes:
+                skipped_count += 1
+                print(f"    Skipping {target_gene} (tandem duplicate, not representative)")
+                continue
             # Get flanking genes with genome-specific distance cap and max genes
             distance_cap = FLANKING_DISTANCE_KB.get(genome_code, 1000)  # Default to 1000 if genome not specified
             upstream_genes, downstream_genes = mappers[genome_code].get_flanking_genes(
@@ -919,6 +931,10 @@ def main():
             print(f"      Target: {target_gene}")
             print(f"      Flanking: {len(upstream_genes)}U + {len(downstream_genes)}D = {len(all_flanking)} genes -> {len(upstream_proteins)+len(downstream_proteins)} proteins")
             print(f"      Tandems: {len(tandems)}")
+
+        # Report skipped tandem duplicates for this genome
+        if skipped_count > 0:
+            print(f"\n  Skipped {skipped_count} tandem duplicate(s) (not representatives)")
 
     # Step 5: Save results
     print("\n[5] Saving results...")
