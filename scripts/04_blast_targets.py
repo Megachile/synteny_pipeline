@@ -7,7 +7,6 @@ runs BLAST once per genome, then assigns hits to loci with best-match tracking.
 
 Usage:
     python 04_blast_targets.py \\
-        --blocks <path/to/synteny_blocks_filtered.tsv> \\
         --locus-defs <path/to/locus_definitions.tsv> \\
         --query-proteins <path/to/01_extracted_proteins> \\
         --genome-db-dir <path/to/ragtag_dbs> \\
@@ -318,8 +317,6 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    parser.add_argument('--blocks', required=True, type=Path,
-                        help='Path to synteny_blocks_filtered.tsv')
     parser.add_argument('--locus-defs', required=True, type=Path,
                         help='Path to locus_definitions.tsv')
     parser.add_argument('--query-proteins', required=True, type=Path,
