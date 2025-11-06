@@ -297,8 +297,14 @@ else
     echo "  Waiting for completion..."
 
     # Wait for array job to complete
-    while squeue -j ${PHASE7_JOB} 2>/dev/null | grep -q ${PHASE7_JOB}; do
-        sleep 30
+    while true; do
+        # Check if job is still in queue (running or pending)
+        if squeue -j ${PHASE7_JOB} 2>/dev/null | grep -q "${PHASE7_JOB}"; then
+            sleep 30
+        else
+            # Job not in queue - either completed or failed
+            break
+        fi
     done
 
     # Check if any tasks failed
