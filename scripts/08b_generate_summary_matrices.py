@@ -105,14 +105,30 @@ def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_bl
         targets_by_genome[target['genome']].append(target)
 
     # Get synteny blocks for this gene family's loci
-    synteny_by_genome = {}
+    # Store both locus and synteny_pct
+    synteny_by_genome_locus = {}  # {genome: {locus: synteny_pct}}
+    locus_expected_proteins = {}  # {locus: total_expected}
+
     for locus in loci_list:
         locus_blocks = synteny_blocks_df[synteny_blocks_df['locus_id'] == locus]
         for _, block in locus_blocks.iterrows():
             genome = block['genome']
-            if genome not in synteny_by_genome:
-                synteny_by_genome[genome] = []
-            synteny_by_genome[genome].append(locus)
+
+            # Get expected number of flanking proteins for this locus
+            # From num_target_proteins column (total proteins in the block)
+            total_expected = block.get('num_target_proteins', 0)
+            locus_expected_proteins[locus] = total_expected
+
+            # Calculate synteny percentage
+            num_matches = block.get('num_query_matches', 0)
+            if total_expected > 0:
+                synteny_pct = round(num_matches / total_expected * 100, 1)
+            else:
+                synteny_pct = 0.0
+
+            if genome not in synteny_by_genome_locus:
+                synteny_by_genome_locus[genome] = {}
+            synteny_by_genome_locus[genome][locus] = synteny_pct
 
     # Get all unique locus categories
     # Syntenic loci (from loci_list) + unplaceable
@@ -137,12 +153,12 @@ def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_bl
         # Count targets by category
         genome_targets = targets_by_genome.get(genome, [])
 
-        # Initialize all columns with "No block" (no synteny)
+        # Initialize all columns with "0%" (no synteny)
         for category in locus_categories:
             if category.endswith('_unplaceable'):
                 row[category] = ""  # Unplaceable is special
             else:
-                row[category] = "No block"
+                row[category] = "0%"
 
         # Fill in target counts
         category_counts = defaultdict(list)
@@ -173,19 +189,24 @@ def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_bl
 
             category_counts[assigned_to].append(target_str)
 
-        # Format counts for each category
+        # Format counts for each category with synteny percent
         for category, target_list in category_counts.items():
             if category in row:  # Only if it's a known category
                 if target_list:
-                    row[category] = f"[{'; '.join(target_list)}]"
+                    # Get synteny percent if available
+                    if genome in synteny_by_genome_locus and category in synteny_by_genome_locus[genome]:
+                        synteny_pct = synteny_by_genome_locus[genome][category]
+                        row[category] = f"{synteny_pct}% [{'; '.join(target_list)}]"
+                    else:
+                        row[category] = f"[{'; '.join(target_list)}]"
 
         # Check for synteny blocks without targets
         # For loci where this genome has a synteny block but no extracted target
-        genome_loci_with_blocks = synteny_by_genome.get(genome, [])
-        for locus in genome_loci_with_blocks:
-            if locus in row and row[locus] == "No block":
-                # Synteny block exists but no target found/extracted
-                row[locus] = "[empty]"
+        if genome in synteny_by_genome_locus:
+            for locus, synteny_pct in synteny_by_genome_locus[genome].items():
+                if locus in row and row[locus] == "0%":
+                    # Synteny block exists but no target found/extracted
+                    row[locus] = f"{synteny_pct}% [empty]"
 
         # Add total count (only successfully extracted targets)
         row['total'] = sum(len(targets) for targets in category_counts.values())

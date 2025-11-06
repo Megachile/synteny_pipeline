@@ -390,8 +390,8 @@ def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_d
                 # Synteny block exists but no target found
                 row['TARGET'] = f"{gene_family} [empty]"
             else:
-                # No synteny block
-                row['TARGET'] = "No block"
+                # No synteny block - report as 0% conservation
+                row['TARGET'] = f"{gene_family} [0%]"
 
         # Downstream proteins (ascending order)
         for i, protein_id in enumerate(downstream_proteins, 1):
