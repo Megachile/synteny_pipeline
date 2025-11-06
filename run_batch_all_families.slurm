@@ -63,16 +63,17 @@ OUTPUT_DIR="${GENE_FAMILY}_BK_LB_batch"
 
 # Load environment
 echo "Loading environment..."
-set +e  # Disable exit on error for environment setup
-set +u  # Disable unbound variable check
-source ~/.bashrc 2>&1 | grep -v "cannot access" | grep -v "No such file" || true
-eval "$(micromamba shell hook --shell bash)" 2>/dev/null || true
-micromamba activate busco_env 2>&1 | grep -v "already activated" || true
-module load exonerate/2.4.0-yl7q 2>/dev/null || true
-set -u  # Re-enable unbound variable check
-set -e  # Re-enable exit on error
+
+# Initialize micromamba
+eval "$(micromamba shell hook --shell bash)"
+micromamba activate busco_env
+
+# Load Exonerate module
+module load exonerate/2.4.0-yl7q 2>/dev/null || echo "  Exonerate module not loaded (may already be available)"
 
 echo "Environment ready"
+echo "  Python: $(which python)"
+echo "  Conda env: $CONDA_DEFAULT_ENV"
 echo ""
 
 ################################################################################
