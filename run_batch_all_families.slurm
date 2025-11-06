@@ -247,7 +247,6 @@ else
         --genome-fasta-dir data/ragtag_output \
         --output-dir "${PHASE3_DIR}/06_extracted_sequences" \
         --unplaceable-evalue 1e-10 \
-        --threads 16 \
         --verbose \
         2>&1 | tee "logs/phase6_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
         echo "✓ Phase 6 complete"
