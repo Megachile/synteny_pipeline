@@ -309,7 +309,10 @@ else
     done
 
     # Check if any tasks failed
-    FAILED_TASKS=$(ls logs/phase7_${GENE_FAMILY}_${PHASE7_JOB}_*.err 2>/dev/null | xargs grep -l "Phase 7 failed" | wc -l)
+    FAILED_TASKS=0
+    if compgen -G "logs/phase7_${GENE_FAMILY}_${PHASE7_JOB}_*.err" > /dev/null; then
+        FAILED_TASKS=$(grep -l "Phase 7 failed" logs/phase7_${GENE_FAMILY}_${PHASE7_JOB}_*.err 2>/dev/null | wc -l)
+    fi
     if [ $FAILED_TASKS -gt 0 ]; then
         echo "❌ Phase 7 failed - ${FAILED_TASKS} array tasks failed"
         exit 1
