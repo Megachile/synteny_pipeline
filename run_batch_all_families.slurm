@@ -28,7 +28,8 @@ cd /carc/scratch/projects/emartins/2016456/adam/synteny_scanning/hpc_deployment_
 mkdir -p logs
 
 # Read gene families from input file (skip header and empty lines)
-GENE_FAMILIES=($(tail -n +2 hpc_input_loci.tsv | grep -v "^$" | cut -f1))
+# Use mapfile to preserve spaces in gene family names
+mapfile -t GENE_FAMILIES < <(tail -n +2 hpc_input_loci.tsv | grep -v "^$" | cut -f1)
 
 # Get this array task's gene family
 GENE_FAMILY="${GENE_FAMILIES[$SLURM_ARRAY_TASK_ID]}"
