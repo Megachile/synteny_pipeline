@@ -86,15 +86,15 @@ echo "==========================================================================
 
 # Phase 1: Discover paralogs
 PHASE12_DIR="outputs/${OUTPUT_DIR}/phase12_landmark"
-mkdir -p ${PHASE12_DIR}
+mkdir -p "${PHASE12_DIR}"
 
 echo ""
 echo "--- PHASE 1: PARALOG DISCOVERY ---"
 if python scripts/01_discover_paralogs_gene_level.py \
     --loc-ids "$TARGET_GENES" \
-    --output-dir ${PHASE12_DIR} \
-    --gene-family ${GENE_FAMILY} \
-    2>&1 | tee logs/phase1_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log; then
+    --output-dir "${PHASE12_DIR}" \
+    --gene-family "${GENE_FAMILY}" \
+    2>&1 | tee "logs/phase1_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
     echo "✓ Phase 1 complete"
 else
     echo "❌ Phase 1 failed"
@@ -104,8 +104,8 @@ fi
 # Phase 2: Synteny comparison and deduplication
 echo ""
 echo "--- PHASE 2: SYNTENY COMPARISON & DEDUPLICATION ---"
-if python scripts/02_compare_synteny_gene_level.py ${PHASE12_DIR} \
-    2>&1 | tee logs/phase2_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log; then
+if python scripts/02_compare_synteny_gene_level.py "${PHASE12_DIR}" \
+    2>&1 | tee "logs/phase2_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
     echo "✓ Phase 2 complete"
 else
     echo "❌ Phase 2 failed"
@@ -114,19 +114,19 @@ fi
 
 # Phase 3a: Genome-wide synteny detection
 PHASE3_DIR="outputs/${OUTPUT_DIR}"
-mkdir -p ${PHASE3_DIR}
+mkdir -p "${PHASE3_DIR}"
 
 echo ""
 echo "--- PHASE 3a: GENOME-WIDE SYNTENY DETECTION ---"
 if python scripts/02_synteny_detection.py \
-    --locus-defs ${PHASE12_DIR}/locus_definitions.tsv \
+    --locus-defs "${PHASE12_DIR}/locus_definitions.tsv" \
     --genome-db-dir data/ragtag_dbs \
-    --output-dir ${PHASE3_DIR}/02_synteny_blocks \
+    --output-dir "${PHASE3_DIR}/02_synteny_blocks" \
     --evalue 1e-5 \
     --max-targets 50 \
     --max-gap-kb 500 \
     --threads 16 \
-    2>&1 | tee logs/phase3a_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log; then
+    2>&1 | tee "logs/phase3a_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
     echo "✓ Phase 3a complete"
 else
     echo "❌ Phase 3a failed"
@@ -143,7 +143,7 @@ if [ ! -f "${PHASE3_DIR}/02_synteny_blocks/all_synteny_blocks.tsv" ]; then
     echo -e "locus_id\tgenome\tblock_id\tscaffold\tstrand\tstart\tend\tspan_kb\tnum_target_proteins\tnum_query_matches" \
         > "${PHASE3_DIR}/02_synteny_blocks/all_synteny_blocks.tsv"
 
-    for locus_file in ${PHASE3_DIR}/02_synteny_blocks/*_synteny_blocks.tsv; do
+    for locus_file in "${PHASE3_DIR}"/02_synteny_blocks/*_synteny_blocks.tsv; do
         if [ -f "$locus_file" ]; then
             tail -n +2 "$locus_file" >> "${PHASE3_DIR}/02_synteny_blocks/all_synteny_blocks.tsv"
         fi
@@ -151,10 +151,10 @@ if [ ! -f "${PHASE3_DIR}/02_synteny_blocks/all_synteny_blocks.tsv" ]; then
 fi
 
 if python scripts/03_filter_blocks.py \
-    --input ${PHASE3_DIR}/02_synteny_blocks/all_synteny_blocks.tsv \
-    --output-dir ${PHASE3_DIR}/03_filtered_blocks \
+    --input "${PHASE3_DIR}/02_synteny_blocks/all_synteny_blocks.tsv" \
+    --output-dir "${PHASE3_DIR}/03_filtered_blocks" \
     --verbose \
-    2>&1 | tee logs/phase3b_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log; then
+    2>&1 | tee "logs/phase3b_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
     echo "✓ Phase 3b complete"
 else
     echo "❌ Phase 3b failed"
@@ -165,11 +165,11 @@ fi
 echo ""
 echo "--- PHASE 3c: EXTRACT TARGET PROTEINS ---"
 if python scripts/03c_extract_target_proteins.py \
-    --locus-defs ${PHASE12_DIR}/locus_definitions.tsv \
+    --locus-defs "${PHASE12_DIR}/locus_definitions.tsv" \
     --proteome-dir data/proteomes \
     --genome-dir data/genomes \
-    --output-dir ${PHASE3_DIR}/01_extracted_proteins \
-    2>&1 | tee logs/phase3c_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log; then
+    --output-dir "${PHASE3_DIR}/01_extracted_proteins" \
+    2>&1 | tee "logs/phase3c_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
     echo "✓ Phase 3c complete"
 else
     echo "❌ Phase 3c failed"
@@ -180,12 +180,12 @@ fi
 echo ""
 echo "--- PHASE 4: TARGET GENE DETECTION ---"
 if python scripts/04_blast_targets.py \
-    --locus-defs ${PHASE12_DIR}/locus_definitions.tsv \
-    --query-proteins ${PHASE3_DIR}/01_extracted_proteins \
+    --locus-defs "${PHASE12_DIR}/locus_definitions.tsv" \
+    --query-proteins "${PHASE3_DIR}/01_extracted_proteins" \
     --genome-db-dir data/ragtag_dbs \
-    --output-dir ${PHASE3_DIR}/04_target_genes \
+    --output-dir "${PHASE3_DIR}/04_target_genes" \
     --threads 16 \
-    2>&1 | tee logs/phase4_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log; then
+    2>&1 | tee "logs/phase4_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
     echo "✓ Phase 4 complete"
 else
     echo "❌ Phase 4 failed"
@@ -196,10 +196,10 @@ fi
 echo ""
 echo "--- PHASE 5: FUNCTIONAL CLASSIFICATION ---"
 if python scripts/05_classify_targets.py \
-    --targets ${PHASE3_DIR}/04_target_genes/all_target_loci.tsv \
-    --blocks ${PHASE3_DIR}/03_filtered_blocks/synteny_blocks_filtered.tsv \
-    --output-dir ${PHASE3_DIR}/05_classified \
-    2>&1 | tee logs/phase5_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log; then
+    --targets "${PHASE3_DIR}/04_target_genes/all_target_loci.tsv" \
+    --blocks "${PHASE3_DIR}/03_filtered_blocks/synteny_blocks_filtered.tsv" \
+    --output-dir "${PHASE3_DIR}/05_classified" \
+    2>&1 | tee "logs/phase5_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
     echo "✓ Phase 5 complete"
 else
     echo "❌ Phase 5 failed"
@@ -210,15 +210,15 @@ fi
 echo ""
 echo "--- PHASE 6: EXTRACT GENE STRUCTURES ---"
 if python scripts/06_extract_sequences.py \
-    --syntenic ${PHASE3_DIR}/05_classified/syntenic_targets.tsv \
-    --unplaceable ${PHASE3_DIR}/05_classified/unplaceable_targets.tsv \
-    --query-proteins ${PHASE3_DIR}/04_target_genes/combined_targets.faa \
+    --syntenic "${PHASE3_DIR}/05_classified/syntenic_targets.tsv" \
+    --unplaceable "${PHASE3_DIR}/05_classified/unplaceable_targets.tsv" \
+    --query-proteins "${PHASE3_DIR}/04_target_genes/combined_targets.faa" \
     --genome-fasta-dir data/ragtag_output \
-    --output-dir ${PHASE3_DIR}/06_extracted_sequences \
+    --output-dir "${PHASE3_DIR}/06_extracted_sequences" \
     --unplaceable-evalue 1e-10 \
     --threads 16 \
     --verbose \
-    2>&1 | tee logs/phase6_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log; then
+    2>&1 | tee "logs/phase6_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
     echo "✓ Phase 6 complete"
 else
     echo "❌ Phase 6 failed"
@@ -229,13 +229,13 @@ fi
 echo ""
 echo "--- PHASE 7: SWISSPROT ANNOTATION ---"
 if python scripts/07_swissprot_annotation.py \
-    --synteny-dir ${PHASE3_DIR}/02_synteny_blocks \
-    --filtered-blocks ${PHASE3_DIR}/03_filtered_blocks/synteny_blocks_filtered.tsv \
+    --synteny-dir "${PHASE3_DIR}/02_synteny_blocks" \
+    --filtered-blocks "${PHASE3_DIR}/03_filtered_blocks/synteny_blocks_filtered.tsv" \
     --swissprot-db data/reference/swissprot.dmnd \
-    --output-dir ${PHASE3_DIR}/07_swissprot_annotations \
+    --output-dir "${PHASE3_DIR}/07_swissprot_annotations" \
     --evalue 1e-5 \
     --threads 16 \
-    2>&1 | tee logs/phase7_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log; then
+    2>&1 | tee "logs/phase7_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
     echo "✓ Phase 7 complete"
 else
     echo "❌ Phase 7 failed"
@@ -245,18 +245,18 @@ fi
 # Phase 8a: Generate locus matrices
 echo ""
 echo "--- PHASE 8a: GENERATE LOCUS MATRICES ---"
-cp ${PHASE12_DIR}/locus_definitions.tsv ${PHASE3_DIR}/locus_definitions.tsv
+cp "${PHASE12_DIR}/locus_definitions.tsv" "${PHASE3_DIR}/locus_definitions.tsv"
 
 if python scripts/08a_generate_locus_matrices.py \
-    --locus-defs ${PHASE3_DIR}/locus_definitions.tsv \
-    --synteny-dir ${PHASE3_DIR}/02_synteny_blocks \
-    --blocks ${PHASE3_DIR}/03_filtered_blocks/synteny_blocks_filtered.tsv \
-    --targets ${PHASE3_DIR}/05_classified/all_targets_classified.tsv \
-    --swissprot ${PHASE3_DIR}/07_swissprot_annotations/genome_specific_swissprot_annotations.tsv \
+    --locus-defs "${PHASE3_DIR}/locus_definitions.tsv" \
+    --synteny-dir "${PHASE3_DIR}/02_synteny_blocks" \
+    --blocks "${PHASE3_DIR}/03_filtered_blocks/synteny_blocks_filtered.tsv" \
+    --targets "${PHASE3_DIR}/05_classified/all_targets_classified.tsv" \
+    --swissprot "${PHASE3_DIR}/07_swissprot_annotations/genome_specific_swissprot_annotations.tsv" \
     --reference-proteins data/reference/protein.faa \
     --species-map data/gca_to_species.tsv \
-    --output-dir ${PHASE3_DIR}/08_matrices \
-    2>&1 | tee logs/phase8a_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log; then
+    --output-dir "${PHASE3_DIR}/08_matrices" \
+    2>&1 | tee "logs/phase8a_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
     echo "✓ Phase 8a complete"
 else
     echo "❌ Phase 8a failed"
@@ -267,9 +267,9 @@ fi
 echo ""
 echo "--- PHASE 8b: GENERATE SUMMARY MATRICES ---"
 if python scripts/08b_generate_summary_matrices.py \
-    --locus-matrices-dir ${PHASE3_DIR}/08_matrices \
-    --output-dir ${PHASE3_DIR}/08_matrices \
-    2>&1 | tee logs/phase8b_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log; then
+    --locus-matrices-dir "${PHASE3_DIR}/08_matrices" \
+    --output-dir "${PHASE3_DIR}/08_matrices" \
+    2>&1 | tee "logs/phase8b_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
     echo "✓ Phase 8b complete"
 else
     echo "❌ Phase 8b failed"
