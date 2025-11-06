@@ -120,29 +120,94 @@ else
     fi
 fi
 
-# Phase 3a: Genome-wide synteny detection
+# Phase 3a: Genome-wide synteny detection (parallelized per locus)
 PHASE3_DIR="outputs/${OUTPUT_DIR}"
 mkdir -p "${PHASE3_DIR}"
+mkdir -p "${PHASE3_DIR}/02_synteny_blocks"
 
 echo ""
 echo "--- PHASE 3a: GENOME-WIDE SYNTENY DETECTION ---"
-if [ -f "${PHASE3_DIR}/02_synteny_blocks/all_synteny_blocks.tsv" ]; then
+
+SYNTENY_BLOCKS_DIR="${PHASE3_DIR}/02_synteny_blocks"
+ALL_BLOCKS="${SYNTENY_BLOCKS_DIR}/all_synteny_blocks.tsv"
+
+if [ -f "$ALL_BLOCKS" ]; then
     echo "✓ Phase 3a already complete (skipping)"
 else
-    if python scripts/02_synteny_detection.py \
-        --locus-defs "${PHASE12_DIR}/locus_definitions.tsv" \
-        --genome-db-dir data/ragtag_dbs \
-        --output-dir "${PHASE3_DIR}/02_synteny_blocks" \
-        --evalue 1e-5 \
-        --max-targets 50 \
-        --max-gap-kb 500 \
-        --threads 16 \
-        2>&1 | tee "logs/phase3a_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
-        echo "✓ Phase 3a complete"
-    else
-        echo "❌ Phase 3a failed"
+    # Count loci from locus definitions
+    LOCUS_DEFS="${PHASE12_DIR}/locus_definitions.tsv"
+    if [ ! -f "$LOCUS_DEFS" ]; then
+        echo "❌ Phase 3a failed - locus definitions not found"
         exit 1
     fi
+
+    NLOCI=$(tail -n +2 "$LOCUS_DEFS" | wc -l)
+    echo "  Detected ${NLOCI} loci to search"
+
+    if [ $NLOCI -eq 0 ]; then
+        echo "❌ Phase 3a failed - no loci found in locus definitions"
+        exit 1
+    fi
+
+    # Submit Phase 3a array job (one task per locus)
+    echo "  Submitting Phase 3a array job (0-$((NLOCI-1)))..."
+    PHASE3A_JOB=$(sbatch --parsable \
+        --array=0-$((NLOCI-1)) \
+        --job-name="phase3a_${GENE_FAMILY}" \
+        --output="logs/phase3a_${GENE_FAMILY}_%A_%a.out" \
+        --error="logs/phase3a_${GENE_FAMILY}_%A_%a.err" \
+        --cpus-per-task=16 \
+        --mem=32G \
+        --time=4:00:00 \
+        run_phase3a_array.slurm "${LOCUS_DEFS}" "${PHASE3_DIR}")
+
+    echo "  Phase 3a array job submitted: ${PHASE3A_JOB}"
+    echo "  Waiting for completion..."
+
+    # Wait for array job to complete
+    while true; do
+        # Check if job is still in queue (running or pending)
+        if squeue -j ${PHASE3A_JOB} 2>/dev/null | grep -q "${PHASE3A_JOB}"; then
+            sleep 30
+        else
+            break
+        fi
+    done
+
+    # Check for failures
+    FAILED_TASKS=0
+    if compgen -G "logs/phase3a_${GENE_FAMILY}_${PHASE3A_JOB}_*.err" > /dev/null; then
+        FAILED_TASKS=$(grep -l "Phase 3a failed\|ERROR" logs/phase3a_${GENE_FAMILY}_${PHASE3A_JOB}_*.err 2>/dev/null | wc -l || true)
+    fi
+
+    if [ $FAILED_TASKS -gt 0 ]; then
+        echo "❌ Phase 3a failed - ${FAILED_TASKS} loci failed"
+        exit 1
+    fi
+
+    # Aggregate results from all loci
+    echo "  Aggregating results from ${NLOCI} loci..."
+
+    # Create header
+    echo -e "locus_id\tgenome\tblock_id\tscaffold\tstrand\tstart\tend\tspan_kb\tnum_target_proteins\tnum_query_matches" \
+        > "$ALL_BLOCKS"
+
+    # Append all per-locus files
+    shopt -s nullglob
+    locus_files=("${SYNTENY_BLOCKS_DIR}"/*_synteny_blocks.tsv)
+
+    if [ ${#locus_files[@]} -eq 0 ]; then
+        echo "❌ Phase 3a failed - no locus output files found"
+        exit 1
+    fi
+
+    for locus_file in "${locus_files[@]}"; do
+        tail -n +2 "$locus_file" >> "$ALL_BLOCKS"
+    done
+
+    TOTAL_BLOCKS=$(tail -n +2 "$ALL_BLOCKS" | wc -l)
+    echo "✓ Phase 3a complete (${NLOCI} loci processed in parallel)"
+    echo "  Aggregated output: ${ALL_BLOCKS} (${TOTAL_BLOCKS} total blocks)"
 fi
 
 # Phase 3b: Filter to best block per genome
@@ -304,20 +369,16 @@ else
             sleep 30
         else
             # Job not in queue - either completed or failed
-            echo "  Phase 7 array job completed" >&2
             break
         fi
     done
-    echo "  Exited wait loop" >&2
 
     # Check if any tasks failed
-    echo "  Checking for failed tasks..." >&2
     FAILED_TASKS=0
     if compgen -G "logs/phase7_${GENE_FAMILY}_${PHASE7_JOB}_*.err" > /dev/null; then
         # grep returns 1 when no matches found, so use || true to prevent pipefail
         FAILED_TASKS=$(grep -l "Phase 7 failed" logs/phase7_${GENE_FAMILY}_${PHASE7_JOB}_*.err 2>/dev/null | wc -l || true)
     fi
-    echo "  Failed tasks: ${FAILED_TASKS}" >&2
     if [ $FAILED_TASKS -gt 0 ]; then
         echo "❌ Phase 7 failed - ${FAILED_TASKS} array tasks failed"
         exit 1
