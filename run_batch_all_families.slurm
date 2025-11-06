@@ -304,15 +304,19 @@ else
             sleep 30
         else
             # Job not in queue - either completed or failed
+            echo "  Phase 7 array job completed" >&2
             break
         fi
     done
+    echo "  Exited wait loop" >&2
 
     # Check if any tasks failed
+    echo "  Checking for failed tasks..." >&2
     FAILED_TASKS=0
     if compgen -G "logs/phase7_${GENE_FAMILY}_${PHASE7_JOB}_*.err" > /dev/null; then
         FAILED_TASKS=$(grep -l "Phase 7 failed" logs/phase7_${GENE_FAMILY}_${PHASE7_JOB}_*.err 2>/dev/null | wc -l)
     fi
+    echo "  Failed tasks: ${FAILED_TASKS}" >&2
     if [ $FAILED_TASKS -gt 0 ]; then
         echo "❌ Phase 7 failed - ${FAILED_TASKS} array tasks failed"
         exit 1
@@ -320,6 +324,7 @@ else
 
     # Aggregate per-locus results into single file
     echo "  Aggregating results from ${NLOCI} loci..."
+    echo "  Starting aggregation" >&2
 
     # Create header from first locus file
     shopt -s nullglob
