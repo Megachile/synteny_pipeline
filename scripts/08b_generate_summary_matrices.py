@@ -91,7 +91,7 @@ def load_extracted_seq_metadata(extraction_dir):
 
     return metadata
 
-def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_blocks_df, species_map, phylo_order_map, seq_metadata):
+def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_blocks_df, species_map, phylo_order_map, seq_metadata, output_dir):
     """Create summary matrix for one gene family."""
 
     print(f"\n  Processing {gene_family}...")
@@ -104,31 +104,27 @@ def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_bl
     for _, target in family_targets.iterrows():
         targets_by_genome[target['genome']].append(target)
 
-    # Get synteny blocks for this gene family's loci
-    # Store both locus and synteny_pct
+    # Read synteny percentages from Phase 8a locus matrices
+    # Phase 8a already calculated correct synteny_pct based on flanking columns
     synteny_by_genome_locus = {}  # {genome: {locus: synteny_pct}}
-    locus_expected_proteins = {}  # {locus: total_expected}
 
     for locus in loci_list:
-        locus_blocks = synteny_blocks_df[synteny_blocks_df['locus_id'] == locus]
-        for _, block in locus_blocks.iterrows():
-            genome = block['genome']
+        # Load the locus matrix created by Phase 8a
+        locus_matrix_file = output_dir / f"{locus}_genome_swissprot_matrix.tsv"
 
-            # Get expected number of flanking proteins for this locus
-            # From num_target_proteins column (total proteins in the block)
-            total_expected = block.get('num_target_proteins', 0)
-            locus_expected_proteins[locus] = total_expected
+        if locus_matrix_file.exists():
+            # Read synteny_pct from the locus matrix
+            locus_matrix = pd.read_csv(locus_matrix_file, sep='\t')
 
-            # Calculate synteny percentage
-            num_matches = block.get('num_query_matches', 0)
-            if total_expected > 0:
-                synteny_pct = round(num_matches / total_expected * 100, 1)
-            else:
-                synteny_pct = 0.0
+            for _, row in locus_matrix.iterrows():
+                genome = row['genome_id']
+                synteny_pct = row.get('synteny_pct', 0.0)
 
-            if genome not in synteny_by_genome_locus:
-                synteny_by_genome_locus[genome] = {}
-            synteny_by_genome_locus[genome][locus] = synteny_pct
+                if genome not in synteny_by_genome_locus:
+                    synteny_by_genome_locus[genome] = {}
+                synteny_by_genome_locus[genome][locus] = synteny_pct
+        else:
+            print(f"    Warning: Locus matrix not found: {locus_matrix_file.name}")
 
     # Get all unique locus categories
     # Syntenic loci (from loci_list) + unplaceable
@@ -309,7 +305,7 @@ def main():
         # Create matrix
         matrix_df = create_gene_family_matrix(
             gene_family, family_loci, all_targets_df, synteny_blocks_df,
-            species_map, phylo_order_map, seq_metadata
+            species_map, phylo_order_map, seq_metadata, args.output_dir
         )
 
         if not matrix_df.empty:

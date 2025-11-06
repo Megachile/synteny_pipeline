@@ -410,6 +410,42 @@ def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_d
             else:
                 row[col_name] = ""
 
+        # Recalculate synteny_pct based on actual flanking columns filled
+        # Count U/D columns with data (including "no match")
+        flanking_cols_with_data = 0
+        total_flanking_cols = len(upstream_proteins) + len(downstream_proteins)
+
+        for i in range(len(upstream_proteins), 0, -1):
+            protein_id = upstream_proteins[i-1]
+            if protein_id in protein_names:
+                display_name = protein_names[protein_id]
+            else:
+                display_name = upstream_names[i-1]
+            col_name = f"U{i}_{display_name}"
+
+            val = row.get(col_name, "")
+            if val and val != "" and str(val) != "nan":
+                flanking_cols_with_data += 1
+
+        for i, protein_id in enumerate(downstream_proteins, 1):
+            if protein_id in protein_names:
+                display_name = protein_names[protein_id]
+            else:
+                display_name = downstream_names[i-1]
+            col_name = f"D{i}_{display_name}"
+
+            val = row.get(col_name, "")
+            if val and val != "" and str(val) != "nan":
+                flanking_cols_with_data += 1
+
+        # Update synteny percentage based on flanking columns
+        if total_flanking_cols > 0:
+            row['synteny_pct'] = round((flanking_cols_with_data / total_flanking_cols) * 100, 1)
+            row['num_proteins_found'] = flanking_cols_with_data
+        else:
+            row['synteny_pct'] = 0
+            row['num_proteins_found'] = 0
+
         matrix_rows.append(row)
 
     # Create DataFrame and sort
