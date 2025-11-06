@@ -225,22 +225,69 @@ else
     exit 1
 fi
 
-# Phase 7: SwissProt annotation
+# Phase 7: SwissProt annotation (parallelized per locus)
 echo ""
 echo "--- PHASE 7: SWISSPROT ANNOTATION ---"
-if python scripts/07_swissprot_annotation.py \
-    --synteny-dir "${PHASE3_DIR}/02_synteny_blocks" \
-    --filtered-blocks "${PHASE3_DIR}/03_filtered_blocks/synteny_blocks_filtered.tsv" \
-    --swissprot-db data/reference/swissprot.dmnd \
-    --output-dir "${PHASE3_DIR}/07_swissprot_annotations" \
-    --evalue 1e-5 \
-    --threads 16 \
-    2>&1 | tee "logs/phase7_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
-    echo "✓ Phase 7 complete"
-else
-    echo "❌ Phase 7 failed"
+
+# Count loci from filtered blocks
+FILTERED_BLOCKS="${PHASE3_DIR}/03_filtered_blocks/synteny_blocks_filtered.tsv"
+if [ ! -f "$FILTERED_BLOCKS" ]; then
+    echo "❌ Phase 7 failed - filtered blocks not found"
     exit 1
 fi
+
+NLOCI=$(tail -n +2 "$FILTERED_BLOCKS" | cut -f1 | sort -u | wc -l)
+echo "  Detected ${NLOCI} loci to annotate"
+
+if [ $NLOCI -eq 0 ]; then
+    echo "❌ Phase 7 failed - no loci found in filtered blocks"
+    exit 1
+fi
+
+# Submit Phase 7 array job (one task per locus)
+echo "  Submitting Phase 7 array job (0-$((NLOCI-1)))..."
+PHASE7_JOB=$(sbatch --parsable \
+    --array=0-$((NLOCI-1)) \
+    --job-name="phase7_${GENE_FAMILY}" \
+    --output="logs/phase7_${GENE_FAMILY}_%A_%a.out" \
+    --error="logs/phase7_${GENE_FAMILY}_%A_%a.err" \
+    --cpus-per-task=8 \
+    --mem=16G \
+    --time=2:00:00 \
+    run_phase7_array.slurm "${PHASE3_DIR}")
+
+echo "  Phase 7 array job submitted: ${PHASE7_JOB}"
+echo "  Waiting for completion..."
+
+# Wait for array job to complete
+while squeue -j ${PHASE7_JOB} 2>/dev/null | grep -q ${PHASE7_JOB}; do
+    sleep 30
+done
+
+# Check if any tasks failed
+FAILED_TASKS=$(ls logs/phase7_${GENE_FAMILY}_${PHASE7_JOB}_*.err 2>/dev/null | xargs grep -l "Phase 7 failed" | wc -l)
+if [ $FAILED_TASKS -gt 0 ]; then
+    echo "❌ Phase 7 failed - ${FAILED_TASKS} array tasks failed"
+    exit 1
+fi
+
+# Aggregate per-locus results into single file
+echo "  Aggregating results from ${NLOCI} loci..."
+ANNOT_DIR="${PHASE3_DIR}/07_swissprot_annotations"
+FINAL_OUTPUT="${ANNOT_DIR}/genome_specific_swissprot_annotations.tsv"
+
+# Create header
+head -1 $(ls ${ANNOT_DIR}/*_swissprot_annotations.tsv | head -1) > "$FINAL_OUTPUT"
+
+# Concatenate all per-locus results (skip headers)
+for locus_file in ${ANNOT_DIR}/*_swissprot_annotations.tsv; do
+    if [ -f "$locus_file" ] && [[ ! "$locus_file" =~ "genome_specific" ]]; then
+        tail -n +2 "$locus_file" >> "$FINAL_OUTPUT"
+    fi
+done
+
+echo "✓ Phase 7 complete (${NLOCI} loci processed in parallel)"
+echo "  Aggregated output: ${FINAL_OUTPUT}"
 
 # Phase 8a: Generate locus matrices
 echo ""
