@@ -68,8 +68,10 @@ source ~/.bashrc
 micromamba activate busco_env
 set -u
 
-# Load Exonerate module
-module load exonerate/2.4.0-yl7q
+# Load Exonerate module (allow failure as it may already be loaded)
+set +e
+module load exonerate/2.4.0-yl7q 2>/dev/null || true
+set -e
 
 echo "Environment ready"
 echo ""
