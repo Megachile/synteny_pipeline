@@ -21,18 +21,26 @@ def calculate_block_score(block, expected_chromosome=None):
     Calculate score for a synteny block.
 
     Scoring:
-    - Base score = number of proteins found
+    - Base score = number of matched queries (preferred) or unique hit segments
     - Bonus +20 if on expected chromosome (when known)
-    - Penalty -10 if on fragmented scaffold (e.g., NW_*, JAACYO*)
+    - Penalty -10 if on fragmented scaffold (common contig prefixes)
     """
-    score = block['num_proteins']
+    # Prefer num_query_matches; fall back to num_target_proteins or num_proteins
+    base_count = (
+        block['num_query_matches']
+        if 'num_query_matches' in block
+        else (block['num_target_proteins'] if 'num_target_proteins' in block else block.get('num_proteins', 0))
+    )
+
+    score = base_count
 
     # Chromosome bonus
     if expected_chromosome and block['scaffold'] == expected_chromosome:
         score += 20
 
-    # Fragmented scaffold penalty
-    if block['scaffold'].startswith(('NW_', 'JAACYO')):
+    # Fragmented scaffold penalty (broaden beyond a single prefix)
+    scaf = str(block['scaffold'])
+    if scaf.startswith(('NW_', 'NODE_', 'JA')):
         score -= 10
 
     return score
