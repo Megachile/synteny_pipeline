@@ -194,10 +194,19 @@ def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bits
         else:
             # Unplaceable hit - apply strict filters
             evalue = target.get('best_evalue', 1.0)
-            bitscore = target.get('bitscore', 0) if 'bitscore' in target else target.get('best_bitscore', 0)
+
+            # Check if bitscore column exists (newer Phase 4 outputs include it)
+            has_bitscore = 'bitscore' in target or 'best_bitscore' in target
+            bitscore = target.get('best_bitscore', target.get('bitscore', 0)) if has_bitscore else None
 
             # Only keep strong unplaceable hits
-            if evalue <= unplaceable_evalue and bitscore >= unplaceable_bitscore:
+            # If bitscore is available, require both evalue and bitscore thresholds
+            # If bitscore is missing (older outputs), use evalue only
+            passes_filters = evalue <= unplaceable_evalue
+            if has_bitscore:
+                passes_filters = passes_filters and bitscore >= unplaceable_bitscore
+
+            if passes_filters:
                 classification = {
                     **target.to_dict(),
                     'placement': 'unplaceable',
@@ -217,7 +226,7 @@ def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bits
                     'genome': target.get('genome', ''),
                     'query_id': target.get('query_id', ''),
                     'best_evalue': evalue,
-                    'bitscore': bitscore,
+                    'bitscore': bitscore if has_bitscore else 'N/A',
                     'drop_reason': 'outside_block_and_below_thresholds'
                 })
     return pd.DataFrame(classifications), pd.DataFrame(dropped)
