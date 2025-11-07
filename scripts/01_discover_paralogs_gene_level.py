@@ -110,6 +110,7 @@ class GenomicMapper:
 
                 # Extract gene positions (both NCBI and BRAKER3)
                 if feature_type == 'gene':
+                    end = int(parts[4])  # Get end position
                     # NCBI format: Name=LOC117167432
                     ncbi_match = re.search(r'Name=(LOC\d+)', attributes)
                     # BRAKER3 format: ID=g10440;
@@ -118,11 +119,11 @@ class GenomicMapper:
                     if ncbi_match:
                         gene_id = ncbi_match.group(1)
                         self.chr_genes[chrom].append((start, gene_id))
-                        self.gene_positions[gene_id] = (chrom, start)
+                        self.gene_positions[gene_id] = (chrom, start, end)
                     elif braker_match:
                         gene_id = braker_match.group(1)
                         self.chr_genes[chrom].append((start, gene_id))
-                        self.gene_positions[gene_id] = (chrom, start)
+                        self.gene_positions[gene_id] = (chrom, start, end)
 
                 # Extract protein-gene mapping (NCBI only - BRAKER3 inferred from proteome)
                 if feature_type == 'CDS' and 'protein_id=' in attributes:
@@ -175,8 +176,9 @@ class GenomicMapper:
                     if gene_id not in seen_genes:
                         seen_genes.add(gene_id)
                         self.gene_order.append(gene_id)
-                        # Use position in list as pseudo-coordinate
-                        self.gene_positions[gene_id] = ('scaffold', len(self.gene_order))
+                        # Use position in list as pseudo-coordinate (start, end)
+                        pos = len(self.gene_order)
+                        self.gene_positions[gene_id] = ('scaffold', pos, pos)
 
             print(f"    Mapped {len(self.protein_to_gene)} proteins to {len(self.gene_order)} genes (BRAKER3)")
 
@@ -209,7 +211,9 @@ class GenomicMapper:
         if target_gene not in self.gene_positions:
             return [], []
 
-        chrom, target_pos = self.gene_positions[target_gene]
+        target_pos_tuple = self.gene_positions[target_gene]
+        chrom = target_pos_tuple[0]
+        target_pos = target_pos_tuple[1]
         candidates = []  # (distance, position, gene_id) - track distance for sorting
 
         # Check if NCBI or BRAKER3
@@ -219,7 +223,9 @@ class GenomicMapper:
                 if gene == target_gene:
                     continue
                 if gene in self.gene_positions:
-                    g_chrom, g_pos = self.gene_positions[gene]
+                    g_pos_tuple = self.gene_positions[gene]
+                    g_chrom = g_pos_tuple[0]
+                    g_pos = g_pos_tuple[1]
                     if g_chrom == chrom:
                         distance_kb = abs(g_pos - target_pos) / 1000
                         if distance_kb <= flanking_distance_kb:
@@ -274,7 +280,9 @@ class GenomicMapper:
         positions = {}
         for g in cluster_genes:
             if g in self.gene_positions:
-                chrom, pos = self.gene_positions[g]
+                pos_tuple = self.gene_positions[g]
+                chrom = pos_tuple[0]
+                pos = pos_tuple[1]
                 positions[g] = (chrom, pos)
 
         if not positions:
@@ -314,7 +322,9 @@ class GenomicMapper:
         if self.gene_order:  # BRAKER3
             for gene in self.gene_order:
                 if gene in self.gene_positions:
-                    g_chrom, g_pos = self.gene_positions[gene]
+                    g_pos_tuple = self.gene_positions[gene]
+                    g_chrom = g_pos_tuple[0]
+                    g_pos = g_pos_tuple[1]
                     if g_chrom == chrom:
                         maybe_add(gene, g_pos)
         else:  # NCBI
@@ -654,7 +664,9 @@ def detect_input_tandem_clusters(input_locs, mapper, max_distance_kb=50):
     positions = {}
     for loc in input_locs:
         if loc in mapper.gene_positions:
-            chrom, start = mapper.gene_positions[loc]
+            pos = mapper.gene_positions[loc]
+            chrom = pos[0]
+            start = pos[1]
             positions[loc] = {'chrom': chrom, 'start': start}
         else:
             print(f"  Warning: {loc} not found in BK genome")
@@ -918,37 +930,79 @@ def main():
             }
 
     for genome_code, paralog_data in all_paralogs.items():
-        print(f"\n  {genome_code}: {paralog_data['gene_count']} unique genes (pre-cluster)")
-
         genes = [g for g in paralog_data['unique_genes'] if g in mappers[genome_code].gene_positions]
+        print(f"\n  {genome_code}: {len(genes)} target genes with positions")
         if not genes:
-            print("    No positioned genes; skipping")
             continue
 
-        # Cluster paralogs by tandem proximity within this genome
-        per_genome_clusters = detect_input_tandem_clusters(genes, mappers[genome_code])
-        print(f"    Tandem clusters found: {len(per_genome_clusters)} (will emit one locus per cluster)")
+        # Build per-gene flanking map without excluding family genes (for mutual-flanking detection)
+        distance_cap = FLANKING_DISTANCE_KB.get(genome_code, 1000)
+        per_gene_flanking = {}
+        debug_flanking_rows = []
+        for g in genes:
+            up, dn = mappers[genome_code].get_flanking_genes(
+                g, flanking_distance_kb=distance_cap, max_genes=MAX_FLANKING_GENES
+            )
+            per_gene_flanking[g] = set(up + dn)
+            pos_tuple = mappers[genome_code].gene_positions.get(g, ("unknown", 0, 0))
+            chrom = pos_tuple[0]
+            pos = pos_tuple[1]
+            debug_flanking_rows.append({
+                'gene': g,
+                'chromosome': chrom,
+                'position': pos,
+                'upstream_count': len(up),
+                'downstream_count': len(dn),
+                'flanking_total': len(up) + len(dn),
+                'upstream_genes': ','.join(up),
+                'downstream_genes': ','.join(dn)
+            })
 
-        # For each cluster, build flanking around the cluster boundaries and save one locus
-        for cluster in per_genome_clusters:
-            # Determine chromosome and representative gene (leftmost)
+        # Determine mutual-flanking clusters (undirected components)
+        visited = set()
+        mf_clusters = []
+        for g in genes:
+            if g in visited:
+                continue
+            comp = set([g])
+            stack = [g]
+            visited.add(g)
+            while stack:
+                cur = stack.pop()
+                for h in genes:
+                    if h == cur or h in visited:
+                        continue
+                    if (h in per_gene_flanking.get(cur, set())) and (cur in per_gene_flanking.get(h, set())):
+                        visited.add(h)
+                        comp.add(h)
+                        stack.append(h)
+            mf_clusters.append(sorted(list(comp), key=lambda x: mappers[genome_code].gene_positions.get(x, ('', 0))[1]))
+
+        print(f"    Mutual-flanking clusters: {len(mf_clusters)} (will emit one locus per cluster)")
+
+        # Debug: compute mutual edges for reporting
+        mutual_edges = set()
+        for g in genes:
+            for h in genes:
+                if h <= g:
+                    continue
+                if (h in per_gene_flanking.get(g, set())) and (g in per_gene_flanking.get(h, set())):
+                    mutual_edges.add((g, h))
+        print(f"    Mutual links (edges): {len(mutual_edges)}")
+
+        # For Phase 2 hand-off, exclude ALL family genes from flanking
+        exclude_family = set(genes)
+
+        cluster_debug_rows = []
+        for idx, cluster in enumerate(mf_clusters, start=1):
             chrom = mappers[genome_code].gene_positions[cluster[0]][0]
-            # Create a stable order by genomic position
-            cluster_sorted = sorted(cluster, key=lambda g: mappers[genome_code].gene_positions[g][1])
-            rep_gene = cluster_sorted[0]
+            rep_gene = cluster[0]
 
-            # Flanking around the cluster (exclude ALL family member genes, not just this cluster)
-            distance_cap = FLANKING_DISTANCE_KB.get(genome_code, 1000)
             upstream_genes, downstream_genes = mappers[genome_code].get_flanking_genes_for_cluster(
-                cluster_sorted, flanking_distance_kb=distance_cap, max_genes=MAX_FLANKING_GENES,
-                exclude_genes=genes  # Exclude all family members in this genome
+                cluster, flanking_distance_kb=distance_cap, max_genes=MAX_FLANKING_GENES, exclude_genes=exclude_family
             )
 
-            if not upstream_genes and not downstream_genes:
-                print(f"    Warning: No flanking genes for cluster at {chrom} around {rep_gene}")
-                continue
-
-            # Extract flanking proteins
+            # Extract proteins for cleaned flanking
             upstream_proteins = extract_flanking_proteins(
                 upstream_genes, mappers[genome_code], LANDMARKS[genome_code]['proteome']
             )
@@ -956,10 +1010,9 @@ def main():
                 downstream_genes, mappers[genome_code], LANDMARKS[genome_code]['proteome']
             )
 
-            # Name locus and write flanking FASTA
+            # Name and write
             locus_name = name_locus(genome_code, chrom, locus_counter[genome_code])
             locus_counter[genome_code] += 1
-
             flanking_file = args.output_dir / f"{locus_name}_flanking.faa"
             with open(flanking_file, 'w') as f:
                 for i, gene in enumerate(upstream_genes, 1):
@@ -975,40 +1028,87 @@ def main():
                         seq.description = f"D{i} {seq.description}"
                         SeqIO.write([seq], f, 'fasta')
 
-            # Input cluster metadata for any member of this cluster
-            # Prefer a member that was in the original input list
             input_meta = None
-            for g in cluster_sorted:
+            for g in cluster:
                 if g in input_tandem_map:
                     input_meta = input_tandem_map[g]
                     break
             if input_meta is None:
                 input_meta = {'is_input_tandem': False, 'cluster_size': 1, 'cluster_members': [rep_gene]}
 
-            # Build locus entry
+            target_pos = mappers[genome_code].gene_positions.get(rep_gene)
+            target_start = target_pos[1] if target_pos and len(target_pos) >= 2 else None
+            target_end = target_pos[2] if target_pos and len(target_pos) >= 3 else None
+
             locus = {
                 'locus_id': locus_name,
                 'gene_family': args.gene_family,
                 'genome': genome_code,
                 'chromosome': chrom,
                 'target_gene': rep_gene,
+                'target_start': target_start,
+                'target_end': target_end,
                 'upstream_count': len(upstream_genes),
                 'downstream_count': len(downstream_genes),
                 'flanking_count': len(upstream_genes) + len(downstream_genes),
-                'tandem_count': max(0, len(cluster_sorted) - 1),
-                'is_tandem': len(cluster_sorted) > 1,
+                'tandem_count': max(0, len(cluster) - 1),
+                'is_tandem': len(cluster) > 1,
                 'input_is_tandem': input_meta['is_input_tandem'],
                 'input_cluster_size': input_meta['cluster_size'],
                 'input_cluster_members': ','.join(input_meta['cluster_members']),
-                'cluster_size': len(cluster_sorted),
-                'cluster_members': ','.join(cluster_sorted),
+                'cluster_size': len(cluster),
+                'cluster_members': ','.join(cluster),
                 'flanking_file': str(flanking_file)
             }
 
             unique_loci.append(locus)
 
-            print(f"    {locus_name} (cluster size {len(cluster_sorted)}): rep={rep_gene}")
-            print(f"      Flanking: {len(upstream_genes)}U + {len(downstream_genes)}D = {len(upstream_genes)+len(downstream_genes)} genes")
+            print(f"    {locus_name} (cluster size {len(cluster)}): rep={rep_gene}")
+            print(f"      Cleaned flanking (excl family): {len(upstream_genes)}U + {len(downstream_genes)}D = {len(upstream_genes)+len(downstream_genes)} genes")
+
+            # Add cluster debug row
+            # Compute approximate boundary from member positions
+            positions = [mappers[genome_code].gene_positions.get(g, (chrom, 0))[1] for g in cluster]
+            left = min(positions) if positions else 0
+            right = max(positions) if positions else 0
+            cluster_debug_rows.append({
+                'cluster_id': f"{genome_code}_cluster_{idx:03d}",
+                'chromosome': chrom,
+                'member_count': len(cluster),
+                'members': ','.join(cluster),
+                'boundary_start': left,
+                'boundary_end': right,
+                'cleaned_upstream_count': len(upstream_genes),
+                'cleaned_downstream_count': len(downstream_genes),
+                'cleaned_flanking_total': len(upstream_genes) + len(downstream_genes),
+                'locus_id': locus_name,
+                'flanking_file': str(flanking_file)
+            })
+
+        # Write debug files for this genome
+        try:
+            import pandas as pd  # already imported at top
+            dbg_dir = args.output_dir
+            # Per-gene flanking map
+            if debug_flanking_rows:
+                pd.DataFrame(debug_flanking_rows).to_csv(
+                    dbg_dir / f"debug_flanking_{genome_code}.tsv", sep='\t', index=False
+                )
+            # Mutual edges
+            if mutual_edges:
+                import csv
+                with open(dbg_dir / f"debug_mutual_edges_{genome_code}.tsv", 'w', newline='') as f:
+                    w = csv.writer(f, delimiter='\t')
+                    w.writerow(['gene_a', 'gene_b'])
+                    for a, b in sorted(mutual_edges):
+                        w.writerow([a, b])
+            # Cluster summary
+            if cluster_debug_rows:
+                pd.DataFrame(cluster_debug_rows).to_csv(
+                    dbg_dir / f"debug_clusters_{genome_code}.tsv", sep='\t', index=False
+                )
+        except Exception as e:
+            print(f"    DEBUG write failed for {genome_code}: {e}")
 
     # Step 5: Save results
     print("\n[5] Saving results...")

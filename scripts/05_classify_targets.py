@@ -18,6 +18,7 @@ from collections import defaultdict
 from Bio import SeqIO
 import argparse
 import os
+import math
 
 def check_proximity(target, block, max_distance_kb=100):
     """Check if target gene is near synteny block (within max_distance_kb).
@@ -119,17 +120,24 @@ def load_target_sequences(genome_id, parent_locus, output_dir):
     return sequences
 
 def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bitscore,
-                    allow_nearby=False, proximity_kb=100):
+                    allow_nearby=False, proximity_kb=100,
+                    pad_kb=0, dynamic_nearby=False, nearby_frac_span=0.3, nearby_upper_kb=200):
     """Classify each target as syntenic or unplaceable based on proximity to synteny blocks.
 
     Quality assessment happens AFTER Exonerate extraction (Phase 6).
     """
 
-    # Index synteny blocks by (genome, scaffold) for fast lookup
+    # Optionally pad blocks for overlap/proximity checks and index by (genome, scaffold)
     synteny_index = defaultdict(list)
+    pad_bp = pad_kb * 1000
     for _, block in blocks_df.iterrows():
-        key = (block['genome'], block['scaffold'])
-        synteny_index[key].append(block)
+        b = block.to_dict()
+        b['start'] = int(b['start']) - pad_bp
+        b['end'] = int(b['end']) + pad_bp
+        # Compute span_kb if missing
+        b['span_kb'] = b.get('span_kb', (int(b['end']) - int(b['start'])) / 1000)
+        key = (b['genome'], b['scaffold'])
+        synteny_index[key].append(b)
 
     classifications = []
     dropped = []
@@ -173,7 +181,14 @@ def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bits
                     distance = bstart - end
                 else:
                     distance = start - bend
-                if distance <= proximity_kb * 1000:
+                # Dynamic nearby threshold per block (capped)
+                if dynamic_nearby:
+                    dyn_kb = max(30, int(block.get('span_kb', 0) * nearby_frac_span))
+                    dyn_kb = min(dyn_kb, nearby_upper_kb)
+                    thresh_bp = dyn_kb * 1000
+                else:
+                    thresh_bp = proximity_kb * 1000
+                if distance <= thresh_bp:
                     if best_distance is None or distance < best_distance:
                         best_distance = distance
                         best_block = block
@@ -230,6 +245,63 @@ def classify_targets(targets_df, blocks_df, unplaceable_evalue, unplaceable_bits
                     'drop_reason': 'outside_block_and_below_thresholds'
                 })
     return pd.DataFrame(classifications), pd.DataFrame(dropped)
+
+def compute_distance_debug(targets_df, blocks_df, bins_kb, out_path: Path = None):
+    """Compute min distance of each target to any block on same genome/scaffold (0 if overlap).
+
+    Returns a dict with histogram counts and optionally writes a TSV of distances.
+    """
+    # Build index
+    index = defaultdict(list)
+    for _, b in blocks_df.iterrows():
+        key = (b['genome'], b['scaffold'])
+        index[key].append((int(b['start']), int(b['end'])))
+
+    distances = []
+    for _, t in targets_df.iterrows():
+        key = (t['genome'], t['scaffold'])
+        bks = index.get(key, [])
+        if not bks:
+            continue
+        s, e = int(t['start']), int(t['end'])
+        md = 10**12
+        for bs, be in bks:
+            if not (e < bs or s > be):
+                md = 0
+                break
+            d = bs - e if e < bs else s - be
+            if d < md:
+                md = d
+        distances.append({
+            'genome': t['genome'],
+            'scaffold': t['scaffold'],
+            'locus_name': t.get('locus_name', ''),
+            'query_id': t.get('query_id', ''),
+            'start': s,
+            'end': e,
+            'min_distance_bp': md
+        })
+
+    if not distances:
+        return {'total': 0, 'bins': []}
+
+    # Histogram
+    bins_bp = [int(k*1000) for k in bins_kb]
+    counts = [0]*len(bins_bp)
+    total = len(distances)
+    for rec in distances:
+        d = rec['min_distance_bp']
+        for i, b in enumerate(bins_bp):
+            if d <= b:
+                counts[i] += 1
+                break
+
+    # Write TSV if requested
+    if out_path:
+        df = pd.DataFrame(distances)
+        df.to_csv(out_path, sep='\t', index=False)
+
+    return {'total': total, 'bins': list(zip(bins_kb, counts))}
 
 def deduplicate_overlapping_targets(classified_df):
     """Deduplicate overlapping target loci.
@@ -326,7 +398,19 @@ def parse_args():
     parser.add_argument('--allow-nearby', action='store_true',
                         help='Allow targets near (not overlapping) a block to be syntenic')
     parser.add_argument('--proximity-kb', type=int, default=100,
-                        help='Max distance in kb for nearby classification (default: 100)')
+                        help='Max distance in kb for nearby classification when not using dynamic (default: 100)')
+    parser.add_argument('--pad-kb', type=int, default=0,
+                        help='Pad block start/end by this many kb for overlap/proximity checks (default: 0)')
+    parser.add_argument('--dynamic-nearby', action='store_true',
+                        help='Use per-block dynamic nearby threshold = min(max(frac*span,30kb), nearby-upper-kb)')
+    parser.add_argument('--nearby-frac-span', type=float, default=0.3,
+                        help='Fraction of block span used for dynamic nearby threshold (default: 0.3)')
+    parser.add_argument('--nearby-upper-kb', type=int, default=200,
+                        help='Upper cap for dynamic nearby threshold in kb (default: 200)')
+    parser.add_argument('--debug-distances', action='store_true',
+                        help='Print a histogram of min distances from targets to nearest block and write a TSV file')
+    parser.add_argument('--distance-bins-kb', type=str, default='30,50,75,100,150,200,300,500,1000',
+                        help='Comma-separated distance bins in kb for debug histogram')
 
     return parser.parse_args()
 
@@ -370,6 +454,21 @@ def main():
     targets_df = pd.read_csv(args.targets, sep='\t')
     print(f"  Loaded {len(targets_df)} target loci", flush=True)
 
+    # Optional debug: distances from targets to nearest block (raw, without padding)
+    if args.debug_distances:
+        try:
+            bins_kb = [int(x) for x in args.distance_bins_kb.split(',') if x.strip()]
+        except Exception:
+            bins_kb = [30,50,75,100,150,200,300,500,1000]
+        debug_path = args.output_dir / 'debug_target_block_distances.tsv'
+        stats = compute_distance_debug(targets_df, blocks_df, bins_kb, out_path=debug_path)
+        print(f"\n[2b] Distance debug (raw, no padding): total targets with candidate blocks: {stats['total']}")
+        if stats['total'] > 0:
+            for kb, c in stats['bins']:
+                pct = (c / stats['total'] * 100) if stats['total'] else 0.0
+                print(f"  <= {kb}kb: {c} ({pct:.1f}%)")
+            print(f"  Wrote per-target distances to: {debug_path}")
+
     # Infer paths for reference proteins (in same directory as targets file)
     targets_dir = args.targets.parent
     bk_proteins_file = targets_dir.parent / "01_extracted_proteins" / "BK_proteins.faa"
@@ -377,7 +476,13 @@ def main():
     # Classify targets
     print("\n[3] Classifying targets...", flush=True)
     print(f"  Unplaceable filters: e-value <= {args.unplaceable_evalue}, bitscore >= {args.unplaceable_bitscore}")
-    print(f"  Synteny placement: {'overlap-only' if not args.allow_nearby else f'overlap-or-within {args.proximity_kb}kb'}")
+    if args.allow_nearby:
+        if args.dynamic_nearby:
+            print(f"  Synteny placement: overlap-or-dynamic-nearby (frac={args.nearby_frac_span}, cap={args.nearby_upper_kb}kb), pad={args.pad_kb}kb")
+        else:
+            print(f"  Synteny placement: overlap-or-within {args.proximity_kb}kb, pad={args.pad_kb}kb")
+    else:
+        print(f"  Synteny placement: overlap-only, pad={args.pad_kb}kb")
 
     classified_df, dropped_df = classify_targets(
         targets_df,
@@ -385,7 +490,11 @@ def main():
         args.unplaceable_evalue,
         args.unplaceable_bitscore,
         allow_nearby=args.allow_nearby,
-        proximity_kb=args.proximity_kb
+        proximity_kb=args.proximity_kb,
+        pad_kb=args.pad_kb,
+        dynamic_nearby=args.dynamic_nearby,
+        nearby_frac_span=args.nearby_frac_span,
+        nearby_upper_kb=args.nearby_upper_kb
     )
 
     if len(classified_df) == 0:

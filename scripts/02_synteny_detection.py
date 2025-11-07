@@ -52,6 +52,17 @@ def run_tblastn(query_file, genome_db, output_xml, evalue="1e-5", max_targets=50
 
     return result.returncode == 0
 
+
+def _normalize_scaffold(name: str) -> str:
+    s = str(name).split()[0]
+    if s.endswith('_RagTag'):
+        s = s[: -len('_RagTag')]
+    for pat in (r'^(CM\d+)(?:\.\d+)?$', r'^(NC_\d+)(?:\.\d+)?$', r'^(NW_\d+)(?:\.\d+)?$', r'^(NT_\d+)(?:\.\d+)?$'):
+        m = re.match(pat, s)
+        if m:
+            return m.group(1)
+    return s
+
 def parse_blast_xml(xml_file):
     """Parse BLAST XML and extract hits."""
     hits = []
@@ -205,7 +216,7 @@ def _select_blocks_by_chain(scaffold_hits, strand, q_order_map, block_id_start, 
                 if len(current_hits) >= MIN_PROTEINS_FOR_BLOCK:
                     blocks.append({
                         'block_id': f"block_{block_id:05d}",
-                        'scaffold': current_hits[0]['sseqid'],
+                        'scaffold': _normalize_scaffold(current_hits[0]['sseqid']),
                         'strand': strand,
                         'start': min(x['coord_start'] for x in current_hits),
                         'end': max(x['coord_end'] for x in current_hits),
@@ -227,7 +238,7 @@ def _select_blocks_by_chain(scaffold_hits, strand, q_order_map, block_id_start, 
         if len(current_hits) >= MIN_PROTEINS_FOR_BLOCK:
             blocks.append({
                 'block_id': f"block_{block_id:05d}",
-                'scaffold': current_hits[0]['sseqid'],
+                'scaffold': _normalize_scaffold(current_hits[0]['sseqid']),
                 'strand': strand,
                 'start': min(x['coord_start'] for x in current_hits),
                 'end': max(x['coord_end'] for x in current_hits),

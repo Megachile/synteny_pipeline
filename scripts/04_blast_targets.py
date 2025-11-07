@@ -17,6 +17,7 @@ Usage:
 """
 
 from pathlib import Path
+import re
 import subprocess
 import pandas as pd
 from collections import defaultdict
@@ -45,6 +46,19 @@ def run_tblastn(query_file, genome_db, output_xml, evalue, max_targets, threads)
         result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, text=True)
 
     return result.returncode == 0
+
+
+def _normalize_scaffold(name: str) -> str:
+    s = str(name).split()[0]
+    # Remove RagTag suffix
+    if s.endswith('_RagTag'):
+        s = s[: -len('_RagTag')]
+    # Strip version for common accessions
+    for pat in (r'^(CM\d+)(?:\.\d+)?$', r'^(NC_\d+)(?:\.\d+)?$', r'^(NW_\d+)(?:\.\d+)?$', r'^(NT_\d+)(?:\.\d+)?$'):
+        m = re.match(pat, s)
+        if m:
+            return m.group(1)
+    return s
 
 def parse_blast_xml(xml_file):
     """Parse BLAST XML and extract hits with query info."""
@@ -85,7 +99,7 @@ def parse_blast_xml(xml_file):
 
                     hits.append({
                         'query_id': query_id,
-                        'scaffold': hit_accession,
+                        'scaffold': _normalize_scaffold(hit_accession),
                         'scaffold_desc': hit_def,
                         'strand': strand,
                         'frame': frame,
@@ -239,6 +253,7 @@ def cluster_into_loci(hits, locus_id, gene_family, min_split_gap_kb=10, min_hits
                 start = min(h['start'] for h in s_hits)
                 end = max(h['end'] for h in s_hits)
                 best_evalue = min(h['evalue'] for h in s_hits)
+                best_bitscore = max(h.get('bitscore', 0) for h in s_hits)
                 frames = {h.get('frame', 0) for h in s_hits}
 
                 loci.append({
@@ -252,7 +267,8 @@ def cluster_into_loci(hits, locus_id, gene_family, min_split_gap_kb=10, min_hits
                     'span_kb': (end - start) / 1000,
                     'num_hits': len(s_hits),
                     'gene_family': gene_family,
-                    'best_evalue': best_evalue
+                    'best_evalue': best_evalue,
+                    'best_bitscore': best_bitscore
                 })
                 locus_num += 1
         else:
@@ -291,6 +307,7 @@ def cluster_into_loci(hits, locus_id, gene_family, min_split_gap_kb=10, min_hits
                     start = min(h['start'] for h in segment_hits)
                     end = max(h['end'] for h in segment_hits)
                     best_evalue = min(h['evalue'] for h in segment_hits)
+                    best_bitscore = max(h.get('bitscore', 0) for h in segment_hits)
                     frames = {h.get('frame', 0) for h in segment_hits}
 
                     loci.append({
@@ -304,7 +321,8 @@ def cluster_into_loci(hits, locus_id, gene_family, min_split_gap_kb=10, min_hits
                         'span_kb': (end - start) / 1000,
                         'num_hits': len(segment_hits),
                         'gene_family': gene_family,
-                        'best_evalue': best_evalue
+                        'best_evalue': best_evalue,
+                        'best_bitscore': best_bitscore
                     })
                     locus_num += 1
 
@@ -408,9 +426,20 @@ def main():
     # Find genome databases
     print("\n[4] Finding genome databases...", flush=True)
     genome_dbs = {}
+    def _normalize_genome_id(name: str) -> str:
+        # Match 02_synteny_detection normalization: GCA_XXXXXX.Y -> keep prefix+version
+        if name.startswith('GCA_') or name.startswith('GCF_'):
+            parts = name.split('_')
+            if len(parts) >= 2:
+                return parts[0] + '_' + parts[1]
+        return name
+
     for db_file in args.genome_db_dir.glob("*.nhr"):
         genome_name = db_file.stem
-        genome_dbs[genome_name] = args.genome_db_dir / genome_name
+        genome_dbs[genome_name] = {
+            'db': args.genome_db_dir / genome_name,
+            'genome_id': _normalize_genome_id(genome_name)
+        }
     print(f"  Found {len(genome_dbs)} genome databases", flush=True)
 
     # Run BLAST once per genome
@@ -420,7 +449,8 @@ def main():
 
     genome_hits = {}  # genome -> list of hits
 
-    for genome_name, genome_db in genome_dbs.items():
+    for genome_name, meta in genome_dbs.items():
+        genome_db = meta['db']
         output_xml = blast_dir / f"{genome_name}.xml"
 
         if output_xml.exists():
@@ -490,8 +520,11 @@ def main():
             # Cluster into loci using coverage-track-based algorithm
             target_loci = cluster_into_loci(query_hits, locus_id_placeholder, args.gene_family, min_split_gap_kb, min_hits=1)
 
+            # Normalize genome id to match Phase 2/3 outputs
+            genome_id = genome_dbs[genome_name]['genome_id'] if genome_name in genome_dbs else _normalize_genome_id(genome_name)
+
             for target_locus in target_loci:
-                target_locus['genome'] = genome_name
+                target_locus['genome'] = genome_id
                 target_locus['query_id'] = query_id
                 # NO parent_locus assignment - Phase 5 will assign based on synteny proximity
 

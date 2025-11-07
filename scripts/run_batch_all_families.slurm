@@ -295,6 +295,11 @@ else
         --blocks "${PHASE3_DIR}/03_filtered_blocks/synteny_blocks_filtered.tsv" \
         --output-dir "${PHASE3_DIR}/05_classified" \
         2>&1 | tee "logs/phase5_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
+        # Verify outputs exist and are non-empty
+        if [ ! -s "${PHASE3_DIR}/05_classified/all_targets_classified.tsv" ]; then
+            echo "❌ Phase 5 produced no classifications (all_targets_classified.tsv missing or empty)"
+            exit 1
+        fi
         echo "✓ Phase 5 complete"
     else
         echo "❌ Phase 5 failed"
@@ -317,6 +322,10 @@ else
         --unplaceable-evalue 1e-10 \
         --verbose \
         2>&1 | tee "logs/phase6_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
+        if [ ! -s "${PHASE3_DIR}/06_extracted_sequences/all_extracted_genes.faa" ]; then
+            echo "❌ Phase 6 produced no sequences (all_extracted_genes.faa missing or empty)"
+            exit 1
+        fi
         echo "✓ Phase 6 complete"
     else
         echo "❌ Phase 6 failed"
