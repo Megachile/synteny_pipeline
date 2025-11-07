@@ -21,10 +21,9 @@ set -e
 set -u
 set -o pipefail
 
-# Change to workflow directory (relative to this script's location)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKFLOW_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-cd "${WORKFLOW_DIR}"
+# CRITICAL: Change to workflow directory using absolute path
+# SLURM jobs start in the directory where sbatch is called, NOT where the script lives
+cd /carc/scratch/projects/emartins/2016456/adam/synteny_scanning/hpc_deployment_package/hybrid_workflow
 
 # Create logs directory
 mkdir -p logs
