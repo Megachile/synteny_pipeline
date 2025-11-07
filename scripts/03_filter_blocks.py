@@ -142,12 +142,17 @@ def main():
     loci = blocks_df['locus_id'].unique()
     print(f"  Loci: {', '.join(loci)}")
 
-    # Filter blocks
-    print("\n[2] Filtering to best block per genome...")
-    filtered_df = filter_best_blocks(blocks_df, args.verbose)
+    # Check if we have any blocks
+    if len(blocks_df) == 0:
+        print("\n[2] No synteny blocks found - creating empty output")
+        filtered_df = blocks_df.copy()
+    else:
+        # Filter blocks
+        print("\n[2] Filtering to best block per genome...")
+        filtered_df = filter_best_blocks(blocks_df, args.verbose)
 
-    reduction = (1 - len(filtered_df) / len(blocks_df)) * 100
-    print(f"  Filtered: {len(blocks_df)} -> {len(filtered_df)} blocks ({reduction:.1f}% reduction)")
+        reduction = (1 - len(filtered_df) / len(blocks_df)) * 100
+        print(f"  Filtered: {len(blocks_df)} -> {len(filtered_df)} blocks ({reduction:.1f}% reduction)")
 
     # Save filtered blocks
     print("\n[3] Saving filtered blocks...")

@@ -132,7 +132,8 @@ echo "--- PHASE 3a: GENOME-WIDE SYNTENY DETECTION ---"
 SYNTENY_BLOCKS_DIR="${PHASE3_DIR}/02_synteny_blocks"
 ALL_BLOCKS="${SYNTENY_BLOCKS_DIR}/all_synteny_blocks.tsv"
 
-if [ -f "$ALL_BLOCKS" ]; then
+# Check if Phase 3a is already complete (file exists and has more than just header)
+if [ -f "$ALL_BLOCKS" ] && [ $(wc -l < "$ALL_BLOCKS") -gt 1 ]; then
     echo "✓ Phase 3a already complete (skipping)"
 else
     # Count loci from locus definitions
@@ -189,20 +190,34 @@ else
     # Aggregate results from all loci
     echo "  Aggregating results from ${NLOCI} loci..."
 
+    # Find per-locus output files (exclude all_synteny_blocks.tsv)
+    shopt -s nullglob
+    locus_files=("${SYNTENY_BLOCKS_DIR}"/*_synteny_blocks.tsv)
+
+    # Filter out the aggregated file if it exists
+    filtered_files=()
+    for f in "${locus_files[@]}"; do
+        if [[ ! "$f" =~ all_synteny_blocks.tsv$ ]]; then
+            filtered_files+=("$f")
+        fi
+    done
+
+    if [ ${#filtered_files[@]} -eq 0 ]; then
+        echo "❌ Phase 3a failed - no locus output files found"
+        exit 1
+    fi
+
+    if [ ${#filtered_files[@]} -ne ${NLOCI} ]; then
+        echo "❌ Phase 3a failed - expected ${NLOCI} locus files, found ${#filtered_files[@]}"
+        exit 1
+    fi
+
     # Create header
     echo -e "locus_id\tgenome\tblock_id\tscaffold\tstrand\tstart\tend\tspan_kb\tnum_target_proteins\tnum_query_matches" \
         > "$ALL_BLOCKS"
 
     # Append all per-locus files
-    shopt -s nullglob
-    locus_files=("${SYNTENY_BLOCKS_DIR}"/*_synteny_blocks.tsv)
-
-    if [ ${#locus_files[@]} -eq 0 ]; then
-        echo "❌ Phase 3a failed - no locus output files found"
-        exit 1
-    fi
-
-    for locus_file in "${locus_files[@]}"; do
+    for locus_file in "${filtered_files[@]}"; do
         tail -n +2 "$locus_file" >> "$ALL_BLOCKS"
     done
 
