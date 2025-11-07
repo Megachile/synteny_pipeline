@@ -741,6 +741,25 @@ def main():
     duplicates_removed = deduplicate_extracted_sequences(targets_df, args.output_dir)
     print(f"  Removed {duplicates_removed} duplicate extractions", flush=True)
 
+    # Aggregate all protein sequences into single file
+    print("\n[5] Aggregating extracted proteins...", flush=True)
+    all_proteins_file = args.output_dir / "all_extracted_genes.faa"
+    protein_count = 0
+
+    with open(all_proteins_file, 'w') as outfile:
+        # Find all *_protein.fasta files in genome subdirectories
+        for genome_dir in args.output_dir.iterdir():
+            if genome_dir.is_dir():
+                for target_dir in genome_dir.iterdir():
+                    if target_dir.is_dir():
+                        for protein_file in target_dir.glob("*_protein.fasta"):
+                            # Read and write each protein sequence
+                            for record in SeqIO.parse(protein_file, 'fasta'):
+                                SeqIO.write(record, outfile, 'fasta')
+                                protein_count += 1
+
+    print(f"  Wrote {protein_count} protein sequences to {all_proteins_file.name}", flush=True)
+
     # Summary
     print("\n" + "=" * 80)
     print("SEQUENCE EXTRACTION COMPLETE")
@@ -748,8 +767,10 @@ def main():
     print(f"\nTotal genes extracted: {total_extracted}")
     print(f"Duplicates removed: {duplicates_removed}")
     print(f"Unique genes: {total_extracted - duplicates_removed}")
+    print(f"Aggregated proteins: {protein_count}")
     print(f"Genomes processed: {len(genome_groups) - len(failed_genomes)}/{len(genome_groups)}")
     print(f"\nOutput directory: {args.output_dir}")
+    print(f"Aggregated file: {all_proteins_file}")
 
 if __name__ == "__main__":
     main()

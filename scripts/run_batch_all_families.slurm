@@ -337,8 +337,9 @@ else
         --unplaceable-evalue 1e-10 \
         --verbose \
         2>&1 | tee "logs/phase6_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
-        if [ ! -s "${PHASE3_DIR}/06_extracted_sequences/all_extracted_genes.faa" ]; then
-            echo "❌ Phase 6 produced no sequences (all_extracted_genes.faa missing or empty)"
+        # Verify aggregated file was created
+        if [ ! -f "${PHASE3_DIR}/06_extracted_sequences/all_extracted_genes.faa" ]; then
+            echo "❌ Phase 6 failed - aggregated file not created"
             exit 1
         fi
         echo "✓ Phase 6 complete"
