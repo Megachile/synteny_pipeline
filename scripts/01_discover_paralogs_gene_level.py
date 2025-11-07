@@ -254,6 +254,91 @@ class GenomicMapper:
 
         return upstream_genes, downstream_genes
 
+    def get_flanking_genes_for_cluster(self, cluster_genes, flanking_distance_kb=1000, max_genes=None, exclude_genes=None):
+        """Get flanking genes around a tandem cluster treated as a unit.
+
+        Defines cluster boundaries by the leftmost and rightmost gene positions.
+        Upstream genes are those on the same chromosome with positions < left boundary.
+        Downstream genes are those on the same chromosome with positions > right boundary.
+        Cluster member genes AND all genes in exclude_genes are excluded from flanking.
+
+        Args:
+            cluster_genes: Genes defining the cluster boundaries
+            flanking_distance_kb: Max distance for flanking genes
+            max_genes: Max number of flanking genes total
+            exclude_genes: Additional genes to exclude (e.g., all family members)
+
+        Returns (upstream_genes, downstream_genes) in order of proximity to the boundary.
+        """
+        # Filter to genes with known positions and collect chrom/positions
+        positions = {}
+        for g in cluster_genes:
+            if g in self.gene_positions:
+                chrom, pos = self.gene_positions[g]
+                positions[g] = (chrom, pos)
+
+        if not positions:
+            return [], []
+
+        # Ensure all genes are on same chromosome; if not, fallback to per-gene flanking
+        chroms = {c for c, _ in positions.values()}
+        if len(chroms) != 1:
+            # Fallback: choose the majority chromosome
+            chrom = max(chroms, key=lambda c: sum(1 for (cc, _) in positions.values() if cc == c))
+        else:
+            chrom = next(iter(chroms))
+
+        left = min(pos for (c, pos) in positions.values() if c == chrom)
+        right = max(pos for (c, pos) in positions.values() if c == chrom)
+
+        # Collect candidate flanking genes
+        candidates = []  # (distance_to_boundary_kb, position, gene_id, side)
+
+        # Build exclusion set from both cluster members and additional excludes
+        exclude_set = set(cluster_genes)
+        if exclude_genes:
+            exclude_set.update(exclude_genes)
+
+        def maybe_add(gene_id, pos):
+            if gene_id in exclude_set:
+                return
+            if pos < left:
+                dist_kb = (left - pos) / 1000
+                if dist_kb <= flanking_distance_kb:
+                    candidates.append((dist_kb, pos, gene_id, 'U'))
+            elif pos > right:
+                dist_kb = (pos - right) / 1000
+                if dist_kb <= flanking_distance_kb:
+                    candidates.append((dist_kb, pos, gene_id, 'D'))
+
+        if self.gene_order:  # BRAKER3
+            for gene in self.gene_order:
+                if gene in self.gene_positions:
+                    g_chrom, g_pos = self.gene_positions[gene]
+                    if g_chrom == chrom:
+                        maybe_add(gene, g_pos)
+        else:  # NCBI
+            if chrom in self.chr_genes:
+                for pos, gene_id in self.chr_genes[chrom]:
+                    maybe_add(gene_id, pos)
+
+        # Split and sort each side by increasing distance (closest first)
+        upstream = [(d, p, g) for (d, p, g, s) in candidates if s == 'U']
+        downstream = [(d, p, g) for (d, p, g, s) in candidates if s == 'D']
+        upstream.sort(key=lambda x: x[0])
+        downstream.sort(key=lambda x: x[0])
+
+        upstream_genes = [g for d, p, g in upstream]
+        downstream_genes = [g for d, p, g in downstream]
+
+        # Apply max cap evenly between sides
+        if max_genes is not None:
+            max_per_side = max_genes // 2
+            upstream_genes = upstream_genes[:max_per_side]
+            downstream_genes = downstream_genes[:max_per_side]
+
+        return upstream_genes, downstream_genes
+
     def get_representative_protein(self, gene_id):
         """Get one representative protein for a gene."""
         if gene_id in self.gene_to_proteins:
@@ -817,12 +902,12 @@ def main():
             'gene_count': len(combined_genes)
         }
 
-    # Step 4: Process each unique locus
-    print("\n[4] Processing unique loci...")
+    # Step 4: Process loci at cluster level (deduplicate tandems ahead of time)
+    print("\n[4] Processing loci at tandem-cluster level…")
     unique_loci = []
     locus_counter = defaultdict(int)
 
-    # Create mapping of target genes to their input tandem cluster info
+    # Map target genes to input cluster metadata for reporting
     input_tandem_map = {}
     for cluster in tandem_clusters:
         for gene in cluster:
@@ -832,49 +917,38 @@ def main():
                 'cluster_members': cluster
             }
 
-    # Build set of representative genes from input tandem clusters
-    # Only create loci for representatives to avoid duplicate loci for tandem clusters
-    representative_genes = set(representative_locs)
-
     for genome_code, paralog_data in all_paralogs.items():
-        print(f"\n  {genome_code}: {paralog_data['gene_count']} unique genes")
+        print(f"\n  {genome_code}: {paralog_data['gene_count']} unique genes (pre-cluster)")
 
-        # Track skipped tandem duplicates
-        skipped_count = 0
+        genes = [g for g in paralog_data['unique_genes'] if g in mappers[genome_code].gene_positions]
+        if not genes:
+            print("    No positioned genes; skipping")
+            continue
 
-        for target_gene in paralog_data['unique_genes']:
-            # Skip non-representative genes from input tandem clusters
-            if target_gene in input_tandem_map and target_gene not in representative_genes:
-                skipped_count += 1
-                print(f"    Skipping {target_gene} (tandem duplicate, not representative)")
-                continue
-            # Get flanking genes with genome-specific distance cap and max genes
-            distance_cap = FLANKING_DISTANCE_KB.get(genome_code, 1000)  # Default to 1000 if genome not specified
-            upstream_genes, downstream_genes = mappers[genome_code].get_flanking_genes(
-                target_gene,
-                flanking_distance_kb=distance_cap,
-                max_genes=MAX_FLANKING_GENES
+        # Cluster paralogs by tandem proximity within this genome
+        per_genome_clusters = detect_input_tandem_clusters(genes, mappers[genome_code])
+        print(f"    Tandem clusters found: {len(per_genome_clusters)} (will emit one locus per cluster)")
+
+        # For each cluster, build flanking around the cluster boundaries and save one locus
+        for cluster in per_genome_clusters:
+            # Determine chromosome and representative gene (leftmost)
+            chrom = mappers[genome_code].gene_positions[cluster[0]][0]
+            # Create a stable order by genomic position
+            cluster_sorted = sorted(cluster, key=lambda g: mappers[genome_code].gene_positions[g][1])
+            rep_gene = cluster_sorted[0]
+
+            # Flanking around the cluster (exclude ALL family member genes, not just this cluster)
+            distance_cap = FLANKING_DISTANCE_KB.get(genome_code, 1000)
+            upstream_genes, downstream_genes = mappers[genome_code].get_flanking_genes_for_cluster(
+                cluster_sorted, flanking_distance_kb=distance_cap, max_genes=MAX_FLANKING_GENES,
+                exclude_genes=genes  # Exclude all family members in this genome
             )
 
             if not upstream_genes and not downstream_genes:
-                print(f"    Warning: No flanking genes found for {target_gene}")
+                print(f"    Warning: No flanking genes for cluster at {chrom} around {rep_gene}")
                 continue
 
-            # Detect tandems (combine both sides)
-            all_flanking = upstream_genes + downstream_genes
-            tandems = detect_tandems(paralog_data['unique_genes'], all_flanking)
-
-            # Get chromosome
-            if target_gene in mappers[genome_code].gene_positions:
-                chrom = mappers[genome_code].gene_positions[target_gene][0]
-            else:
-                chrom = 'unknown'
-
-            # Create locus entry
-            locus_name = name_locus(genome_code, chrom, locus_counter[genome_code])
-            locus_counter[genome_code] += 1
-
-            # Extract flanking proteins (upstream and downstream separately)
+            # Extract flanking proteins
             upstream_proteins = extract_flanking_proteins(
                 upstream_genes, mappers[genome_code], LANDMARKS[genome_code]['proteome']
             )
@@ -882,18 +956,18 @@ def main():
                 downstream_genes, mappers[genome_code], LANDMARKS[genome_code]['proteome']
             )
 
-            # Save flanking proteins in order: upstream (U), then downstream (D)
+            # Name locus and write flanking FASTA
+            locus_name = name_locus(genome_code, chrom, locus_counter[genome_code])
+            locus_counter[genome_code] += 1
+
             flanking_file = args.output_dir / f"{locus_name}_flanking.faa"
             with open(flanking_file, 'w') as f:
-                # Write upstream (already in reverse order - closest to target first)
                 for i, gene in enumerate(upstream_genes, 1):
                     if gene in upstream_proteins:
                         seq = upstream_proteins[gene]
                         seq.id = f"{seq.id}|{gene}"
                         seq.description = f"U{i} {seq.description}"
                         SeqIO.write([seq], f, 'fasta')
-
-                # Write downstream
                 for i, gene in enumerate(downstream_genes, 1):
                     if gene in downstream_proteins:
                         seq = downstream_proteins[gene]
@@ -901,40 +975,40 @@ def main():
                         seq.description = f"D{i} {seq.description}"
                         SeqIO.write([seq], f, 'fasta')
 
-            # Check if this target gene is part of an input tandem cluster
-            input_tandem_info = input_tandem_map.get(target_gene, {
-                'is_input_tandem': False,
-                'cluster_size': 1,
-                'cluster_members': [target_gene]
-            })
+            # Input cluster metadata for any member of this cluster
+            # Prefer a member that was in the original input list
+            input_meta = None
+            for g in cluster_sorted:
+                if g in input_tandem_map:
+                    input_meta = input_tandem_map[g]
+                    break
+            if input_meta is None:
+                input_meta = {'is_input_tandem': False, 'cluster_size': 1, 'cluster_members': [rep_gene]}
 
+            # Build locus entry
             locus = {
                 'locus_id': locus_name,
                 'gene_family': args.gene_family,
                 'genome': genome_code,
                 'chromosome': chrom,
-                'target_gene': target_gene,
+                'target_gene': rep_gene,
                 'upstream_count': len(upstream_genes),
                 'downstream_count': len(downstream_genes),
                 'flanking_count': len(upstream_genes) + len(downstream_genes),
-                'tandem_count': len(tandems),
-                'is_tandem': len(tandems) > 0,
-                'input_is_tandem': input_tandem_info['is_input_tandem'],
-                'input_cluster_size': input_tandem_info['cluster_size'],
-                'input_cluster_members': ','.join(input_tandem_info['cluster_members']),
+                'tandem_count': max(0, len(cluster_sorted) - 1),
+                'is_tandem': len(cluster_sorted) > 1,
+                'input_is_tandem': input_meta['is_input_tandem'],
+                'input_cluster_size': input_meta['cluster_size'],
+                'input_cluster_members': ','.join(input_meta['cluster_members']),
+                'cluster_size': len(cluster_sorted),
+                'cluster_members': ','.join(cluster_sorted),
                 'flanking_file': str(flanking_file)
             }
 
             unique_loci.append(locus)
 
-            print(f"    {locus_name}:")
-            print(f"      Target: {target_gene}")
-            print(f"      Flanking: {len(upstream_genes)}U + {len(downstream_genes)}D = {len(all_flanking)} genes -> {len(upstream_proteins)+len(downstream_proteins)} proteins")
-            print(f"      Tandems: {len(tandems)}")
-
-        # Report skipped tandem duplicates for this genome
-        if skipped_count > 0:
-            print(f"\n  Skipped {skipped_count} tandem duplicate(s) (not representatives)")
+            print(f"    {locus_name} (cluster size {len(cluster_sorted)}): rep={rep_gene}")
+            print(f"      Flanking: {len(upstream_genes)}U + {len(downstream_genes)}D = {len(upstream_genes)+len(downstream_genes)} genes")
 
     # Step 5: Save results
     print("\n[5] Saving results...")
