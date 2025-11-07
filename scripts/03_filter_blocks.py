@@ -58,16 +58,38 @@ def filter_best_blocks(blocks_df, verbose=False):
             # Only one block for this genome/locus
             filtered_blocks.append(group.iloc[0].to_dict())
         else:
-            # Multiple blocks - select best
-            # Calculate scores
+            # Multiple blocks - select best with tie-breakers:
+            #  1) Highest score (num_query_matches with penalties/bonuses)
+            #  2) Smaller span_kb preferred
+            #  3) Higher density (matches per kb) preferred
+            group = group.copy()
             group['score'] = group.apply(lambda x: calculate_block_score(x), axis=1)
 
-            # Select block with highest score
-            best_idx = group['score'].idxmax()
-            best_block = group.loc[best_idx].to_dict()
+            # Compute span_kb if missing
+            if 'span_kb' not in group.columns:
+                group['span_kb'] = (group['end'] - group['start']) / 1000.0
 
-            # Remove temporary score column from output
-            del best_block['score']
+            # Base count for density calculation
+            def _base_count(x):
+                if 'num_query_matches' in x:
+                    return x['num_query_matches']
+                elif 'num_target_proteins' in x:
+                    return x['num_target_proteins']
+                else:
+                    return x.get('num_proteins', 0)
+
+            group['base_count'] = group.apply(lambda r: _base_count(r), axis=1)
+            group['density'] = group.apply(lambda r: (r['base_count'] / max(r['span_kb'], 1.0)), axis=1)
+
+            # Sort by score desc, span asc, density desc
+            sorted_group = group.sort_values(by=['score', 'span_kb', 'density'], ascending=[False, True, False])
+            best_idx = sorted_group.index[0]
+            best_block = sorted_group.loc[best_idx].to_dict()
+
+            # Remove temporary columns
+            for tmp_col in ('score', 'base_count', 'density'):
+                if tmp_col in best_block:
+                    del best_block[tmp_col]
 
             filtered_blocks.append(best_block)
 

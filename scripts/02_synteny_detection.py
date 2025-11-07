@@ -17,6 +17,7 @@ Usage:
 """
 
 from pathlib import Path
+import re
 import subprocess
 import pandas as pd
 from collections import defaultdict
@@ -30,7 +31,8 @@ from Bio.SeqRecord import SeqRecord
 # Configuration constants
 MIN_PROTEINS_FOR_BLOCK = 3  # Minimum target proteins to call a synteny block
 MAX_FLANKING_FOR_SYNTENY = 80  # Maximum flanking proteins to use (40 upstream + 40 downstream)
-# Hard maximum span for a single synteny block; prevents chains across neighboring loci
+# Default hard maximum span for a single synteny block; prevents chains across neighboring loci
+# Can be overridden via --max-span-kb at runtime.
 MAX_BLOCK_SPAN_KB = 300
 
 def run_tblastn(query_file, genome_db, output_xml, evalue="1e-5", max_targets=50, threads=16):
@@ -118,11 +120,17 @@ def _build_query_order_map(filtered_flanking_fasta):
         pass
     return order
 
-def _select_blocks_by_chain(scaffold_hits, strand, q_order_map, block_id_start):
-    """Select synteny blocks by colinear chains (LIS-like) and span constraint."""
+def _select_blocks_by_chain(scaffold_hits, strand, q_order_map, block_id_start, max_gap_kb, max_span_kb):
+    """Select synteny blocks by colinear chains (LIS-like) with gap and span limits.
+
+    The chain is segmented when either:
+      - The genomic gap between consecutive hits exceeds max_gap_kb, or
+      - The cumulative span of the current segment exceeds max_span_kb.
+    """
     blocks = []
     block_id = block_id_start
-    max_span_bp = MAX_BLOCK_SPAN_KB * 1000
+    max_span_bp = max_span_kb * 1000
+    max_gap_bp = max_gap_kb * 1000
 
     # Choose best hit per qseqid (lowest evalue, highest bitscore as tie-breaker)
     best_by_q = {}
@@ -172,14 +180,28 @@ def _select_blocks_by_chain(scaffold_hits, strand, q_order_map, block_id_start):
         if len(chain) < MIN_PROTEINS_FOR_BLOCK:
             break
 
-        # Segment the chain if span exceeds max_span_bp
-        seg = []
+        # Segment the chain using both max gap and max span constraints
         seg_start = chain[0][2]['coord_start']
         seg_end = chain[0][2]['coord_end']
         current_hits = [chain[0][2]]
         for _, _, h in chain[1:]:
-            seg_end = max(seg_end, h['coord_end'])
-            if (seg_end - seg_start) > max_span_bp:
+            # Compute genomic gap between the last kept hit and the new hit
+            prev = current_hits[-1]
+            if h['coord_start'] > prev['coord_end']:
+                gap_bp = h['coord_start'] - prev['coord_end']
+            elif prev['coord_start'] > h['coord_end']:
+                gap_bp = prev['coord_start'] - h['coord_end']
+            else:
+                gap_bp = 0
+
+            # Prospective span if we include this hit
+            prospective_start = min(seg_start, h['coord_start'])
+            prospective_end = max(seg_end, h['coord_end'])
+            span_exceeds = (prospective_end - prospective_start) > max_span_bp
+            gap_exceeds = gap_bp > max_gap_bp
+
+            if gap_exceeds or span_exceeds:
+                # Flush current segment as a block (if sufficient hits)
                 if len(current_hits) >= MIN_PROTEINS_FOR_BLOCK:
                     blocks.append({
                         'block_id': f"block_{block_id:05d}",
@@ -192,12 +214,16 @@ def _select_blocks_by_chain(scaffold_hits, strand, q_order_map, block_id_start):
                         'hits': current_hits
                     })
                     block_id += 1
-                # start new segment
+
+                # Start a new segment from current hit
                 seg_start = h['coord_start']
                 seg_end = h['coord_end']
                 current_hits = [h]
             else:
+                # Continue current segment
                 current_hits.append(h)
+                seg_start = min(seg_start, h['coord_start'])
+                seg_end = max(seg_end, h['coord_end'])
         if len(current_hits) >= MIN_PROTEINS_FOR_BLOCK:
             blocks.append({
                 'block_id': f"block_{block_id:05d}",
@@ -217,8 +243,8 @@ def _select_blocks_by_chain(scaffold_hits, strand, q_order_map, block_id_start):
 
     return blocks, block_id
 
-def cluster_into_blocks(hits, q_order_map, max_gap_kb=500):
-    """Cluster BLAST hits into synteny blocks using colinear chains and span limits."""
+def cluster_into_blocks(hits, q_order_map, max_gap_kb=500, max_span_kb=MAX_BLOCK_SPAN_KB):
+    """Cluster BLAST hits into synteny blocks using colinear chains with gap and span limits."""
     grouped = defaultdict(list)
     for hit in hits:
         key = (hit['sseqid'], hit['strand'])
@@ -227,7 +253,7 @@ def cluster_into_blocks(hits, q_order_map, max_gap_kb=500):
     blocks = []
     block_id = 1
     for (scaffold, strand), scaffold_hits in grouped.items():
-        b, block_id = _select_blocks_by_chain(scaffold_hits, strand, q_order_map, block_id)
+        b, block_id = _select_blocks_by_chain(scaffold_hits, strand, q_order_map, block_id, max_gap_kb, max_span_kb)
         blocks.extend(b)
 
     return blocks
@@ -272,7 +298,7 @@ def save_hit_sequences(hits, genome_id, locus_output):
     
     return len(sequences)
 
-def filter_flanking_proteins(flanking_file, locus_id, output_dir):
+def filter_flanking_proteins(flanking_file, locus_id, output_dir, closest_each_side=None):
     """
     Filter flanking proteins to top N for synteny detection.
 
@@ -288,16 +314,47 @@ def filter_flanking_proteins(flanking_file, locus_id, output_dir):
         Path to filtered flanking file, or None on error
     """
     try:
-        # Read first N proteins
-        filtered_seqs = []
-        with open(flanking_file, 'r') as f:
-            for i, record in enumerate(SeqIO.parse(f, 'fasta')):
+        records = list(SeqIO.parse(str(flanking_file), 'fasta'))
+        if closest_each_side is not None:
+            # Select only U1..Uk and D1..Dk based on description prefix "U#" / "D#"
+            u_selected = []
+            d_selected = []
+            for rec in records:
+                desc = rec.description or ""
+                m = re.match(r"^([UD])(\d+)\b", desc)
+                if not m:
+                    continue
+                side = m.group(1)
+                idx = int(m.group(2))
+                if idx <= closest_each_side:
+                    if side == 'U':
+                        u_selected.append((idx, rec))
+                    else:
+                        d_selected.append((idx, rec))
+
+            # Sort each side by index ascending (U1..Uk, D1..Dk) and keep order U then D
+            u_selected.sort(key=lambda x: x[0])
+            d_selected.sort(key=lambda x: x[0])
+            filtered_seqs = [rec for _, rec in u_selected] + [rec for _, rec in d_selected]
+
+            # Fallback: if nothing matched the U/D pattern, revert to first-N behavior
+            if not filtered_seqs:
+                fallback = []
+                for i, record in enumerate(records):
+                    if i >= MAX_FLANKING_FOR_SYNTENY:
+                        break
+                    fallback.append(record)
+                filtered_seqs = fallback
+        else:
+            # Read first N proteins as-is from file order
+            filtered_seqs = []
+            for i, record in enumerate(records):
                 if i >= MAX_FLANKING_FOR_SYNTENY:
                     break
                 filtered_seqs.append(record)
 
         if not filtered_seqs:
-            print(f"    WARNING: No sequences found in {flanking_file}")
+            print(f"    WARNING: No sequences selected from {flanking_file}")
             return None
 
         # Save filtered file in output directory
@@ -315,7 +372,7 @@ def filter_flanking_proteins(flanking_file, locus_id, output_dir):
         print(f"    ERROR filtering flanking proteins: {e}")
         return None
 
-def process_locus(locus_id, flanking_file, genome_dbs, output_dir, evalue="1e-5", max_targets=50, threads=16, max_gap_kb=500):
+def process_locus(locus_id, flanking_file, genome_dbs, output_dir, evalue="1e-5", max_targets=50, threads=16, max_gap_kb=500, max_span_kb=MAX_BLOCK_SPAN_KB, closest_each_side=None):
     """Process synteny detection for one locus."""
 
     print(f"\n  Processing {locus_id}...")
@@ -326,7 +383,7 @@ def process_locus(locus_id, flanking_file, genome_dbs, output_dir, evalue="1e-5"
         return []
 
     # Filter flanking proteins to top N for efficiency
-    filtered_flanking = filter_flanking_proteins(flanking_file, locus_id, output_dir)
+    filtered_flanking = filter_flanking_proteins(flanking_file, locus_id, output_dir, closest_each_side=closest_each_side)
     if filtered_flanking is None:
         print(f"    ERROR: Failed to filter flanking proteins")
         return []
@@ -374,7 +431,7 @@ def process_locus(locus_id, flanking_file, genome_dbs, output_dir, evalue="1e-5"
         # Build query order mapping from filtered flanking FASTA for colinearity
         q_order_map = _build_query_order_map(filtered_flanking)
         # Cluster into blocks using colinear chains with span limit
-        blocks = cluster_into_blocks(hits, q_order_map, max_gap_kb)
+        blocks = cluster_into_blocks(hits, q_order_map, max_gap_kb, max_span_kb)
         print(f" - {len(blocks)} synteny blocks, {num_seqs} HSP sequences saved")
 
         # Add genome and locus info to blocks
@@ -425,8 +482,12 @@ def parse_args():
                         help='Maximum number of BLAST targets (default: 50)')
     parser.add_argument('--max-gap-kb', type=int, default=500,
                         help='Maximum gap (kb) between hits in same block (default: 500)')
+    parser.add_argument('--max-span-kb', type=int, default=MAX_BLOCK_SPAN_KB,
+                        help='Maximum span (kb) allowed for a single block before segmenting (default: 300)')
     parser.add_argument('--threads', type=int, default=16,
                         help='Number of BLAST threads (default: 16)')
+    parser.add_argument('--closest-each-side', type=int,
+                        help='Use only the closest K flanking proteins upstream (U1..UK) and downstream (D1..DK)')
     parser.add_argument('--locus', type=str,
                         help='Process only this specific locus (for SLURM arrays)')
 
@@ -447,7 +508,10 @@ def main():
     print(f"  E-value: {args.evalue}")
     print(f"  Max targets: {args.max_targets}")
     print(f"  Max gap: {args.max_gap_kb} kb")
+    print(f"  Max span: {args.max_span_kb} kb")
     print(f"  Threads: {args.threads}")
+    if args.closest_each_side is not None:
+        print(f"  Closest flanking per side: U1..U{args.closest_each_side}, D1..D{args.closest_each_side}")
 
     # Create output directory
     args.output_dir.mkdir(exist_ok=True, parents=True)
@@ -483,7 +547,8 @@ def main():
         flanking_file = Path(row['flanking_file'])
         locus_blocks = process_locus(
             locus_id, flanking_file, genome_dbs, args.output_dir,
-            args.evalue, args.max_targets, args.threads, args.max_gap_kb
+            args.evalue, args.max_targets, args.threads, args.max_gap_kb, args.max_span_kb,
+            closest_each_side=args.closest_each_side
         )
         all_blocks.extend(locus_blocks)
 
