@@ -55,7 +55,7 @@ for family in "${FAMILIES[@]}"; do
     # Check if Phase 6 completed
     if [ ! -f "${OUTPUT_DIR}/06_extracted_sequences/all_extracted_genes.faa" ]; then
         echo "  ⚠ Phase 6 not complete, skipping..."
-        ((FAIL_COUNT++))
+        FAIL_COUNT=$((FAIL_COUNT + 1))
         continue
     fi
 
@@ -83,12 +83,12 @@ for family in "${FAMILIES[@]}"; do
                 echo "    Grades: intact=$INTACT, degraded_fragment=$DEGRADED_FRAG, pseudogene=$DEGRADED_PSEUDO, no_cds=$DEGRADED_NO_CDS, bad=$BAD"
             else
                 echo "  ❌ Phase 7 failed - graded file not created"
-                ((FAIL_COUNT++))
+                FAIL_COUNT=$((FAIL_COUNT + 1))
                 continue
             fi
         else
             echo "  ❌ Phase 7 failed"
-            ((FAIL_COUNT++))
+            FAIL_COUNT=$((FAIL_COUNT + 1))
             continue
         fi
     fi
@@ -105,7 +105,7 @@ for family in "${FAMILIES[@]}"; do
     # Check if Phase 8 (SwissProt) completed
     if [ ! -f "${OUTPUT_DIR}/07_swissprot_annotations/genome_specific_swissprot_annotations.tsv" ]; then
         echo "  ⚠ Phase 8 (SwissProt) not complete, skipping matrix regeneration..."
-        ((FAIL_COUNT++))
+        FAIL_COUNT=$((FAIL_COUNT + 1))
         continue
     fi
 
@@ -130,7 +130,7 @@ for family in "${FAMILIES[@]}"; do
         echo "  ✓ Phase 9a complete (with grading)"
     else
         echo "  ❌ Phase 9a failed"
-        ((FAIL_COUNT++))
+        FAIL_COUNT=$((FAIL_COUNT + 1))
         continue
     fi
 
@@ -145,10 +145,10 @@ for family in "${FAMILIES[@]}"; do
         2>&1 | tee "logs/phase9b_surgical_${family}.log"; then
 
         echo "  ✓ Phase 9b complete"
-        ((SUCCESS_COUNT++))
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
     else
         echo "  ❌ Phase 9b failed"
-        ((FAIL_COUNT++))
+        FAIL_COUNT=$((FAIL_COUNT + 1))
     fi
 
     echo ""
