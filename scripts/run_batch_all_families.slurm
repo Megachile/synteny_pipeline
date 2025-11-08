@@ -502,8 +502,8 @@ else
     GRADED_SYNTENIC="${PHASE3_DIR}/05_classified/syntenic_targets_graded.tsv"
     GRADED_ARG=""
     if [ -f "$GRADED_SYNTENIC" ]; then
-        GRADED_ARG="--graded-syntenic $GRADED_SYNTENIC --keep-grades intact,degraded_fragment"
-        echo "  Using graded syntenic targets (keeping: intact, degraded_fragment)"
+        GRADED_ARG="--graded-syntenic $GRADED_SYNTENIC --keep-grades intact,degraded_fragment,degraded_pseudogene,degraded_no_cds"
+        echo "  Using graded syntenic targets (keeping all confident hits, filtering only bad_match)"
     fi
 
     if python scripts/08a_generate_locus_matrices.py \

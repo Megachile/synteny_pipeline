@@ -119,7 +119,7 @@ for family in "${FAMILIES[@]}"; do
         --blocks "${OUTPUT_DIR}/03_filtered_blocks/synteny_blocks_filtered.tsv" \
         --targets "${OUTPUT_DIR}/05_classified/all_targets_classified.tsv" \
         --graded-syntenic "$GRADED_FILE" \
-        --keep-grades "intact,degraded_fragment" \
+        --keep-grades "intact,degraded_fragment,degraded_pseudogene,degraded_no_cds" \
         --swissprot "${OUTPUT_DIR}/07_swissprot_annotations/genome_specific_swissprot_annotations.tsv" \
         --reference-proteins data/reference/protein.faa \
         --extracted-seqs "${OUTPUT_DIR}/06_extracted_sequences" \
