@@ -41,9 +41,13 @@ if [ -z "$GENE_FAMILY" ] || [ -z "$TARGET_GENES" ]; then
     exit 1
 fi
 
+# Sanitize gene family name for filesystem use (remove spaces, pipes, commas, special chars)
+CLEAN_GENE_FAMILY=$(echo "$GENE_FAMILY" | sed 's/ /_/g; s/|/_/g; s/,//g; s/[^a-zA-Z0-9_-]/_/g')
+
 echo "================================================================================"
 echo "ARRAY TASK $SLURM_ARRAY_TASK_ID: Processing $GENE_FAMILY"
 echo "================================================================================"
+echo "Sanitized name: $CLEAN_GENE_FAMILY"
 echo "Target genes: $TARGET_GENES"
 echo "Job ID: ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
 echo "Node: $(hostname)"
@@ -52,15 +56,15 @@ echo ""
 # Create inputs directory
 mkdir -p inputs
 
-# Create input file for this gene family
-INPUT_FILE="inputs/${GENE_FAMILY}_test.tsv"
+# Create input file for this gene family (use sanitized name for filename)
+INPUT_FILE="inputs/${CLEAN_GENE_FAMILY}_test.tsv"
 echo -e "gene_family\ttarget_genes" > "$INPUT_FILE"
 echo -e "${GENE_FAMILY}\t${TARGET_GENES}" >> "$INPUT_FILE"
 
 echo "Created input file: $INPUT_FILE"
 
-# Set output directory name (clean version of gene family name)
-OUTPUT_DIR="${GENE_FAMILY}_BK_LB_batch"
+# Set output directory name (sanitized version of gene family name)
+OUTPUT_DIR="${CLEAN_GENE_FAMILY}_BK_LB_batch"
 
 # Load environment
 echo "Loading environment..."
@@ -98,7 +102,7 @@ else
         --loc-ids "$TARGET_GENES" \
         --output-dir "${PHASE12_DIR}" \
         --gene-family "${GENE_FAMILY}" \
-        2>&1 | tee "logs/phase1_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
+        2>&1 | tee "logs/phase1_${CLEAN_GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
         echo "✓ Phase 1 complete"
     else
         echo "❌ Phase 1 failed"
@@ -113,7 +117,7 @@ if [ -f "${PHASE12_DIR}/synteny_groups.json" ]; then
     echo "✓ Phase 2 already complete (skipping)"
 else
     if python scripts/02_compare_synteny_gene_level.py "${PHASE12_DIR}" \
-        2>&1 | tee "logs/phase2_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
+        2>&1 | tee "logs/phase2_${CLEAN_GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
         echo "✓ Phase 2 complete"
     else
         echo "❌ Phase 2 failed"
@@ -156,8 +160,8 @@ else
     PHASE3A_JOB=$(sbatch --parsable \
         --array=0-$((NLOCI-1)) \
         --job-name="phase3a_${GENE_FAMILY}" \
-        --output="logs/phase3a_${GENE_FAMILY}_%A_%a.out" \
-        --error="logs/phase3a_${GENE_FAMILY}_%A_%a.err" \
+        --output="logs/phase3a_${CLEAN_GENE_FAMILY}_%A_%a.out" \
+        --error="logs/phase3a_${CLEAN_GENE_FAMILY}_%A_%a.err" \
         --cpus-per-task=16 \
         --mem=32G \
         --time=4:00:00 \
@@ -178,8 +182,8 @@ else
 
     # Check for failures
     FAILED_TASKS=0
-    if compgen -G "logs/phase3a_${GENE_FAMILY}_${PHASE3A_JOB}_*.err" > /dev/null; then
-        FAILED_TASKS=$(grep -l "Phase 3a failed\|ERROR" logs/phase3a_${GENE_FAMILY}_${PHASE3A_JOB}_*.err 2>/dev/null | wc -l || true)
+    if compgen -G "logs/phase3a_${CLEAN_GENE_FAMILY}_${PHASE3A_JOB}_*.err" > /dev/null; then
+        FAILED_TASKS=$(grep -l "Phase 3a failed\|ERROR" logs/phase3a_${CLEAN_GENE_FAMILY}_${PHASE3A_JOB}_*.err 2>/dev/null | wc -l || true)
     fi
 
     if [ $FAILED_TASKS -gt 0 ]; then
@@ -250,7 +254,7 @@ else
         --input "${PHASE3_DIR}/02_synteny_blocks/all_synteny_blocks.tsv" \
         --output-dir "${PHASE3_DIR}/03_filtered_blocks" \
         --verbose \
-        2>&1 | tee "logs/phase3b_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
+        2>&1 | tee "logs/phase3b_${CLEAN_GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
         echo "✓ Phase 3b complete"
     else
         echo "❌ Phase 3b failed"
@@ -270,7 +274,7 @@ else
         --proteome-dir data/proteomes \
         --genome-dir data/genomes \
         --output-dir "${PHASE3_DIR}/01_extracted_proteins" \
-        2>&1 | tee "logs/phase3c_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
+        2>&1 | tee "logs/phase3c_${CLEAN_GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
         echo "✓ Phase 3c complete"
     else
         echo "❌ Phase 3c failed"
@@ -291,7 +295,7 @@ else
         --output-dir "${PHASE3_DIR}/04_target_genes" \
         --gene-family "${GENE_FAMILY}" \
         --threads 16 \
-        2>&1 | tee "logs/phase4_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
+        2>&1 | tee "logs/phase4_${CLEAN_GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
         echo "✓ Phase 4 complete"
     else
         echo "❌ Phase 4 failed"
@@ -309,7 +313,7 @@ else
         --targets "${PHASE3_DIR}/04_target_genes/all_target_loci.tsv" \
         --blocks "${PHASE3_DIR}/03_filtered_blocks/synteny_blocks_filtered.tsv" \
         --output-dir "${PHASE3_DIR}/05_classified" \
-        2>&1 | tee "logs/phase5_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
+        2>&1 | tee "logs/phase5_${CLEAN_GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
         # Verify outputs exist and are non-empty
         if [ ! -s "${PHASE3_DIR}/05_classified/all_targets_classified.tsv" ]; then
             echo "❌ Phase 5 produced no classifications (all_targets_classified.tsv missing or empty)"
@@ -336,7 +340,7 @@ else
         --output-dir "${PHASE3_DIR}/06_extracted_sequences" \
         --unplaceable-evalue 1e-10 \
         --verbose \
-        2>&1 | tee "logs/phase6_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
+        2>&1 | tee "logs/phase6_${CLEAN_GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
         # Verify aggregated file was created
         if [ ! -f "${PHASE3_DIR}/06_extracted_sequences/all_extracted_genes.faa" ]; then
             echo "❌ Phase 6 failed - aggregated file not created"
@@ -379,8 +383,8 @@ else
     PHASE7_JOB=$(sbatch --parsable \
         --array=0-$((NLOCI-1)) \
         --job-name="phase7_${GENE_FAMILY}" \
-        --output="logs/phase7_${GENE_FAMILY}_%A_%a.out" \
-        --error="logs/phase7_${GENE_FAMILY}_%A_%a.err" \
+        --output="logs/phase7_${CLEAN_GENE_FAMILY}_%A_%a.out" \
+        --error="logs/phase7_${CLEAN_GENE_FAMILY}_%A_%a.err" \
         --cpus-per-task=8 \
         --mem=16G \
         --time=2:00:00 \
@@ -402,9 +406,9 @@ else
 
     # Check if any tasks failed
     FAILED_TASKS=0
-    if compgen -G "logs/phase7_${GENE_FAMILY}_${PHASE7_JOB}_*.err" > /dev/null; then
+    if compgen -G "logs/phase7_${CLEAN_GENE_FAMILY}_${PHASE7_JOB}_*.err" > /dev/null; then
         # grep returns 1 when no matches found, so use || true to prevent pipefail
-        FAILED_TASKS=$(grep -l "Phase 7 failed" logs/phase7_${GENE_FAMILY}_${PHASE7_JOB}_*.err 2>/dev/null | wc -l || true)
+        FAILED_TASKS=$(grep -l "Phase 7 failed" logs/phase7_${CLEAN_GENE_FAMILY}_${PHASE7_JOB}_*.err 2>/dev/null | wc -l || true)
     fi
     if [ $FAILED_TASKS -gt 0 ]; then
         echo "❌ Phase 7 failed - ${FAILED_TASKS} array tasks failed"
@@ -461,7 +465,7 @@ else
         --extracted-seqs "${PHASE3_DIR}/06_extracted_sequences" \
         --species-map data/gca_to_species.tsv \
         --output-dir "${PHASE3_DIR}/08_matrices" \
-        2>&1 | tee "logs/phase8a_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
+        2>&1 | tee "logs/phase8a_${CLEAN_GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
         echo "✓ Phase 8a complete"
     else
         echo "❌ Phase 8a failed"
@@ -483,7 +487,7 @@ else
         --species-map data/gca_to_species.tsv \
         --extracted-seqs "${PHASE3_DIR}/06_extracted_sequences" \
         --output-dir "${PHASE3_DIR}/08_matrices" \
-        2>&1 | tee "logs/phase8b_${GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
+        2>&1 | tee "logs/phase8b_${CLEAN_GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
         echo "✓ Phase 8b complete"
     else
         echo "❌ Phase 8b failed"
