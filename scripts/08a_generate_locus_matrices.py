@@ -13,6 +13,8 @@ Usage:
         --synteny-dir <path/to/02_synteny_blocks> \\
         --blocks <path/to/synteny_blocks_filtered.tsv> \\
         --targets <path/to/all_targets_classified.tsv> \\
+        [--graded-syntenic <path/to/syntenic_targets_graded.tsv>] \\
+        [--keep-grades intact,degraded_fragment] \\
         --swissprot <path/to/genome_specific_swissprot_annotations.tsv> \\
         --reference-proteins <path/to/protein.faa> \\
         --species-map <path/to/gca_to_species.tsv> \\
@@ -471,6 +473,10 @@ def parse_args():
                         help='Path to synteny_blocks_filtered.tsv (optional)')
     parser.add_argument('--targets', type=Path,
                         help='Path to all_targets_classified.tsv (optional)')
+    parser.add_argument('--graded-syntenic', type=Path,
+                        help='Optional path to syntenic_targets_graded.tsv (Phase 6 grading output)')
+    parser.add_argument('--keep-grades', type=str, default='intact,degraded_fragment',
+                        help='Comma-separated list of grades to keep (default: intact,degraded_fragment)')
     parser.add_argument('--swissprot', type=Path,
                         help='Path to genome_specific_swissprot_annotations.tsv (optional)')
     parser.add_argument('--reference-proteins', required=False, type=Path,
@@ -524,7 +530,24 @@ def main():
         targets_df = pd.read_csv(args.targets, sep='\t')
         # Filter to syntenic only for main column
         syntenic_targets = targets_df[targets_df['placement'] == 'synteny']
-        print(f"  Loaded {len(syntenic_targets)} syntenic targets")
+        # Optional quality grading filter
+        graded_path = args.graded_syntenic if args.graded_syntenic else (args.targets.parent / 'syntenic_targets_graded.tsv')
+        if graded_path and graded_path.exists():
+            try:
+                graded_df = pd.read_csv(graded_path, sep='\t')
+                keep = {g.strip() for g in str(args.keep_grades).split(',') if g.strip()}
+                graded_keep = graded_df[graded_df['grade'].isin(keep)].copy()
+                # Composite key for robust match
+                def _key(df):
+                    return set(zip(df.get('genome', []), df.get('locus_name', []), df.get('query_id', []), df.get('start', []), df.get('end', [])))
+                k_keep = _key(graded_keep)
+                syntenic_targets = syntenic_targets[syntenic_targets.apply(lambda r: (r.get('genome',''), r.get('locus_name',''), r.get('query_id',''), r.get('start',None), r.get('end',None)) in k_keep, axis=1)]
+                print(f"  Loaded {len(syntenic_targets)} syntenic targets (graded kept: {len(graded_keep)})")
+            except Exception as e:
+                print(f"  Warning: could not apply graded filter ({e}); using unfiltered syntenic")
+                print(f"  Loaded {len(syntenic_targets)} syntenic targets")
+        else:
+            print(f"  Loaded {len(syntenic_targets)} syntenic targets")
     else:
         syntenic_targets = pd.DataFrame()
         print("  No classified targets found")

@@ -86,7 +86,7 @@ echo ""
 ################################################################################
 
 echo "================================================================================"
-echo "STARTING FULL PIPELINE (PHASES 1-8)"
+echo "STARTING FULL PIPELINE (PHASES 1-9)"
 echo "================================================================================"
 
 # Phase 1: Discover paralogs
@@ -327,6 +327,9 @@ else
         --targets "${PHASE3_DIR}/04_target_genes/all_target_loci.tsv" \
         --blocks "${PHASE3_DIR}/03_filtered_blocks/synteny_blocks_filtered.tsv" \
         --output-dir "${PHASE3_DIR}/05_classified" \
+        --allow-nearby \
+        --proximity-kb 200 \
+        --pad-kb 20 \
         2>&1 | tee "logs/phase5_${CLEAN_GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
         # Verify outputs exist and are non-empty
         if [ ! -s "${PHASE3_DIR}/05_classified/all_targets_classified.tsv" ]; then
@@ -367,9 +370,35 @@ else
     fi
 fi
 
-# Phase 7: SwissProt annotation (parallelized per locus)
+# Phase 7: Grade match quality
 echo ""
-echo "--- PHASE 7: SWISSPROT ANNOTATION ---"
+echo "--- PHASE 7: GRADE MATCH QUALITY ---"
+
+GRADED_FILE="${PHASE3_DIR}/05_classified/syntenic_targets_graded.tsv"
+
+if [ -f "$GRADED_FILE" ]; then
+    echo "✓ Phase 7 already complete (skipping)"
+else
+    if python scripts/07_grade_matches.py \
+        --syntenic "${PHASE3_DIR}/05_classified/syntenic_targets.tsv" \
+        --extracted-dir "${PHASE3_DIR}/06_extracted_sequences" \
+        --query-proteins "${PHASE3_DIR}/04_target_genes/combined_targets.faa" \
+        2>&1 | tee "logs/phase7_${CLEAN_GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
+
+        if [ ! -f "$GRADED_FILE" ]; then
+            echo "❌ Phase 7 failed - graded file not created"
+            exit 1
+        fi
+        echo "✓ Phase 7 complete"
+    else
+        echo "❌ Phase 7 failed"
+        exit 1
+    fi
+fi
+
+# Phase 8: SwissProt annotation (parallelized per locus)
+echo ""
+echo "--- PHASE 8: SWISSPROT ANNOTATION ---"
 
 ANNOT_DIR="${PHASE3_DIR}/07_swissprot_annotations"
 FINAL_OUTPUT="${ANNOT_DIR}/genome_specific_swissprot_annotations.tsv"
@@ -460,39 +489,48 @@ else
     echo "  Aggregated output: ${FINAL_OUTPUT}"
 fi
 
-# Phase 8a: Generate locus matrices
+# Phase 9a: Generate locus matrices (using graded syntenic targets)
 echo ""
-echo "--- PHASE 8a: GENERATE LOCUS MATRICES ---"
+echo "--- PHASE 9a: GENERATE LOCUS MATRICES ---"
 
 if [ -d "${PHASE3_DIR}/08_matrices" ] && [ -n "$(ls -A ${PHASE3_DIR}/08_matrices/*_locus_matrix.tsv 2>/dev/null)" ]; then
-    echo "✓ Phase 8a already complete (skipping)"
+    echo "✓ Phase 9a already complete (skipping)"
 else
     cp "${PHASE12_DIR}/locus_definitions.tsv" "${PHASE3_DIR}/locus_definitions.tsv"
+
+    # Use graded syntenic if available
+    GRADED_SYNTENIC="${PHASE3_DIR}/05_classified/syntenic_targets_graded.tsv"
+    GRADED_ARG=""
+    if [ -f "$GRADED_SYNTENIC" ]; then
+        GRADED_ARG="--graded-syntenic $GRADED_SYNTENIC --keep-grades intact,degraded_fragment"
+        echo "  Using graded syntenic targets (keeping: intact, degraded_fragment)"
+    fi
 
     if python scripts/08a_generate_locus_matrices.py \
         --locus-defs "${PHASE3_DIR}/locus_definitions.tsv" \
         --synteny-dir "${PHASE3_DIR}/02_synteny_blocks" \
         --blocks "${PHASE3_DIR}/03_filtered_blocks/synteny_blocks_filtered.tsv" \
         --targets "${PHASE3_DIR}/05_classified/all_targets_classified.tsv" \
+        $GRADED_ARG \
         --swissprot "${PHASE3_DIR}/07_swissprot_annotations/genome_specific_swissprot_annotations.tsv" \
         --reference-proteins data/reference/protein.faa \
         --extracted-seqs "${PHASE3_DIR}/06_extracted_sequences" \
         --species-map data/gca_to_species.tsv \
         --output-dir "${PHASE3_DIR}/08_matrices" \
-        2>&1 | tee "logs/phase8a_${CLEAN_GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
-        echo "✓ Phase 8a complete"
+        2>&1 | tee "logs/phase9a_${CLEAN_GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
+        echo "✓ Phase 9a complete"
     else
-        echo "❌ Phase 8a failed"
+        echo "❌ Phase 9a failed"
         exit 1
     fi
 fi
 
-# Phase 8b: Generate summary matrices
+# Phase 9b: Generate summary matrices
 echo ""
-echo "--- PHASE 8b: GENERATE SUMMARY MATRICES ---"
+echo "--- PHASE 9b: GENERATE SUMMARY MATRICES ---"
 
 if [ -f "${PHASE3_DIR}/08_matrices/summary_matrix.tsv" ]; then
-    echo "✓ Phase 8b already complete (skipping)"
+    echo "✓ Phase 9b already complete (skipping)"
 else
     if python scripts/08b_generate_summary_matrices.py \
         --locus-defs "${PHASE3_DIR}/locus_definitions.tsv" \
@@ -501,10 +539,10 @@ else
         --species-map data/gca_to_species.tsv \
         --extracted-seqs "${PHASE3_DIR}/06_extracted_sequences" \
         --output-dir "${PHASE3_DIR}/08_matrices" \
-        2>&1 | tee "logs/phase8b_${CLEAN_GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
-        echo "✓ Phase 8b complete"
+        2>&1 | tee "logs/phase9b_${CLEAN_GENE_FAMILY}_${SLURM_ARRAY_TASK_ID}.log"; then
+        echo "✓ Phase 9b complete"
     else
-        echo "❌ Phase 8b failed"
+        echo "❌ Phase 9b failed"
         exit 1
     fi
 fi
