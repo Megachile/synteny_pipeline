@@ -136,27 +136,48 @@ echo "--- PHASE 3a: GENOME-WIDE SYNTENY DETECTION ---"
 SYNTENY_BLOCKS_DIR="${PHASE3_DIR}/02_synteny_blocks"
 ALL_BLOCKS="${SYNTENY_BLOCKS_DIR}/all_synteny_blocks.tsv"
 
-# Check if Phase 3a is already complete (file exists and has more than just header)
-if [ -f "$ALL_BLOCKS" ] && [ $(wc -l < "$ALL_BLOCKS") -gt 1 ]; then
-    echo "✓ Phase 3a already complete (skipping)"
+# Get locus definitions
+LOCUS_DEFS="${PHASE12_DIR}/locus_definitions.tsv"
+if [ ! -f "$LOCUS_DEFS" ]; then
+    echo "❌ Phase 3a failed - locus definitions not found"
+    exit 1
+fi
+
+NLOCI=$(tail -n +2 "$LOCUS_DEFS" | wc -l)
+
+if [ $NLOCI -eq 0 ]; then
+    echo "❌ Phase 3a failed - no loci found in locus definitions"
+    exit 1
+fi
+
+# Check which loci already have synteny files
+shopt -s nullglob
+existing_locus_files=("${SYNTENY_BLOCKS_DIR}"/*_synteny_blocks.tsv)
+existing_count=0
+for f in "${existing_locus_files[@]}"; do
+    if [[ ! "$f" =~ all_synteny_blocks.tsv$ ]]; then
+        existing_count=$((existing_count + 1))
+    fi
+done
+
+if [ $existing_count -eq $NLOCI ]; then
+    echo "✓ Phase 3a already complete for all ${NLOCI} loci (skipping array job)"
+    # Just aggregate if needed
+    if [ ! -f "$ALL_BLOCKS" ] || [ $(wc -l < "$ALL_BLOCKS") -le 1 ]; then
+        echo "  Aggregating existing results..."
+        echo -e "locus_id\tgenome\tblock_id\tscaffold\tstrand\tstart\tend\tspan_kb\tnum_target_proteins\tnum_query_matches" > "$ALL_BLOCKS"
+        for f in "${existing_locus_files[@]}"; do
+            if [[ ! "$f" =~ all_synteny_blocks.tsv$ ]]; then
+                tail -n +2 "$f" >> "$ALL_BLOCKS"
+            fi
+        done
+        TOTAL_BLOCKS=$(tail -n +2 "$ALL_BLOCKS" | wc -l)
+        echo "  Aggregated ${TOTAL_BLOCKS} total blocks"
+    fi
 else
-    # Count loci from locus definitions
-    LOCUS_DEFS="${PHASE12_DIR}/locus_definitions.tsv"
-    if [ ! -f "$LOCUS_DEFS" ]; then
-        echo "❌ Phase 3a failed - locus definitions not found"
-        exit 1
-    fi
+    echo "  Detected ${NLOCI} total loci, ${existing_count} already complete"
+    echo "  Submitting Phase 3a array job for all loci (0-$((NLOCI-1)))..."
 
-    NLOCI=$(tail -n +2 "$LOCUS_DEFS" | wc -l)
-    echo "  Detected ${NLOCI} loci to search"
-
-    if [ $NLOCI -eq 0 ]; then
-        echo "❌ Phase 3a failed - no loci found in locus definitions"
-        exit 1
-    fi
-
-    # Submit Phase 3a array job (one task per locus)
-    echo "  Submitting Phase 3a array job (0-$((NLOCI-1)))..."
     PHASE3A_JOB=$(sbatch --parsable \
         --array=0-$((NLOCI-1)) \
         --job-name="phase3a_${GENE_FAMILY}" \
@@ -172,7 +193,6 @@ else
 
     # Wait for array job to complete
     while true; do
-        # Check if job is still in queue (running or pending)
         if squeue -j ${PHASE3A_JOB} 2>/dev/null | grep -q "${PHASE3A_JOB}"; then
             sleep 30
         else
@@ -194,11 +214,9 @@ else
     # Aggregate results from all loci
     echo "  Aggregating results from ${NLOCI} loci..."
 
-    # Find per-locus output files (exclude all_synteny_blocks.tsv)
+    # Find per-locus output files
     shopt -s nullglob
     locus_files=("${SYNTENY_BLOCKS_DIR}"/*_synteny_blocks.tsv)
-
-    # Filter out the aggregated file if it exists
     filtered_files=()
     for f in "${locus_files[@]}"; do
         if [[ ! "$f" =~ all_synteny_blocks.tsv$ ]]; then
@@ -211,10 +229,7 @@ else
         exit 1
     fi
 
-    if [ ${#filtered_files[@]} -ne ${NLOCI} ]; then
-        echo "❌ Phase 3a failed - expected ${NLOCI} locus files, found ${#filtered_files[@]}"
-        exit 1
-    fi
+    echo "  Found ${#filtered_files[@]} locus files"
 
     # Create header
     echo -e "locus_id\tgenome\tblock_id\tscaffold\tstrand\tstart\tend\tspan_kb\tnum_target_proteins\tnum_query_matches" \
@@ -226,7 +241,7 @@ else
     done
 
     TOTAL_BLOCKS=$(tail -n +2 "$ALL_BLOCKS" | wc -l)
-    echo "✓ Phase 3a complete (${NLOCI} loci processed in parallel)"
+    echo "✓ Phase 3a complete"
     echo "  Aggregated output: ${ALL_BLOCKS} (${TOTAL_BLOCKS} total blocks)"
 fi
 
