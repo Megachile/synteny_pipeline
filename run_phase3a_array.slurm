@@ -54,6 +54,7 @@ if [ ${SLURM_ARRAY_TASK_ID} -ge ${NLOCI} ]; then
 fi
 
 LOCUS="${LOCI[$SLURM_ARRAY_TASK_ID]}"
+OUTPUT_FILE="${OUTPUT_DIR}/02_synteny_blocks/${LOCUS}_synteny_blocks.tsv"
 
 echo "================================================================================"
 echo "PHASE 3a ARRAY TASK ${SLURM_ARRAY_TASK_ID}: Processing locus ${LOCUS}"
@@ -63,6 +64,13 @@ echo "Total loci: ${NLOCI}"
 echo "Job ID: ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
 echo "Node: $(hostname)"
 echo ""
+
+# Check if output already exists and is non-empty
+if [ -f "$OUTPUT_FILE" ] && [ -s "$OUTPUT_FILE" ]; then
+    echo "✓ Phase 3a already complete for locus ${LOCUS} (skipping)"
+    echo "Output: ${OUTPUT_FILE}"
+    exit 0
+fi
 
 # Run Phase 3a for this specific locus
 python scripts/02_synteny_detection.py \
@@ -77,4 +85,4 @@ python scripts/02_synteny_detection.py \
 
 echo ""
 echo "✓ Phase 3a complete for locus ${LOCUS}"
-echo "Output: ${OUTPUT_DIR}/02_synteny_blocks/${LOCUS}_synteny_blocks.tsv"
+echo "Output: ${OUTPUT_FILE}"

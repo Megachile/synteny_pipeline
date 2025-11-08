@@ -160,23 +160,17 @@ for f in "${existing_locus_files[@]}"; do
     fi
 done
 
-if [ $existing_count -eq $NLOCI ]; then
-    echo "✓ Phase 3a already complete for all ${NLOCI} loci (skipping array job)"
-    # Just aggregate if needed
-    if [ ! -f "$ALL_BLOCKS" ] || [ $(wc -l < "$ALL_BLOCKS") -le 1 ]; then
-        echo "  Aggregating existing results..."
-        echo -e "locus_id\tgenome\tblock_id\tscaffold\tstrand\tstart\tend\tspan_kb\tnum_target_proteins\tnum_query_matches" > "$ALL_BLOCKS"
-        for f in "${existing_locus_files[@]}"; do
-            if [[ ! "$f" =~ all_synteny_blocks.tsv$ ]]; then
-                tail -n +2 "$f" >> "$ALL_BLOCKS"
-            fi
-        done
-        TOTAL_BLOCKS=$(tail -n +2 "$ALL_BLOCKS" | wc -l)
-        echo "  Aggregated ${TOTAL_BLOCKS} total blocks"
-    fi
+# Check if aggregated file exists and is complete
+if [ -f "$ALL_BLOCKS" ] && [ $(wc -l < "$ALL_BLOCKS") -gt 1 ] && [ $existing_count -eq $NLOCI ]; then
+    echo "✓ Phase 3a already complete for all ${NLOCI} loci (skipping)"
 else
-    echo "  Detected ${NLOCI} total loci, ${existing_count} already complete"
-    echo "  Submitting Phase 3a array job for all loci (0-$((NLOCI-1)))..."
+    if [ $existing_count -gt 0 ]; then
+        echo "  Detected ${NLOCI} total loci, ${existing_count} already complete, $((NLOCI - existing_count)) missing"
+        echo "  Submitting Phase 3a array job (will skip completed loci)"
+    else
+        echo "  Detected ${NLOCI} loci to search"
+        echo "  Submitting Phase 3a array job (0-$((NLOCI-1)))..."
+    fi
 
     PHASE3A_JOB=$(sbatch --parsable \
         --array=0-$((NLOCI-1)) \
@@ -229,7 +223,12 @@ else
         exit 1
     fi
 
-    echo "  Found ${#filtered_files[@]} locus files"
+    if [ ${#filtered_files[@]} -ne ${NLOCI} ]; then
+        echo "❌ Phase 3a incomplete - expected ${NLOCI} locus files, found ${#filtered_files[@]}"
+        exit 1
+    fi
+
+    echo "  Found ${#filtered_files[@]} complete locus files"
 
     # Create header
     echo -e "locus_id\tgenome\tblock_id\tscaffold\tstrand\tstart\tend\tspan_kb\tnum_target_proteins\tnum_query_matches" \
@@ -241,7 +240,7 @@ else
     done
 
     TOTAL_BLOCKS=$(tail -n +2 "$ALL_BLOCKS" | wc -l)
-    echo "✓ Phase 3a complete"
+    echo "✓ Phase 3a complete - all ${NLOCI} loci processed"
     echo "  Aggregated output: ${ALL_BLOCKS} (${TOTAL_BLOCKS} total blocks)"
 fi
 
