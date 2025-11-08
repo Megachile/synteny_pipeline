@@ -233,34 +233,35 @@ def load_flanking_protein_mapping(locus_id, synteny_dir):
         print(f"    Warning: Flanking file not found: {flanking_file}")
         return {}
 
-    # Read proteins in order
-    protein_ids = []
+    # Read proteins and extract positions from FASTA headers
+    # Format: >XP_033225730.1|LOC117178413 D1 XP_033225730.1 lazarillo protein-like [species]
+    position_to_protein = {}
+
     for record in SeqIO.parse(flanking_file, "fasta"):
         # Extract protein ID (first part before pipe or space)
         prot_id = record.id.split('|')[0].split()[0]
-        protein_ids.append(prot_id)
 
-    if len(protein_ids) == 0:
+        # Extract position label (U1, U2, D1, D2, etc.) from description
+        # Description format: "XP_XXXXX.X|LOCXXXXX U1 XP_XXXXX.X annotation [species]"
+        description = record.description
+        parts = description.split()
+
+        # Position should be the second or third field (after protein ID and LOC)
+        pos_label = None
+        for part in parts[1:4]:  # Check first few fields after ID
+            if part.startswith('U') or part.startswith('D'):
+                # Validate it's actually a position (U/D followed by digits)
+                if len(part) > 1 and part[1:].isdigit():
+                    pos_label = part
+                    break
+
+        if pos_label:
+            position_to_protein[pos_label] = prot_id
+        else:
+            print(f"    Warning: Could not parse position for {prot_id} from: {description}")
+
+    if len(position_to_protein) == 0:
         return {}
-
-    # Create mapping: U1, U2, ... and D1, D2, ...
-    # Proteins are in order: upstream (furthest to closest), then downstream (closest to furthest)
-    # So we need to split them. Assume equal up/down for now
-    n_proteins = len(protein_ids)
-    n_up = n_proteins // 2
-    n_down = n_proteins - n_up
-
-    position_to_protein = {}
-
-    # Upstream proteins (in reverse order for labeling)
-    for i in range(n_up):
-        pos_label = f"U{n_up - i}"
-        position_to_protein[pos_label] = protein_ids[i]
-
-    # Downstream proteins
-    for i in range(n_down):
-        pos_label = f"D{i + 1}"
-        position_to_protein[pos_label] = protein_ids[n_up + i]
 
     return position_to_protein
 
