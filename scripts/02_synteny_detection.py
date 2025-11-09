@@ -174,14 +174,17 @@ def _select_blocks_by_chain(scaffold_hits, strand, q_order_map, block_id_start, 
     # Sort by genomic position (pos)
     seq.sort(key=lambda x: x[0])
 
-    # Greedy extraction of increasing chains by q_idx (LIS-like)
+    # Greedy extraction of colinear chains by q_idx (LIS-like)
+    # Extract chains in BOTH directions to detect normal synteny AND inversions
     unused = seq[:]
+
+    # Phase 1: Extract increasing chains (normal forward synteny or inverted reverse synteny)
     while unused:
         chain = []
         last_q = -1
         new_unused = []
         for pos, q_idx, h in unused:
-            inc_ok = q_idx > last_q if strand == '+' else q_idx < last_q or last_q == -1
+            inc_ok = q_idx > last_q
             if inc_ok:
                 chain.append((pos, q_idx, h))
                 last_q = q_idx
@@ -235,6 +238,85 @@ def _select_blocks_by_chain(scaffold_hits, strand, q_order_map, block_id_start, 
                 current_hits.append(h)
                 seg_start = min(seg_start, h['coord_start'])
                 seg_end = max(seg_end, h['coord_end'])
+        if len(current_hits) >= MIN_PROTEINS_FOR_BLOCK:
+            blocks.append({
+                'block_id': f"block_{block_id:05d}",
+                'scaffold': _normalize_scaffold(current_hits[0]['sseqid']),
+                'strand': strand,
+                'start': min(x['coord_start'] for x in current_hits),
+                'end': max(x['coord_end'] for x in current_hits),
+                'num_target_proteins': len(set(x['qseqid'] for x in current_hits)),
+                'num_query_matches': len(set(x['qseqid'] for x in current_hits)),
+                'hits': current_hits
+            })
+            block_id += 1
+
+        # Remove used qseqids from unused
+        used_q = set(h['qseqid'] for _, _, h in chain)
+        unused = [t for t in new_unused if t[2]['qseqid'] not in used_q]
+
+    # Phase 2: Extract decreasing chains (inversions) from remaining unused hits
+    while unused:
+        chain = []
+        last_q = float('inf')  # Start with infinity for decreasing chains
+        new_unused = []
+        for pos, q_idx, h in unused:
+            dec_ok = q_idx < last_q
+            if dec_ok:
+                chain.append((pos, q_idx, h))
+                last_q = q_idx
+            else:
+                new_unused.append((pos, q_idx, h))
+
+        if len(chain) < MIN_PROTEINS_FOR_BLOCK:
+            break
+
+        # Segment the chain using both max gap and max span constraints
+        seg_start = chain[0][2]['coord_start']
+        seg_end = chain[0][2]['coord_end']
+        current_hits = [chain[0][2]]
+        for _, _, h in chain[1:]:
+            # Compute genomic gap between the last kept hit and the new hit
+            prev = current_hits[-1]
+            if h['coord_start'] > prev['coord_end']:
+                gap_bp = h['coord_start'] - prev['coord_end']
+            elif prev['coord_start'] > h['coord_end']:
+                gap_bp = prev['coord_start'] - h['coord_end']
+            else:
+                gap_bp = 0
+
+            # Prospective span if we include this hit
+            prospective_start = min(seg_start, h['coord_start'])
+            prospective_end = max(seg_end, h['coord_end'])
+            span_exceeds = (prospective_end - prospective_start) > max_span_bp
+            gap_exceeds = gap_bp > max_gap_bp
+
+            if gap_exceeds or span_exceeds:
+                # Flush current segment as a block (if sufficient hits)
+                if len(current_hits) >= MIN_PROTEINS_FOR_BLOCK:
+                    blocks.append({
+                        'block_id': f"block_{block_id:05d}",
+                        'scaffold': _normalize_scaffold(current_hits[0]['sseqid']),
+                        'strand': strand,
+                        'start': min(x['coord_start'] for x in current_hits),
+                        'end': max(x['coord_end'] for x in current_hits),
+                        'num_target_proteins': len(set(x['qseqid'] for x in current_hits)),
+                        'num_query_matches': len(set(x['qseqid'] for x in current_hits)),
+                        'hits': current_hits
+                    })
+                    block_id += 1
+
+                # Start a new segment from current hit
+                seg_start = h['coord_start']
+                seg_end = h['coord_end']
+                current_hits = [h]
+            else:
+                # Continue current segment
+                current_hits.append(h)
+                seg_start = min(seg_start, h['coord_start'])
+                seg_end = max(seg_end, h['coord_end'])
+
+        # Flush final segment
         if len(current_hits) >= MIN_PROTEINS_FOR_BLOCK:
             blocks.append({
                 'block_id': f"block_{block_id:05d}",
@@ -309,7 +391,7 @@ def save_hit_sequences(hits, genome_id, locus_output):
     
     return len(sequences)
 
-def filter_flanking_proteins(flanking_file, locus_id, output_dir, closest_each_side=None):
+def filter_flanking_proteins(flanking_file, locus_id, output_dir, closest_each_side=None, closest_internal=None):
     """
     Filter flanking proteins to top N for synteny detection.
 
@@ -327,26 +409,30 @@ def filter_flanking_proteins(flanking_file, locus_id, output_dir, closest_each_s
     try:
         records = list(SeqIO.parse(str(flanking_file), 'fasta'))
         if closest_each_side is not None:
-            # Select only U1..Uk and D1..Dk based on description prefix "U#" / "D#"
+            # Select only U1..Uk, I1..Ii and D1..Dk based on description prefix
             u_selected = []
+            i_selected = []
             d_selected = []
             for rec in records:
                 desc = rec.description or ""
-                m = re.match(r"^([UD])(\d+)\b", desc)
+                m = re.match(r"^([UDI])(\d+)\b", desc)
                 if not m:
                     continue
                 side = m.group(1)
                 idx = int(m.group(2))
-                if idx <= closest_each_side:
-                    if side == 'U':
-                        u_selected.append((idx, rec))
-                    else:
-                        d_selected.append((idx, rec))
+                if side in ('U', 'D'):
+                    if idx <= closest_each_side:
+                        (u_selected if side == 'U' else d_selected).append((idx, rec))
+                elif side == 'I':
+                    limit = closest_internal if closest_internal is not None else 0
+                    if limit and idx <= limit:
+                        i_selected.append((idx, rec))
 
-            # Sort each side by index ascending (U1..Uk, D1..Dk) and keep order U then D
+            # Sort by index ascending and keep order U, I, D
             u_selected.sort(key=lambda x: x[0])
+            i_selected.sort(key=lambda x: x[0])
             d_selected.sort(key=lambda x: x[0])
-            filtered_seqs = [rec for _, rec in u_selected] + [rec for _, rec in d_selected]
+            filtered_seqs = [rec for _, rec in u_selected] + [rec for _, rec in i_selected] + [rec for _, rec in d_selected]
 
             # Fallback: if nothing matched the U/D pattern, revert to first-N behavior
             if not filtered_seqs:
@@ -383,7 +469,7 @@ def filter_flanking_proteins(flanking_file, locus_id, output_dir, closest_each_s
         print(f"    ERROR filtering flanking proteins: {e}")
         return None
 
-def process_locus(locus_id, flanking_file, genome_dbs, output_dir, evalue="1e-5", max_targets=50, threads=16, max_gap_kb=500, max_span_kb=MAX_BLOCK_SPAN_KB, closest_each_side=None):
+def process_locus(locus_id, flanking_file, genome_dbs, output_dir, evalue="1e-5", max_targets=50, threads=16, max_gap_kb=500, max_span_kb=MAX_BLOCK_SPAN_KB, closest_each_side=None, closest_internal=None):
     """Process synteny detection for one locus."""
 
     print(f"\n  Processing {locus_id}...")
@@ -394,7 +480,7 @@ def process_locus(locus_id, flanking_file, genome_dbs, output_dir, evalue="1e-5"
         return []
 
     # Filter flanking proteins to top N for efficiency
-    filtered_flanking = filter_flanking_proteins(flanking_file, locus_id, output_dir, closest_each_side=closest_each_side)
+    filtered_flanking = filter_flanking_proteins(flanking_file, locus_id, output_dir, closest_each_side=closest_each_side, closest_internal=closest_internal)
     if filtered_flanking is None:
         print(f"    ERROR: Failed to filter flanking proteins")
         return []
@@ -499,6 +585,8 @@ def parse_args():
                         help='Number of BLAST threads (default: 16)')
     parser.add_argument('--closest-each-side', type=int,
                         help='Use only the closest K flanking proteins upstream (U1..UK) and downstream (D1..DK)')
+    parser.add_argument('--closest-internal', type=int, default=5,
+                        help='If using --closest-each-side, also include the closest I anchors inside the cluster (I1..Ii). Default: 5 (0 disables).')
     parser.add_argument('--locus', type=str,
                         help='Process only this specific locus (for SLURM arrays)')
 
@@ -522,7 +610,10 @@ def main():
     print(f"  Max span: {args.max_span_kb} kb")
     print(f"  Threads: {args.threads}")
     if args.closest_each_side is not None:
-        print(f"  Closest flanking per side: U1..U{args.closest_each_side}, D1..D{args.closest_each_side}")
+        if args.closest_internal and args.closest_internal > 0:
+            print(f"  Closest flanking: U1..U{args.closest_each_side}, I1..I{args.closest_internal}, D1..D{args.closest_each_side}")
+        else:
+            print(f"  Closest flanking per side: U1..U{args.closest_each_side}, D1..D{args.closest_each_side}")
 
     # Create output directory
     args.output_dir.mkdir(exist_ok=True, parents=True)
@@ -559,7 +650,8 @@ def main():
         locus_blocks = process_locus(
             locus_id, flanking_file, genome_dbs, args.output_dir,
             args.evalue, args.max_targets, args.threads, args.max_gap_kb, args.max_span_kb,
-            closest_each_side=args.closest_each_side
+            closest_each_side=args.closest_each_side,
+            closest_internal=args.closest_internal
         )
         all_blocks.extend(locus_blocks)
 
