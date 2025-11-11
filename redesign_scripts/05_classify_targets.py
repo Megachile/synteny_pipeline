@@ -187,6 +187,17 @@ def main():
                                   nearby_upper_kb=args.nearby_upper_kb,
                                   base_segment_gap_kb=args.segment_gap_kb)
 
+    # Add locus_name column for compatibility with legacy matrix scripts
+    classified['locus_name'] = classified['locus_id']
+
+    # Add gene_family column for compatibility with legacy matrix scripts
+    if locus_defs is not None and 'gene_family' in locus_defs.columns:
+        family_map = {str(r['locus_id']): str(r['gene_family']) for _, r in locus_defs.iterrows()}
+        classified['gene_family'] = classified['locus_id'].astype(str).map(family_map)
+    else:
+        # Fallback: infer from output directory path or use 'unknown'
+        classified['gene_family'] = 'unknown'
+
     all_out = args.output_dir / 'all_targets_classified.tsv'
     classified.to_csv(all_out, sep='\t', index=False)
 
