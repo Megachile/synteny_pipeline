@@ -299,6 +299,10 @@ def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_d
     all_genomes.update(species_map.keys())
 
     for genome in all_genomes:
+        # Skip GCA_010883055.1 - old Belonocnema kinseyi entry replaced by Belonocnema_kinseyi_GCF
+        if genome == 'GCA_010883055.1':
+            continue
+
         row = OrderedDict()
 
         # Metadata
