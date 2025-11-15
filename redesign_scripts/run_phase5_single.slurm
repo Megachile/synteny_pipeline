@@ -28,7 +28,7 @@ fi
 
 IN_T=outputs/${FAMILY}/phase4_v2/all_target_loci.tsv
 IN_B=outputs/${FAMILY}/phase3_v2/all_synteny_blocks_ge3.tsv
-OUT=outputs/${FAMILY}/phase5_v2_nearby${NEARBY}
+OUT=outputs/${FAMILY}/phase5_v2
 mkdir -p "$OUT"
 
 echo "Phase 5 (test) for ${FAMILY} with nearby_upper_kb=${NEARBY}"
@@ -41,5 +41,11 @@ python redesign_scripts/05_classify_targets.py \
   --rescue-same-scaffold \
   --rescue-upper-kb 350 \
   --rescue-min-evalue 1e-50
+
+# Create descriptive symlink for reference
+SYMLINK=outputs/${FAMILY}/phase5_v2_nearby${NEARBY}
+if [ ! -e "$SYMLINK" ]; then
+  ln -s phase5_v2 "$SYMLINK"
+fi
 
 echo "Done Phase 5 test for ${FAMILY}"
