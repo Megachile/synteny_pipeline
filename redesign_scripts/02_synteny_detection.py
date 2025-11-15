@@ -393,18 +393,29 @@ def process_locus(row: pd.Series, genome_dbs: dict[str, Path], out_dir: Path,
     flanking_file = Path(row['flanking_file'])
     expected_chr = str(row.get('expected_chromosome', '') or '')
     locus_scale = float(row.get('locus_scale', 1.0) or 1.0)
+    flanking_span_kb = row.get('flanking_span_kb', None)
 
-    # Scaled parameters (with caps)
-    def scale(v: int, lo: int, hi: int) -> int:
-        return max(lo, min(hi, int(round(v * locus_scale))))
+    # Use data-driven parameters from Phase 1 if available (Balanced formula)
+    if flanking_span_kb is not None and not pd.isna(flanking_span_kb) and flanking_span_kb > 0:
+        max_gap_kb = int(flanking_span_kb / 2.5)
+        max_span_kb = int(flanking_span_kb * 1.1)
+        merge_gap_kb = int(flanking_span_kb / 5)  # More conservative for merging
+        merge_span_kb = int(flanking_span_kb * 1.3)
+        param_source = "data-driven"
+    else:
+        # Fallback to scaled parameters (with caps) if flanking_span_kb not available
+        def scale(v: int, lo: int, hi: int) -> int:
+            return max(lo, min(hi, int(round(v * locus_scale))))
 
-    max_gap_kb = scale(base_max_gap_kb, 100, 1000)
-    max_span_kb = scale(base_max_span_kb, 300, 1500)
-    merge_gap_kb = scale(base_merge_gap_kb, 10, 200)
-    merge_span_kb = scale(base_merge_span_kb, 400, 2000)
+        max_gap_kb = scale(base_max_gap_kb, 100, 1000)
+        max_span_kb = scale(base_max_span_kb, 300, 1500)
+        merge_gap_kb = scale(base_merge_gap_kb, 10, 200)
+        merge_span_kb = scale(base_merge_span_kb, 400, 2000)
+        param_source = "scaled"
+
     max_targets = max(50, int(round(base_max_targets * locus_scale)))
 
-    print(f"  {locus_id}: scale={locus_scale:.2f} gap={max_gap_kb}kb span={max_span_kb}kb merge_gap={merge_gap_kb}kb merge_span={merge_span_kb}kb targets={max_targets}")
+    print(f"  {locus_id}: {param_source} gap={max_gap_kb}kb span={max_span_kb}kb merge_gap={merge_gap_kb}kb merge_span={merge_span_kb}kb targets={max_targets}")
 
     # Output dirs
     locus_out = out_dir / locus_id
