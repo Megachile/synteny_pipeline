@@ -420,11 +420,13 @@ def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_d
                 if length > 0:
                     status_letter = 'I' if status == 'intact' else 'F' if status == 'fragment' else 'P'
                     parts.append(f"{length}{status_letter}")
-            # For any additional targets without extracted meta, show generic hits
-            extra = max(0, len(genome_targets) - (1 if parts else 0))
-            if extra > 0:
-                parts.extend(["hit"] * extra)
-            row['TARGET'] = f"{gene_family} [{'; '.join(parts)}]" if parts else f"{gene_family} [hit]"
+
+            # Only add generic "hit" if no metadata found (not extracted)
+            if not parts:
+                # No extraction metadata - show generic hit(s)
+                parts.extend(["hit"] * len(genome_targets))
+
+            row['TARGET'] = f"{gene_family} [{'; '.join(parts)}]"
         else:
             if not genome_block.empty:
                 # Synteny block exists but no target found
