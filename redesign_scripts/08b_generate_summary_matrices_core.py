@@ -278,12 +278,12 @@ def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_bl
         genome_targets_all = targets_by_genome.get(genome, [])
         genome_targets = dedup_targets(genome_targets_all, unplaceable_col)
 
-        # Initialize all columns with "0%" (no synteny)
+        # Initialize all columns
         for category in locus_categories:
-            if category.endswith('_near_block') or category.endswith('_confidently_distinct'):
-                row[category] = ""  # Unplaceable categories are special
+            if category.endswith('_unplaceable'):
+                row[category] = ""  # Unplaceable columns don't have synteny percentages
             else:
-                row[category] = "0%"
+                row[category] = ""  # Empty by default; filled in if synteny block exists
 
         # Fill in target counts
         category_counts = defaultdict(list)
@@ -354,9 +354,11 @@ def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_bl
         # For loci where this genome has a synteny block but no extracted target
         if genome in synteny_by_genome_locus:
             for locus, synteny_pct in synteny_by_genome_locus[genome].items():
-                if locus in row and row[locus] == "0%":
+                if locus in row and row[locus] == "":
                     # Synteny block exists but no target found/extracted
-                    row[locus] = f"{synteny_pct}% [empty]"
+                    if synteny_pct > 0:
+                        row[locus] = f"{synteny_pct}% [empty]"
+                    # If synteny_pct is 0, leave it empty - no block found
 
         # Add total count (only successfully extracted targets)
         row['total'] = sum(len(targets) for targets in category_counts.values())
