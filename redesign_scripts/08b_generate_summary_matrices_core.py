@@ -297,12 +297,17 @@ def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_bl
             if placement == 'unplaceable':
                 assigned_to = unplaceable_col
 
-            # Get metadata from extracted sequences for syntenic targets only.
-            # For unplaceables, do not inherit syntenic lengths, as that creates false duplicates.
+            # Get metadata from extracted sequences
             if placement == 'unplaceable':
-                meta = {}
-                length = 0
-                status = 'unknown'
+                # For unplaceables, construct unique_tag: scaffold_start_end
+                scaf = str(target.get('scaffold'))
+                start = str(target.get('start'))
+                end = str(target.get('end'))
+                unique_tag = f"{scaf}_{start}_{end}"
+                lookup_key = (target.get('genome'), unique_tag)
+                meta = seq_metadata.get(lookup_key, {})
+                length = meta.get('length_aa', 0)
+                status = meta.get('status', 'unknown')
             else:
                 # Look up extracted sequence metadata strictly by (genome, assigned locus)
                 # Do not fall back to parent_locus; if missing, record as generic hit.
@@ -311,9 +316,10 @@ def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_bl
                 length = meta.get('length_aa', 0)
                 status = meta.get('status', 'unknown')
 
-            # Skip syntenic targets that failed extraction
-            # But keep unplaceable targets (they aren't extracted)
-            if length == 0 and placement != 'unplaceable':
+            # Skip targets that failed extraction (both syntenic and unplaceable)
+            # Only keep as generic "hit" if no extraction attempted (length=0 and no metadata)
+            if length == 0 and meta:
+                # Extraction was attempted but failed
                 continue
 
             # Status letters: I=intact, P=pseudogene, F=fragment
