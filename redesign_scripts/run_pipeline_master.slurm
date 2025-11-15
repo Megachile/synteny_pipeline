@@ -137,6 +137,27 @@ NUM_LOCI=$(tail -n +2 "${PHASE1_DIR}/locus_definitions.tsv" | wc -l)
 log "✓ Phase 1 complete: ${NUM_LOCI} loci identified"
 
 ################################################################################
+# PHASE 1.5: BK-LB LOCUS UNIFICATION
+################################################################################
+log_phase "PHASE 1.5: BK-LB LOCUS UNIFICATION"
+
+LB_PROTEOME_DB="data/proteomes/GCF_019393585.1_Lboulardi_NCBI.dmnd"
+if [ -f "${LB_PROTEOME_DB}" ]; then
+    log "Merging BK and LB loci based on flanking context..."
+    python redesign_scripts/01b_merge_bk_lb_loci.py \
+        --locus-defs "${PHASE1_DIR}/locus_definitions.tsv" \
+        --lb-proteome-db "${LB_PROTEOME_DB}" \
+        --diamond-threads 8 \
+        2>&1 | tee -a logs/phase1.5_v2_${OUTPUT_DIR}.log
+
+    NUM_LOCI_MERGED=$(tail -n +2 "${PHASE1_DIR}/locus_definitions.tsv" | wc -l)
+    log "✓ Phase 1.5 complete: ${NUM_LOCI_MERGED} loci after BK-LB merge"
+    NUM_LOCI=${NUM_LOCI_MERGED}  # Update for Phase 2 array sizing
+else
+    log "⚠ Skipping Phase 1.5: LB proteome DB not found at ${LB_PROTEOME_DB}"
+fi
+
+################################################################################
 # PHASE 2: SYNTENY DETECTION (ARRAY)
 ################################################################################
 log_phase "PHASE 2: SYNTENY DETECTION (ARRAY)"
