@@ -49,7 +49,7 @@ def main():
 
     cmd = [
         sys.executable,
-        str(Path(__file__).resolve().parent.parent / 'scripts' / 'generate_summary_matrices.py'),
+        str(Path(__file__).resolve().parent / '08b_generate_summary_matrices_core.py'),
         '--locus-defs', str(locus_defs),
         '--blocks', str(blocks),
         '--targets', str(targets),

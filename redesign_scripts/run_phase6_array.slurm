@@ -98,7 +98,7 @@ mkdir -p "${OUT_DIR}"
 
 # Run extraction with the same script used in working flow
 echo "Running Phase 6 extraction (exonerate)..."
-CMD=( python scripts/extract_sequences.py \
+CMD=( python redesign_scripts/06_extract_sequences.py \
     --syntenic "${SYNTENIC_TSV}" \
     --query-proteins "${COMBINED_TARGETS}" \
     --genome-fasta-dir "${GENOME_DIR}" \

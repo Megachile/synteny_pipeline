@@ -80,7 +80,7 @@ def main():
 
     cmd = [
         sys.executable,
-        str(Path(__file__).resolve().parent.parent / 'scripts' / 'generate_locus_matrices.py'),
+        str(Path(__file__).resolve().parent / '08a_generate_locus_matrices_core.py'),
         '--locus-defs', str(locus_defs),
         '--synteny-dir', str(synteny_dir),
         '--blocks', str(blocks),

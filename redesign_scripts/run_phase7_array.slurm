@@ -112,7 +112,7 @@ fi
 LOCI=$(awk 'NR>1{print $1}' "${LOCUS_DEFS}")
 for L in ${LOCI}; do
   echo "Annotating locus: ${L}"
-  python scripts/annotate_swissprot.py \
+  python redesign_scripts/07_annotate_swissprot.py \
     --synteny-dir "${PHASE2_DIR}" \
     --filtered-blocks "${FILTERED}" \
     --swissprot-db "${SWISSPROT_DB}" \
