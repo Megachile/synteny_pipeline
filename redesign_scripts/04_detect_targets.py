@@ -39,6 +39,7 @@ PARALOG_COVERAGE_THRESHOLD = 1.2   # >120% union coverage → distinct paralog
 MIN_CLUSTER_COVERAGE = 0.5         # keep clusters with ≥50% coverage
 MAX_GAP_KB = 20.0                  # Split if gap > 20kb (separates tandem copies)
 QUERY_OVERLAP_THRESHOLD = 0.5      # Query overlap >50% of shorter HSP → tandem copy
+MAX_CLUSTER_SPAN_KB = 500.0        # Hard split if cluster span > 500kb (prevents mega-gene blobs)
 
 
 def run_tblastn(
@@ -255,6 +256,7 @@ def cluster_hsps_per_query(
     paralog_coverage_threshold: float = PARALOG_COVERAGE_THRESHOLD,
     min_cluster_coverage: float = MIN_CLUSTER_COVERAGE,
     query_overlap_threshold: float = QUERY_OVERLAP_THRESHOLD,
+    max_cluster_span_kb: float = MAX_CLUSTER_SPAN_KB,
 ) -> List[Dict]:
     """
     Cluster HSPs for a SINGLE query into gene candidates.
@@ -328,6 +330,19 @@ def cluster_hsps_per_query(
                 if has_substantial_query_overlap:
                     # This HSP substantially overlaps same query region as existing HSP
                     # → Different genomic copy → Start new gene
+                    break
+
+                # Safety valve: Check if adding this HSP would create unreasonably large cluster
+                # This prevents "mega-gene blobs" from repetitive/unstructured proteins (e.g., Glutenin)
+                # Only applies when other filters (gap, query overlap, coverage) fail to split
+                cluster_start = min(h["genomic_start"] for h in current)
+                cluster_end = max(h["genomic_end"] for h in current)
+                potential_span = max(nxt["genomic_end"], cluster_end) - min(nxt["genomic_start"], cluster_start)
+                potential_span_kb = potential_span / 1000.0
+
+                if potential_span_kb > MAX_CLUSTER_SPAN_KB:
+                    # Cluster would span >500kb - force split to prevent mega-genes
+                    # This is a safety valve for pathological cases where normal filters fail
                     break
 
                 # Check coverage for THIS query
@@ -509,45 +524,46 @@ def calibrate_threshold(
     phase1_dir: Path,
     blast_xml_dir: Path,
     default_threshold: float = QUERY_OVERLAP_THRESHOLD,
-) -> float:
-    """Auto-calibrate query overlap threshold using BK ground truth.
+) -> tuple[float, float]:
+    """Auto-calibrate query overlap threshold and min coverage using BK ground truth.
 
     Tests multiple thresholds on BK genome and selects the one that best
-    matches Phase 1 BK gene count.
+    matches Phase 1 BK gene count. If recovery is poor (<80%), retries with
+    lower min_cluster_coverage to handle fragmentary HSPs (unstructured proteins).
 
     Returns:
-        Calibrated threshold (or default if calibration fails)
+        (calibrated_query_overlap_threshold, calibrated_min_coverage)
     """
     print()
     print("=" * 80)
-    print("AUTO-CALIBRATING QUERY OVERLAP THRESHOLD")
+    print("AUTO-CALIBRATING CLUSTERING PARAMETERS")
     print("=" * 80)
 
     # Count Phase 1 BK targets (ground truth)
     phase1_bk_count = count_phase1_bk_targets(phase1_dir)
 
     if phase1_bk_count == 0:
-        print("  No BK genes in Phase 1 - using default threshold")
-        print(f"  → Default threshold: {default_threshold}")
-        return default_threshold
+        print("  No BK genes in Phase 1 - using default parameters")
+        print(f"  → Defaults: query_overlap={default_threshold}, min_coverage={MIN_CLUSTER_COVERAGE}")
+        return (default_threshold, MIN_CLUSTER_COVERAGE)
 
     print(f"  Phase 1 BK ground truth: {phase1_bk_count} genes")
 
     # Find BK BLAST XML
     bk_xml = find_bk_blast_xml(blast_xml_dir)
     if not bk_xml:
-        print("  No BK BLAST results found - using default threshold")
-        print(f"  → Default threshold: {default_threshold}")
-        return default_threshold
+        print("  No BK BLAST results found - using default parameters")
+        print(f"  → Defaults: query_overlap={default_threshold}, min_coverage={MIN_CLUSTER_COVERAGE}")
+        return (default_threshold, MIN_CLUSTER_COVERAGE)
 
     print(f"  BK BLAST XML: {bk_xml.name}")
     print()
 
-    # Test thresholds
+    # Test thresholds with default min_cluster_coverage
     test_thresholds = [0.1, 0.2, 0.3, 0.5, 0.7]
     results = []
 
-    print("  Testing thresholds on BK genome:")
+    print("  Testing query overlap thresholds (min_coverage=0.5):")
     for threshold in test_thresholds:
         # Parse BLAST XML
         hsps = parse_blast_xml_with_query_coords(bk_xml)
@@ -556,25 +572,67 @@ def calibrate_threshold(
         clusters = cluster_hsps_greedy(
             hsps,
             query_overlap_threshold=threshold,
+            min_cluster_coverage=MIN_CLUSTER_COVERAGE,
         )
 
         bk_count = len(clusters)
         diff = abs(bk_count - phase1_bk_count)
-        results.append((threshold, bk_count, diff))
+        recovery_pct = (bk_count / phase1_bk_count) * 100 if phase1_bk_count > 0 else 0
+        results.append((threshold, MIN_CLUSTER_COVERAGE, bk_count, diff, recovery_pct))
 
         status = "✓" if diff == 0 else f"±{diff}"
-        print(f"    Threshold {threshold:.1f}: {bk_count} BK genes ({status})")
+        print(f"    Threshold {threshold:.1f}: {bk_count} genes ({recovery_pct:.0f}% recovery, {status})")
 
     # Select best threshold (minimum difference from Phase 1)
-    best = min(results, key=lambda x: x[2])
+    best = min(results, key=lambda x: x[3])
+    best_recovery_pct = best[4]
+
+    # If recovery is poor (<80%), retry with lower min_cluster_coverage
+    # This handles unstructured proteins with fragmentary HSPs (e.g., Glutenin)
+    if best_recovery_pct < 80:
+        print()
+        print(f"  ⚠️  Low recovery ({best_recovery_pct:.0f}%) - retrying with lower min_coverage=0.3")
+        print(f"     (handles fragmentary HSPs from unstructured proteins)")
+        print()
+
+        lower_cov_results = []
+        print("  Testing query overlap thresholds (min_coverage=0.3):")
+        for threshold in test_thresholds:
+            hsps = parse_blast_xml_with_query_coords(bk_xml)
+            clusters = cluster_hsps_greedy(
+                hsps,
+                query_overlap_threshold=threshold,
+                min_cluster_coverage=0.3,  # Lower threshold
+            )
+
+            bk_count = len(clusters)
+            diff = abs(bk_count - phase1_bk_count)
+            recovery_pct = (bk_count / phase1_bk_count) * 100 if phase1_bk_count > 0 else 0
+            lower_cov_results.append((threshold, 0.3, bk_count, diff, recovery_pct))
+
+            status = "✓" if diff == 0 else f"±{diff}"
+            print(f"    Threshold {threshold:.1f}: {bk_count} genes ({recovery_pct:.0f}% recovery, {status})")
+
+        # Select best from lower coverage results
+        best_lower_cov = min(lower_cov_results, key=lambda x: x[3])
+
+        # Use lower coverage if it improves recovery
+        if best_lower_cov[3] < best[3]:  # Better (smaller diff)
+            best = best_lower_cov
+            print()
+            print(f"  ✓ Lower min_coverage improved recovery!")
+
     calibrated_threshold = best[0]
+    calibrated_min_coverage = best[1]
 
     print()
-    print(f"  → Calibrated threshold: {calibrated_threshold:.1f}")
-    print(f"    (matches Phase 1 with {best[1]} genes, diff={best[2]})")
+    print(f"  → Calibrated parameters:")
+    print(f"     query_overlap_threshold: {calibrated_threshold:.1f}")
+    print(f"     min_cluster_coverage: {calibrated_min_coverage:.1f}")
+    print(f"     BK recovery: {best[2]}/{phase1_bk_count} genes ({best[4]:.0f}%)")
     print()
 
-    return calibrated_threshold
+    return (calibrated_threshold, calibrated_min_coverage)
 
 
 def parse_args() -> argparse.Namespace:
@@ -694,15 +752,17 @@ def main() -> None:
     print(f"[2] Found {len(genome_dbs)} genome databases")
     print()
 
-    # Determine query overlap threshold (calibrate or use fixed)
+    # Determine query overlap threshold and min_coverage (calibrate or use fixed)
     if args.query_overlap_threshold is not None:
         # User specified threshold explicitly
         final_threshold = args.query_overlap_threshold
-        print(f"Using user-specified threshold: {final_threshold}")
+        final_min_coverage = MIN_CLUSTER_COVERAGE
+        print(f"Using user-specified parameters: query_overlap={final_threshold}, min_coverage={final_min_coverage}")
     elif args.disable_calibration:
-        # Calibration disabled, use default
+        # Calibration disabled, use defaults
         final_threshold = QUERY_OVERLAP_THRESHOLD
-        print(f"Auto-calibration disabled, using default threshold: {final_threshold}")
+        final_min_coverage = MIN_CLUSTER_COVERAGE
+        print(f"Auto-calibration disabled, using defaults: query_overlap={final_threshold}, min_coverage={final_min_coverage}")
     else:
         # Auto-calibrate using BK ground truth
         # First, run BLAST for BK genome if needed
@@ -728,8 +788,8 @@ def main() -> None:
                 )
                 print(" done" if ok else " FAILED")
 
-        # Calibrate threshold
-        final_threshold = calibrate_threshold(
+        # Calibrate threshold and min_coverage
+        final_threshold, final_min_coverage = calibrate_threshold(
             args.phase1_dir,
             blast_dir,
             default_threshold=QUERY_OVERLAP_THRESHOLD,
@@ -767,7 +827,7 @@ def main() -> None:
         clusters = cluster_hsps_greedy(
             hsps,
             paralog_coverage_threshold=PARALOG_COVERAGE_THRESHOLD,
-            min_cluster_coverage=MIN_CLUSTER_COVERAGE,
+            min_cluster_coverage=final_min_coverage,
             query_overlap_threshold=final_threshold,
         )
 
