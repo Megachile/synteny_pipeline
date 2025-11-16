@@ -164,17 +164,55 @@ def calculate_union_query_coverage(hsps: List[Dict]) -> float:
     return total / float(qlen)
 
 
-def summarize_cluster(hsps: List[Dict]) -> Dict:
-    """Summarize a cluster of HSPs belonging to one query/scaffold/strand."""
+def calculate_cumulative_query_coverage(hsps: List[Dict]) -> float:
+    """
+    Calculate cumulative coverage across potentially multiple queries.
+
+    For tandem duplicates, HSPs from different queries may appear in the same
+    cluster. We calculate the sum of each query's individual coverage:
+
+    cumulative_cov = coverage(queryA) + coverage(queryB) + ...
+
+    Example: If queryA covers 40% and queryB covers 60%, cumulative = 1.0
+    This represents "1.0 query equivalents" worth of coverage.
+    """
+    if not hsps:
+        return 0.0
+
+    # Group HSPs by query_id and calculate coverage for each query
+    query_coverages: Dict[str, float] = {}
+
+    for query_id in set(h["query_id"] for h in hsps):
+        query_hsps = [h for h in hsps if h["query_id"] == query_id]
+        query_coverages[query_id] = calculate_union_query_coverage(query_hsps)
+
+    # Return sum of all query coverages
+    return sum(query_coverages.values())
+
+
+def summarize_cluster_multi_query(hsps: List[Dict]) -> Dict:
+    """
+    Summarize a cluster that may contain HSPs from multiple queries (tandem duplicates).
+
+    For multi-query clusters, we pick the query with the best bitscore as the
+    representative, but report all contributing queries.
+    """
     g_start = min(h["genomic_start"] for h in hsps)
     g_end = max(h["genomic_end"] for h in hsps)
     span_kb = (g_end - g_start) / 1000.0
 
-    combined_cov = calculate_union_query_coverage(hsps)
+    # Calculate cumulative coverage across all queries
+    cumulative_cov = calculate_cumulative_query_coverage(hsps)
 
-    q_start_min = min(h["query_start"] for h in hsps)
-    q_end_max = max(h["query_end"] for h in hsps)
-    qlen = hsps[0].get("query_length", 0) or 0
+    # Pick the query with the best bitscore as representative
+    best_hsp = max(hsps, key=lambda h: h["bitscore"])
+    representative_query = best_hsp["query_id"]
+
+    # Get query-specific stats for the representative
+    rep_hsps = [h for h in hsps if h["query_id"] == representative_query]
+    q_start_min = min(h["query_start"] for h in rep_hsps)
+    q_end_max = max(h["query_end"] for h in rep_hsps)
+    qlen = rep_hsps[0].get("query_length", 0) or 0
     if qlen > 0:
         q_span_cov = (q_end_max - q_start_min + 1) / float(qlen)
     else:
@@ -183,8 +221,11 @@ def summarize_cluster(hsps: List[Dict]) -> Dict:
     best_evalue = min(h["evalue"] for h in hsps)
     best_bitscore = max(h["bitscore"] for h in hsps)
 
+    # List all contributing queries
+    contributing_queries = sorted(set(h["query_id"] for h in hsps))
+
     return {
-        "query_id": hsps[0]["query_id"],
+        "query_id": representative_query,
         "scaffold": hsps[0]["scaffold"],
         "strand": hsps[0]["strand"],
         "genomic_start": g_start,
@@ -193,11 +234,18 @@ def summarize_cluster(hsps: List[Dict]) -> Dict:
         "query_start_min": q_start_min,
         "query_end_max": q_end_max,
         "query_span_coverage": q_span_cov,
-        "combined_query_coverage": combined_cov,
+        "combined_query_coverage": cumulative_cov,  # Now cumulative across queries!
         "num_hsps": len(hsps),
+        "num_queries": len(contributing_queries),
+        "contributing_queries": ",".join(contributing_queries),
         "best_evalue": best_evalue,
         "best_bitscore": best_bitscore,
     }
+
+
+def summarize_cluster(hsps: List[Dict]) -> Dict:
+    """Legacy function - redirect to multi-query version."""
+    return summarize_cluster_multi_query(hsps)
 
 
 def cluster_hsps_greedy(
@@ -206,19 +254,27 @@ def cluster_hsps_greedy(
     min_cluster_coverage: float = MIN_CLUSTER_COVERAGE,
 ) -> List[Dict]:
     """
-    Cluster HSPs using greedy expansion based on UNION query coverage.
+    Cluster HSPs using greedy expansion based on cumulative query coverage.
 
-    For each (query_id, scaffold, strand):
-      1. Sort HSPs by genomic_start.
+    CRITICAL: Groups by (scaffold, strand) FIRST, not by query_id.
+    This prevents tandem duplicates from being collapsed into one giant cluster.
+
+    For each (scaffold, strand):
+      1. Sort ALL HSPs by genomic_start (regardless of query).
       2. Greedily add consecutive HSPs as long as:
-         - combined coverage <= paralog_coverage_threshold
+         - cumulative coverage across ALL queries <= paralog_coverage_threshold
          - gap between last and next HSP <= MAX_GAP_KB
       3. When either condition fails, finalize current cluster and start a new one.
       4. Keep clusters with combined coverage >= min_cluster_coverage.
 
-    Note: this is per-query clustering. If multiple queries hit the same gene,
-    that shows up as multiple rows with overlapping coordinates and different
-    query_ids; cross-query dedup can be handled later (Phase 5).
+    Cumulative coverage calculation:
+      - Track each query's contribution independently
+      - Sum: coverage_queryA + coverage_queryB + ...
+      - Example: 40% of queryA + 60% of queryB = 1.0 "query equivalents"
+      - Stop when cumulative > paralog_coverage_threshold (default 1.2)
+
+    This correctly handles tandem duplicates by treating each ~100% region as
+    a separate gene, even when multiple queries match the same array.
     """
     if not hsps:
         return []
@@ -226,40 +282,45 @@ def cluster_hsps_greedy(
     df = pd.DataFrame(hsps)
     out: List[Dict] = []
 
-    for _, q_group in df.groupby("query_id"):
-        for (scaffold, strand), sg in q_group.groupby(["scaffold", "strand"]):
-            sg_sorted = sg.sort_values("genomic_start").reset_index(drop=True)
-            used: set[int] = set()
+    # Group by genomic location FIRST (not by query!)
+    for (scaffold, strand), group in df.groupby(["scaffold", "strand"]):
+        sg_sorted = group.sort_values("genomic_start").reset_index(drop=True)
+        used: set[int] = set()
 
-            for start_idx in range(len(sg_sorted)):
-                if start_idx in used:
+        for start_idx in range(len(sg_sorted)):
+            if start_idx in used:
+                continue
+
+            current = [sg_sorted.iloc[start_idx].to_dict()]
+            used.add(start_idx)
+
+            for next_idx in range(start_idx + 1, len(sg_sorted)):
+                if next_idx in used:
                     continue
 
-                current = [sg_sorted.iloc[start_idx].to_dict()]
-                used.add(start_idx)
+                nxt = sg_sorted.iloc[next_idx].to_dict()
+                gap_bp = nxt["genomic_start"] - current[-1]["genomic_end"]
+                gap_kb = gap_bp / 1000.0
 
-                for next_idx in range(start_idx + 1, len(sg_sorted)):
-                    if next_idx in used:
-                        continue
+                # Check gap threshold
+                if gap_kb > MAX_GAP_KB:
+                    break
 
-                    nxt = sg_sorted.iloc[next_idx].to_dict()
-                    gap_bp = nxt["genomic_start"] - current[-1]["genomic_end"]
-                    gap_kb = gap_bp / 1000.0
+                # Calculate cumulative coverage across ALL queries
+                test_cluster = current + [nxt]
+                test_cov = calculate_cumulative_query_coverage(test_cluster)
 
-                    test_cluster = current + [nxt]
-                    test_cov = calculate_union_query_coverage(test_cluster)
+                # Stop if we exceed paralog threshold
+                if test_cov > paralog_coverage_threshold:
+                    break
 
-                    if test_cov > paralog_coverage_threshold:
-                        break
-                    if gap_kb > MAX_GAP_KB:
-                        break
+                current.append(nxt)
+                used.add(next_idx)
 
-                    current.append(nxt)
-                    used.add(next_idx)
-
-                cov = calculate_union_query_coverage(current)
-                if cov >= min_cluster_coverage:
-                    out.append(summarize_cluster(current))
+            # Finalize cluster if it meets minimum coverage
+            cov = calculate_cumulative_query_coverage(current)
+            if cov >= min_cluster_coverage:
+                out.append(summarize_cluster_multi_query(current))
 
     return out
 
