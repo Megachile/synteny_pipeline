@@ -587,40 +587,84 @@ def calibrate_threshold(
     best = min(results, key=lambda x: x[3])
     best_recovery_pct = best[4]
 
-    # If recovery is poor (<80%), retry with lower min_cluster_coverage
-    # This handles unstructured proteins with fragmentary HSPs (e.g., Glutenin)
+    # STAGED CALIBRATION: Progressively relax min_coverage only when needed
+    # Stage 1 (above): min_coverage=0.5 (normal, conservative)
+    # Stage 2 (below): min_coverage=0.3 if recovery <80% (fragmentary HSPs)
+    # Stage 3 (below): min_coverage=0.1 if still <80% (extreme cases like Glutenin)
+
+    # Stage 2: If recovery is poor (<80%), retry with lower min_cluster_coverage
     if best_recovery_pct < 80:
         print()
         print(f"  ⚠️  Low recovery ({best_recovery_pct:.0f}%) - retrying with lower min_coverage=0.3")
         print(f"     (handles fragmentary HSPs from unstructured proteins)")
         print()
 
-        lower_cov_results = []
+        stage2_results = []
         print("  Testing query overlap thresholds (min_coverage=0.3):")
         for threshold in test_thresholds:
             hsps = parse_blast_xml_with_query_coords(bk_xml)
             clusters = cluster_hsps_greedy(
                 hsps,
                 query_overlap_threshold=threshold,
-                min_cluster_coverage=0.3,  # Lower threshold
+                min_cluster_coverage=0.3,
             )
 
             bk_count = len(clusters)
             diff = abs(bk_count - phase1_bk_count)
             recovery_pct = (bk_count / phase1_bk_count) * 100 if phase1_bk_count > 0 else 0
-            lower_cov_results.append((threshold, 0.3, bk_count, diff, recovery_pct))
+            stage2_results.append((threshold, 0.3, bk_count, diff, recovery_pct))
 
             status = "✓" if diff == 0 else f"±{diff}"
             print(f"    Threshold {threshold:.1f}: {bk_count} genes ({recovery_pct:.0f}% recovery, {status})")
 
-        # Select best from lower coverage results
-        best_lower_cov = min(lower_cov_results, key=lambda x: x[3])
+        # Select best from stage 2
+        best_stage2 = min(stage2_results, key=lambda x: x[3])
 
-        # Use lower coverage if it improves recovery
-        if best_lower_cov[3] < best[3]:  # Better (smaller diff)
-            best = best_lower_cov
+        # Use stage 2 if it improves recovery
+        if best_stage2[3] < best[3]:
+            best = best_stage2
             print()
-            print(f"  ✓ Lower min_coverage improved recovery!")
+            print(f"  ✓ min_coverage=0.3 improved recovery!")
+
+        # Stage 3: If STILL <80%, try even lower min_coverage=0.1 (extreme cases)
+        stage2_recovery = best[4]
+        if stage2_recovery < 80:
+            print()
+            print(f"  ⚠️  Still low recovery ({stage2_recovery:.0f}%) - retrying with min_coverage=0.1")
+            print(f"     (extreme fallback for highly fragmentary proteins)")
+            print()
+
+            stage3_results = []
+            print("  Testing query overlap thresholds (min_coverage=0.1):")
+            for threshold in test_thresholds:
+                hsps = parse_blast_xml_with_query_coords(bk_xml)
+                clusters = cluster_hsps_greedy(
+                    hsps,
+                    query_overlap_threshold=threshold,
+                    min_cluster_coverage=0.1,
+                )
+
+                bk_count = len(clusters)
+                diff = abs(bk_count - phase1_bk_count)
+                recovery_pct = (bk_count / phase1_bk_count) * 100 if phase1_bk_count > 0 else 0
+                stage3_results.append((threshold, 0.1, bk_count, diff, recovery_pct))
+
+                status = "✓" if diff == 0 else f"±{diff}"
+                print(f"    Threshold {threshold:.1f}: {bk_count} genes ({recovery_pct:.0f}% recovery, {status})")
+
+            # Select best from stage 3
+            best_stage3 = min(stage3_results, key=lambda x: x[3])
+
+            # Use stage 3 if it improves recovery (AND doesn't oversplit by >20%)
+            # Oversplit check prevents false positives from excessive fragmentation
+            if best_stage3[3] < best[3] and best_stage3[4] <= 120:
+                best = best_stage3
+                print()
+                print(f"  ✓ min_coverage=0.1 improved recovery!")
+            else:
+                if best_stage3[4] > 120:
+                    print()
+                    print(f"  ⚠️  min_coverage=0.1 oversplits ({best_stage3[4]:.0f}% recovery) - keeping min_coverage={best[1]:.1f}")
 
     calibrated_threshold = best[0]
     calibrated_min_coverage = best[1]
