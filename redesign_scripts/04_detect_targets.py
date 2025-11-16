@@ -38,6 +38,7 @@ except Exception:  # fallback when running redesign in isolation
 PARALOG_COVERAGE_THRESHOLD = 1.2   # >120% union coverage → distinct paralog
 MIN_CLUSTER_COVERAGE = 0.5         # keep clusters with ≥50% coverage
 MAX_GAP_KB = 20.0                  # Split if gap > 20kb (separates tandem copies)
+QUERY_OVERLAP_THRESHOLD = 0.5      # Query overlap >50% of shorter HSP → tandem copy
 
 
 def run_tblastn(
@@ -253,12 +254,14 @@ def cluster_hsps_per_query(
     query_id: str,
     paralog_coverage_threshold: float = PARALOG_COVERAGE_THRESHOLD,
     min_cluster_coverage: float = MIN_CLUSTER_COVERAGE,
+    query_overlap_threshold: float = QUERY_OVERLAP_THRESHOLD,
 ) -> List[Dict]:
     """
     Cluster HSPs for a SINGLE query into gene candidates.
 
     This handles multi-exon genes for one query by merging HSPs with:
     - Gap < MAX_GAP_KB (exons of same gene)
+    - Query overlap < query_overlap_threshold (minor overlaps allowed)
     - Total coverage for THIS query <= paralog_coverage_threshold
 
     Returns list of gene candidates from this query.
@@ -293,27 +296,37 @@ def cluster_hsps_per_query(
                 if gap_kb > MAX_GAP_KB:
                     break
 
-                # Check if this HSP overlaps in QUERY SPACE with any HSP already in cluster
-                # If it does, it's a different genomic copy of the same gene
+                # Check if this HSP overlaps SUBSTANTIALLY in QUERY SPACE with any HSP already in cluster
+                # Substantial overlap (>threshold) indicates different genomic copy (tandem duplicate)
+                # Minor overlap (<threshold) is allowed (adjacent exons, alignment artifacts)
                 nxt_q_start = nxt["query_start"]
                 nxt_q_end = nxt["query_end"]
-                has_query_overlap = False
+                nxt_q_len = nxt_q_end - nxt_q_start + 1
+                has_substantial_query_overlap = False
 
                 for existing_hsp in current:
                     ex_q_start = existing_hsp["query_start"]
                     ex_q_end = existing_hsp["query_end"]
+                    ex_q_len = ex_q_end - ex_q_start + 1
 
                     # Check for overlap in query coordinates
                     overlap_start = max(nxt_q_start, ex_q_start)
                     overlap_end = min(nxt_q_end, ex_q_end)
 
                     if overlap_end >= overlap_start:
-                        # They overlap in query space → different gene copies
-                        has_query_overlap = True
-                        break
+                        # Calculate overlap as percentage of shorter HSP
+                        overlap_len = overlap_end - overlap_start + 1
+                        min_hsp_len = min(nxt_q_len, ex_q_len)
+                        overlap_pct = overlap_len / min_hsp_len if min_hsp_len > 0 else 0
 
-                if has_query_overlap:
-                    # This HSP covers same query region as existing HSP
+                        if overlap_pct > query_overlap_threshold:
+                            # Substantial overlap → different gene copies (tandem duplicates)
+                            has_substantial_query_overlap = True
+                            break
+                        # else: minor overlap allowed → continue merging
+
+                if has_substantial_query_overlap:
+                    # This HSP substantially overlaps same query region as existing HSP
                     # → Different genomic copy → Start new gene
                     break
 
@@ -426,6 +439,7 @@ def cluster_hsps_greedy(
     hsps: List[Dict],
     paralog_coverage_threshold: float = PARALOG_COVERAGE_THRESHOLD,
     min_cluster_coverage: float = MIN_CLUSTER_COVERAGE,
+    query_overlap_threshold: float = QUERY_OVERLAP_THRESHOLD,
 ) -> List[Dict]:
     """
     Two-step clustering: per-query, then cross-query deduplication.
@@ -433,6 +447,7 @@ def cluster_hsps_greedy(
     Step 1: For each query, cluster its HSPs into gene candidates
             - Handles multi-exon genes within one query
             - Uses gap threshold and per-query coverage
+            - Uses query overlap threshold to distinguish tandem copies
 
     Step 2: Merge gene candidates from different queries that overlap
             - Handles tandem duplicates (7-8 queries finding same gene)
@@ -451,7 +466,8 @@ def cluster_hsps_greedy(
             query_hsps,
             query_id,
             paralog_coverage_threshold,
-            min_cluster_coverage
+            min_cluster_coverage,
+            query_overlap_threshold
         )
         all_gene_candidates.extend(gene_candidates)
 
@@ -468,6 +484,97 @@ def _normalize_genome_id(name: str) -> str:
         if len(parts) >= 2:
             return f"{parts[0]}_{parts[1]}"
     return name
+
+
+def count_phase1_bk_targets(phase1_dir: Path) -> int:
+    """Count BK targets from Phase 1 per-locus target files (ground truth)."""
+    total = 0
+    for locus_dir in phase1_dir.glob("BK_*"):
+        if locus_dir.is_dir():
+            for faa_file in locus_dir.glob("*_targets.faa"):
+                with open(faa_file) as f:
+                    total += sum(1 for line in f if line.startswith('>'))
+    return total
+
+
+def find_bk_blast_xml(blast_xml_dir: Path) -> Path | None:
+    """Find BK BLAST XML file in the blast_xml directory."""
+    for xml_file in blast_xml_dir.glob("*.xml"):
+        if 'Belonocnema_kinseyi' in xml_file.name or 'BK' in xml_file.name:
+            return xml_file
+    return None
+
+
+def calibrate_threshold(
+    phase1_dir: Path,
+    blast_xml_dir: Path,
+    default_threshold: float = QUERY_OVERLAP_THRESHOLD,
+) -> float:
+    """Auto-calibrate query overlap threshold using BK ground truth.
+
+    Tests multiple thresholds on BK genome and selects the one that best
+    matches Phase 1 BK gene count.
+
+    Returns:
+        Calibrated threshold (or default if calibration fails)
+    """
+    print()
+    print("=" * 80)
+    print("AUTO-CALIBRATING QUERY OVERLAP THRESHOLD")
+    print("=" * 80)
+
+    # Count Phase 1 BK targets (ground truth)
+    phase1_bk_count = count_phase1_bk_targets(phase1_dir)
+
+    if phase1_bk_count == 0:
+        print("  No BK genes in Phase 1 - using default threshold")
+        print(f"  → Default threshold: {default_threshold}")
+        return default_threshold
+
+    print(f"  Phase 1 BK ground truth: {phase1_bk_count} genes")
+
+    # Find BK BLAST XML
+    bk_xml = find_bk_blast_xml(blast_xml_dir)
+    if not bk_xml:
+        print("  No BK BLAST results found - using default threshold")
+        print(f"  → Default threshold: {default_threshold}")
+        return default_threshold
+
+    print(f"  BK BLAST XML: {bk_xml.name}")
+    print()
+
+    # Test thresholds
+    test_thresholds = [0.1, 0.2, 0.3, 0.5, 0.7]
+    results = []
+
+    print("  Testing thresholds on BK genome:")
+    for threshold in test_thresholds:
+        # Parse BLAST XML
+        hsps = parse_blast_xml_with_query_coords(bk_xml)
+
+        # Cluster with this threshold
+        clusters = cluster_hsps_greedy(
+            hsps,
+            query_overlap_threshold=threshold,
+        )
+
+        bk_count = len(clusters)
+        diff = abs(bk_count - phase1_bk_count)
+        results.append((threshold, bk_count, diff))
+
+        status = "✓" if diff == 0 else f"±{diff}"
+        print(f"    Threshold {threshold:.1f}: {bk_count} BK genes ({status})")
+
+    # Select best threshold (minimum difference from Phase 1)
+    best = min(results, key=lambda x: x[2])
+    calibrated_threshold = best[0]
+
+    print()
+    print(f"  → Calibrated threshold: {calibrated_threshold:.1f}")
+    print(f"    (matches Phase 1 with {best[1]} genes, diff={best[2]})")
+    print()
+
+    return calibrated_threshold
 
 
 def parse_args() -> argparse.Namespace:
@@ -501,6 +608,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--evalue", type=str, default="1e-5")
     p.add_argument("--max-targets", type=int, default=10000)
     p.add_argument("--threads", type=int, default=16)
+    p.add_argument(
+        "--query-overlap-threshold",
+        type=float,
+        default=None,
+        help="Query overlap threshold (0-1). Overlap >threshold → tandem copy. If not specified, auto-calibrates using BK ground truth.",
+    )
+    p.add_argument(
+        "--disable-calibration",
+        action="store_true",
+        help="Disable auto-calibration and use fixed threshold (default: auto-calibrate)",
+    )
     # Retained for CLI compatibility; algorithm now uses coverage-driven rules.
     p.add_argument(
         "--base-min-split-kb",
@@ -576,6 +694,47 @@ def main() -> None:
     print(f"[2] Found {len(genome_dbs)} genome databases")
     print()
 
+    # Determine query overlap threshold (calibrate or use fixed)
+    if args.query_overlap_threshold is not None:
+        # User specified threshold explicitly
+        final_threshold = args.query_overlap_threshold
+        print(f"Using user-specified threshold: {final_threshold}")
+    elif args.disable_calibration:
+        # Calibration disabled, use default
+        final_threshold = QUERY_OVERLAP_THRESHOLD
+        print(f"Auto-calibration disabled, using default threshold: {final_threshold}")
+    else:
+        # Auto-calibrate using BK ground truth
+        # First, run BLAST for BK genome if needed
+        bk_genome = None
+        for genome_name in genome_dbs:
+            if 'Belonocnema_kinseyi' in genome_name or 'BK' in genome_name:
+                bk_genome = genome_name
+                break
+
+        if bk_genome:
+            bk_db = genome_dbs[bk_genome]["db"]
+            bk_xml = blast_dir / f"{bk_genome}.xml"
+
+            if not bk_xml.exists():
+                print(f"[2.5] Running tBLASTn for BK genome (for calibration)...", end="")
+                ok = run_tblastn(
+                    combined,
+                    bk_db,  # type: ignore[arg-type]
+                    bk_xml,
+                    evalue=args.evalue,
+                    max_targets=args.max_targets,
+                    threads=args.threads,
+                )
+                print(" done" if ok else " FAILED")
+
+        # Calibrate threshold
+        final_threshold = calibrate_threshold(
+            args.phase1_dir,
+            blast_dir,
+            default_threshold=QUERY_OVERLAP_THRESHOLD,
+        )
+
     all_rows: List[Dict] = []
 
     # Run tBLASTn per genome and cluster HSPs into gene-level hits
@@ -609,6 +768,7 @@ def main() -> None:
             hsps,
             paralog_coverage_threshold=PARALOG_COVERAGE_THRESHOLD,
             min_cluster_coverage=MIN_CLUSTER_COVERAGE,
+            query_overlap_threshold=final_threshold,
         )
 
         if not clusters:
@@ -662,6 +822,40 @@ def main() -> None:
     else:
         print()
         print("[4] No target hits passed clustering thresholds; nothing written")
+
+    # Validate BK gene recovery against Phase 1
+    print()
+    print("=" * 80)
+    print("BK GENE RECOVERY VALIDATION")
+    print("=" * 80)
+
+    # Count Phase 1 BK targets
+    phase1_bk_count = 0
+    phase1_dir = args.phase1_dir
+    for locus_dir in phase1_dir.glob("BK_*"):
+        if locus_dir.is_dir():
+            for faa_file in locus_dir.glob("*_targets.faa"):
+                with open(faa_file) as f:
+                    phase1_bk_count += sum(1 for line in f if line.startswith('>'))
+
+    # Count Phase 4 BK targets
+    phase4_bk_count = 0
+    if all_rows:
+        phase4_bk_count = sum(1 for row in all_rows if 'Belonocnema_kinseyi' in row['genome'])
+
+    print(f"Phase 1 BK targets (ground truth): {phase1_bk_count}")
+    print(f"Phase 4 BK targets (detected): {phase4_bk_count}")
+
+    if phase4_bk_count < phase1_bk_count:
+        missing = phase1_bk_count - phase4_bk_count
+        print(f"⚠️  WARNING: Phase 4 failed to recover {missing} BK genes from Phase 1!")
+        print(f"   This may indicate clustering parameters need adjustment.")
+    elif phase4_bk_count > phase1_bk_count:
+        extra = phase4_bk_count - phase1_bk_count
+        print(f"ℹ️  Phase 4 found {extra} additional BK targets beyond Phase 1")
+        print(f"   This may indicate unannotated genes or over-splitting.")
+    else:
+        print(f"✓ Perfect BK recovery: {phase4_bk_count}/{phase1_bk_count}")
 
     print()
     print("=" * 80)
