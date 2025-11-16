@@ -306,7 +306,30 @@ def cluster_hsps_greedy(
                 if gap_kb > MAX_GAP_KB:
                     break
 
-                # Calculate cumulative coverage across ALL queries
+                # Check if next HSP OVERLAPS with current cluster genomically
+                # If it overlaps significantly, it's the same gene copy - add regardless of coverage
+                cluster_start = min(h["genomic_start"] for h in current)
+                cluster_end = max(h["genomic_end"] for h in current)
+                nxt_start = nxt["genomic_start"]
+                nxt_end = nxt["genomic_end"]
+
+                # Calculate overlap
+                overlap_start = max(cluster_start, nxt_start)
+                overlap_end = min(cluster_end, nxt_end)
+                overlap_bp = max(0, overlap_end - overlap_start)
+
+                # If there's >50% overlap with cluster, it's the same gene - add it
+                cluster_span = cluster_end - cluster_start
+                nxt_span = nxt_end - nxt_start
+                min_span = min(cluster_span, nxt_span)
+
+                if overlap_bp > 0.5 * min_span:
+                    # Overlapping HSP - same gene copy, add regardless of coverage
+                    current.append(nxt)
+                    used.add(next_idx)
+                    continue
+
+                # Non-overlapping HSP - check cumulative coverage threshold
                 test_cluster = current + [nxt]
                 test_cov = calculate_cumulative_query_coverage(test_cluster)
 
