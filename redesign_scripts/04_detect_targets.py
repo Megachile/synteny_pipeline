@@ -37,7 +37,7 @@ except Exception:  # fallback when running redesign in isolation
 # Greedy clustering parameters (mirroring tblastn_recovery_test v4)
 PARALOG_COVERAGE_THRESHOLD = 1.2   # >120% union coverage → distinct paralog
 MIN_CLUSTER_COVERAGE = 0.5         # keep clusters with ≥50% coverage
-MAX_GAP_KB = 200.0                 # always split if gap > 200 kb
+MAX_GAP_KB = 20.0                  # Split if gap > 20kb (separates tandem copies)
 
 
 def run_tblastn(
@@ -248,33 +248,20 @@ def summarize_cluster(hsps: List[Dict]) -> Dict:
     return summarize_cluster_multi_query(hsps)
 
 
-def cluster_hsps_greedy(
+def cluster_hsps_per_query(
     hsps: List[Dict],
+    query_id: str,
     paralog_coverage_threshold: float = PARALOG_COVERAGE_THRESHOLD,
     min_cluster_coverage: float = MIN_CLUSTER_COVERAGE,
 ) -> List[Dict]:
     """
-    Cluster HSPs using greedy expansion based on cumulative query coverage.
+    Cluster HSPs for a SINGLE query into gene candidates.
 
-    CRITICAL: Groups by (scaffold, strand) FIRST, not by query_id.
-    This prevents tandem duplicates from being collapsed into one giant cluster.
+    This handles multi-exon genes for one query by merging HSPs with:
+    - Gap < MAX_GAP_KB (exons of same gene)
+    - Total coverage for THIS query <= paralog_coverage_threshold
 
-    For each (scaffold, strand):
-      1. Sort ALL HSPs by genomic_start (regardless of query).
-      2. Greedily add consecutive HSPs as long as:
-         - cumulative coverage across ALL queries <= paralog_coverage_threshold
-         - gap between last and next HSP <= MAX_GAP_KB
-      3. When either condition fails, finalize current cluster and start a new one.
-      4. Keep clusters with combined coverage >= min_cluster_coverage.
-
-    Cumulative coverage calculation:
-      - Track each query's contribution independently
-      - Sum: coverage_queryA + coverage_queryB + ...
-      - Example: 40% of queryA + 60% of queryB = 1.0 "query equivalents"
-      - Stop when cumulative > paralog_coverage_threshold (default 1.2)
-
-    This correctly handles tandem duplicates by treating each ~100% region as
-    a separate gene, even when multiple queries match the same array.
+    Returns list of gene candidates from this query.
     """
     if not hsps:
         return []
@@ -282,7 +269,7 @@ def cluster_hsps_greedy(
     df = pd.DataFrame(hsps)
     out: List[Dict] = []
 
-    # Group by genomic location FIRST (not by query!)
+    # Group by (scaffold, strand) for this query
     for (scaffold, strand), group in df.groupby(["scaffold", "strand"]):
         sg_sorted = group.sort_values("genomic_start").reset_index(drop=True)
         used: set[int] = set()
@@ -302,50 +289,176 @@ def cluster_hsps_greedy(
                 gap_bp = nxt["genomic_start"] - current[-1]["genomic_end"]
                 gap_kb = gap_bp / 1000.0
 
-                # Check gap threshold
+                # Stop if gap too large (different genes in tandem array)
                 if gap_kb > MAX_GAP_KB:
                     break
 
-                # Check if next HSP OVERLAPS with current cluster genomically
-                # If it overlaps significantly, it's the same gene copy - add regardless of coverage
-                cluster_start = min(h["genomic_start"] for h in current)
-                cluster_end = max(h["genomic_end"] for h in current)
-                nxt_start = nxt["genomic_start"]
-                nxt_end = nxt["genomic_end"]
+                # Check if this HSP overlaps in QUERY SPACE with any HSP already in cluster
+                # If it does, it's a different genomic copy of the same gene
+                nxt_q_start = nxt["query_start"]
+                nxt_q_end = nxt["query_end"]
+                has_query_overlap = False
 
-                # Calculate overlap
-                overlap_start = max(cluster_start, nxt_start)
-                overlap_end = min(cluster_end, nxt_end)
-                overlap_bp = max(0, overlap_end - overlap_start)
+                for existing_hsp in current:
+                    ex_q_start = existing_hsp["query_start"]
+                    ex_q_end = existing_hsp["query_end"]
 
-                # If there's >50% overlap with cluster, it's the same gene - add it
-                cluster_span = cluster_end - cluster_start
-                nxt_span = nxt_end - nxt_start
-                min_span = min(cluster_span, nxt_span)
+                    # Check for overlap in query coordinates
+                    overlap_start = max(nxt_q_start, ex_q_start)
+                    overlap_end = min(nxt_q_end, ex_q_end)
 
-                if overlap_bp > 0.5 * min_span:
-                    # Overlapping HSP - same gene copy, add regardless of coverage
-                    current.append(nxt)
-                    used.add(next_idx)
-                    continue
+                    if overlap_end >= overlap_start:
+                        # They overlap in query space → different gene copies
+                        has_query_overlap = True
+                        break
 
-                # Non-overlapping HSP - check cumulative coverage threshold
+                if has_query_overlap:
+                    # This HSP covers same query region as existing HSP
+                    # → Different genomic copy → Start new gene
+                    break
+
+                # Check coverage for THIS query
                 test_cluster = current + [nxt]
-                test_cov = calculate_cumulative_query_coverage(test_cluster)
+                test_cov = calculate_union_query_coverage(test_cluster)
 
-                # Stop if we exceed paralog threshold
+                # Stop if we exceed threshold (different tandem copy)
                 if test_cov > paralog_coverage_threshold:
                     break
 
                 current.append(nxt)
                 used.add(next_idx)
 
-            # Finalize cluster if it meets minimum coverage
-            cov = calculate_cumulative_query_coverage(current)
+            # Keep if meets minimum coverage
+            cov = calculate_union_query_coverage(current)
             if cov >= min_cluster_coverage:
-                out.append(summarize_cluster_multi_query(current))
+                g_start = min(h["genomic_start"] for h in current)
+                g_end = max(h["genomic_end"] for h in current)
+                span_kb = (g_end - g_start) / 1000.0
+
+                # Filter out abnormally long clusters that likely bridge multiple tandem copies
+                # If coverage >95% but span >10kb, it's probably bridging tandem genes
+                if cov > 0.95 and span_kb > 10.0:
+                    # Skip this mega-cluster - it's a bridge across tandem array
+                    continue
+
+                out.append({
+                    "query_id": query_id,
+                    "scaffold": current[0]["scaffold"],
+                    "strand": current[0]["strand"],
+                    "genomic_start": g_start,
+                    "genomic_end": g_end,
+                    "query_coverage": cov,
+                    "num_hsps": len(current),
+                    "hsps": current,
+                })
 
     return out
+
+
+def deduplicate_genes_across_queries(gene_candidates: List[Dict]) -> List[Dict]:
+    """
+    Merge gene candidates from different queries that overlap genomically.
+
+    This handles the case where 7-8 different queries all find the same gene copy.
+    Any genomic overlap means they're the same gene - merge them.
+    """
+    if not gene_candidates:
+        return []
+
+    # Sort by position
+    candidates = sorted(gene_candidates, key=lambda x: (x["scaffold"], x["strand"], x["genomic_start"]))
+
+    merged = []
+    current_group = [candidates[0]]
+
+    for candidate in candidates[1:]:
+        # Check if on same scaffold/strand as current group
+        if (candidate["scaffold"] != current_group[0]["scaffold"] or
+            candidate["strand"] != current_group[0]["strand"]):
+            # Different location - finalize current group
+            merged.append(current_group)
+            current_group = [candidate]
+            continue
+
+        # Calculate the extent of the current merged group
+        group_start = min(g["genomic_start"] for g in current_group)
+        group_end = max(g["genomic_end"] for g in current_group)
+        group_span = group_end - group_start
+
+        # Calculate overlap with merged group extent
+        overlap_start = max(group_start, candidate["genomic_start"])
+        overlap_end = min(group_end, candidate["genomic_end"])
+        overlap_bp = max(0, overlap_end - overlap_start)
+
+        # Calculate gap from group extent
+        gap_bp = candidate["genomic_start"] - group_end
+
+        # Candidate span
+        cand_span = candidate["genomic_end"] - candidate["genomic_start"]
+        min_span = min(group_span, cand_span)
+
+        # Merge if significant overlap (>50% of smaller span)
+        # This means they're the same gene from different queries
+        if min_span > 0 and overlap_bp > 0.5 * min_span:
+            current_group.append(candidate)
+        else:
+            # No significant overlap - finalize current group, start new
+            merged.append(current_group)
+            current_group = [candidate]
+
+    # Don't forget last group
+    if current_group:
+        merged.append(current_group)
+
+    # Summarize each merged group
+    final_genes = []
+    for group in merged:
+        all_hsps = []
+        for gene in group:
+            all_hsps.extend(gene["hsps"])
+
+        final_genes.append(summarize_cluster_multi_query(all_hsps))
+
+    return final_genes
+
+
+def cluster_hsps_greedy(
+    hsps: List[Dict],
+    paralog_coverage_threshold: float = PARALOG_COVERAGE_THRESHOLD,
+    min_cluster_coverage: float = MIN_CLUSTER_COVERAGE,
+) -> List[Dict]:
+    """
+    Two-step clustering: per-query, then cross-query deduplication.
+
+    Step 1: For each query, cluster its HSPs into gene candidates
+            - Handles multi-exon genes within one query
+            - Uses gap threshold and per-query coverage
+
+    Step 2: Merge gene candidates from different queries that overlap
+            - Handles tandem duplicates (7-8 queries finding same gene)
+            - Uses genomic overlap to deduplicate
+
+    This cleanly separates two concerns and avoids cumulative coverage confusion.
+    """
+    if not hsps:
+        return []
+
+    # Step 1: Per-query clustering
+    all_gene_candidates = []
+    for query_id in set(h["query_id"] for h in hsps):
+        query_hsps = [h for h in hsps if h["query_id"] == query_id]
+        gene_candidates = cluster_hsps_per_query(
+            query_hsps,
+            query_id,
+            paralog_coverage_threshold,
+            min_cluster_coverage
+        )
+        all_gene_candidates.extend(gene_candidates)
+
+    # Step 2: Cross-query deduplication
+    final_genes = deduplicate_genes_across_queries(all_gene_candidates)
+
+    return final_genes
 
 
 def _normalize_genome_id(name: str) -> str:
