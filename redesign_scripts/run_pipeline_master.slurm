@@ -205,28 +205,25 @@ log "Phase 5 job ID: ${PHASE5_JOB}"
 wait_for_job ${PHASE5_JOB} "Phase 5"
 
 ################################################################################
-# PHASE 6: SEQUENCE EXTRACTION (ARRAY)
+# PHASE 6 & 7: SEQUENCE EXTRACTION AND SWISSPROT ANNOTATION (PARALLEL)
 ################################################################################
-log_phase "PHASE 6: SEQUENCE EXTRACTION"
+log_phase "PHASE 6 & 7: EXTRACTION AND ANNOTATION (PARALLEL)"
 
-# Create family list for array job
+# Create family list for array jobs
 echo "${OUTPUT_DIR}" > inputs/${OUTPUT_DIR}_list.txt
 
+# Submit both jobs simultaneously (they're independent, both only need Phase 5)
 PHASE6_JOB=$(sbatch --parsable --array=1 \
     redesign_scripts/run_phase6_array.slurm inputs/${OUTPUT_DIR}_list.txt)
 log "Phase 6 job ID: ${PHASE6_JOB}"
-
-wait_for_job ${PHASE6_JOB} "Phase 6"
-
-################################################################################
-# PHASE 7: SWISSPROT ANNOTATION (ARRAY)
-################################################################################
-log_phase "PHASE 7: SWISSPROT ANNOTATION"
 
 PHASE7_JOB=$(sbatch --parsable --array=1 \
     redesign_scripts/run_phase7_array.slurm inputs/${OUTPUT_DIR}_list.txt)
 log "Phase 7 job ID: ${PHASE7_JOB}"
 
+# Wait for BOTH to complete before proceeding to Phase 8
+log "Waiting for Phase 6 and 7 to complete..."
+wait_for_job ${PHASE6_JOB} "Phase 6"
 wait_for_job ${PHASE7_JOB} "Phase 7"
 
 ################################################################################
