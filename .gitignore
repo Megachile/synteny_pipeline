@@ -1,44 +1,79 @@
-# Outputs and data
+# ============================================================================
+# ONLY TRACK SCRIPTS - IGNORE EVERYTHING ELSE
+# ============================================================================
+
+# Ignore everything by default
+/*
+
+# ONLY allow these directories
+!/scripts/
+!/redesign_scripts/
+!/.gitignore
+!/README.md
+
+# Within scripts directories, ignore Python cache
+scripts/__pycache__/
+redesign_scripts/__pycache__/
+*.pyc
+*.pyo
+
+# ============================================================================
+# EXPLICITLY IGNORE (even if accidentally added)
+# ============================================================================
+
+# Outputs and results
 outputs/
 logs/
+qc_results/
+qc_results_balanced/
+archive*/
+deprecated/
+temp_*/
+tblastn_recovery_test/
+
+# Data files
 data/
 inputs/
-test_outputs/
+ref/
+*_dbs/
+
+# Large files
+*.fasta
+*.fastq
+*.xml
+*.tsv
+*.csv
 *.out
 *.err
 *.log
 
-# Python cache
-__pycache__/
-*.pyc
-
 # Temporary files
 temp_*
 test_*
-*.fasta
-best_hit_per_genome.tsv
-exonerate_extraction_summary.tsv
-phase3_debug.log
+*.tmp
 
 # Beads tracker
 .beads/
 
-# Deprecated scripts
-scripts/deprecated/
+# SLURM scripts (generated, not canonical)
+run_*.slurm
+*.slurm
+!scripts/*.slurm
+!redesign_scripts/*.slurm
 
-# SLURM test scripts
-create_*.slurm
-rebuild_*.slurm
-reinstall_*.slurm
-test_*.slurm
+# Python generated
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-# Analysis scripts (keep run_*.slurm but not temporary ones)
-analyze_*.py
-check_*.py
-create_*.py
-fix_*.py
-select_*.py
-validate_*.py
-run_ferritin_phases.py
-run_ferritin_slurm.sh
-test_pipeline_phases.sh
+# Documentation (keep only critical ones)
+*_SUMMARY.md
+*_RESULTS.md
+*_ANALYSIS.md
+*_ISSUES.md
+*_NOTES.md
+*_PLAN.md
+*_STATUS.md
+SESSION_*.md
+WORKFLOW_BLUEPRINT*.md

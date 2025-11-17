@@ -18,10 +18,11 @@ Outputs (per family):
 
 from __future__ import annotations
 
-from pathlib import Path
 import argparse
 import subprocess
 import xml.etree.ElementTree as ET
+from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List
 
 import pandas as pd
@@ -40,6 +41,10 @@ MIN_CLUSTER_COVERAGE = 0.5         # keep clusters with ≥50% coverage
 MAX_GAP_KB = 20.0                  # Split if gap > 20kb (separates tandem copies)
 QUERY_OVERLAP_THRESHOLD = 0.5      # Query overlap >50% of shorter HSP → tandem copy
 MAX_CLUSTER_SPAN_KB = 500.0        # Hard split if cluster span > 500kb (prevents mega-gene blobs)
+
+# Family-level heuristic limit on how large a merged same-query cluster
+# is allowed to be. Estimated from BK gene lengths during calibration.
+FAMILY_MAX_MERGE_SPAN_KB: float | None = None
 
 
 def run_tblastn(
@@ -141,6 +146,11 @@ def parse_blast_xml_with_query_coords(xml_file: Path) -> List[Dict]:
         print(f"  WARNING: error parsing BLAST XML {xml_file}: {e}")
 
     return hits
+
+
+def filter_hsps_by_evalue(hsps: List[Dict], max_evalue: float) -> List[Dict]:
+    """Filter HSPs by E-value threshold."""
+    return [h for h in hsps if h["evalue"] <= max_evalue]
 
 
 def calculate_union_query_coverage(hsps: List[Dict]) -> float:
@@ -257,6 +267,7 @@ def cluster_hsps_per_query(
     min_cluster_coverage: float = MIN_CLUSTER_COVERAGE,
     query_overlap_threshold: float = QUERY_OVERLAP_THRESHOLD,
     max_cluster_span_kb: float = MAX_CLUSTER_SPAN_KB,
+    max_gap_kb: float = MAX_GAP_KB,
 ) -> List[Dict]:
     """
     Cluster HSPs for a SINGLE query into gene candidates.
@@ -295,7 +306,7 @@ def cluster_hsps_per_query(
                 gap_kb = gap_bp / 1000.0
 
                 # Stop if gap too large (different genes in tandem array)
-                if gap_kb > MAX_GAP_KB:
+                if gap_kb > max_gap_kb:
                     break
 
                 # Check if this HSP overlaps SUBSTANTIALLY in QUERY SPACE with any HSP already in cluster
@@ -450,11 +461,102 @@ def deduplicate_genes_across_queries(gene_candidates: List[Dict]) -> List[Dict]:
     return final_genes
 
 
+def merge_proximal_gene_candidates_same_query(
+    gene_candidates: List[Dict],
+    merge_gap_kb: float,
+) -> List[Dict]:
+    """
+    Post-processing merge: combine same-query candidates that are genomically proximate.
+
+    This addresses cases where the per-query greedy clustering created multiple nearby
+    fragments for the same query within a locus. We merge candidates when:
+        - Same query_id
+        - Same scaffold and strand
+        - Gap between candidates <= merge_gap_kb
+
+    Coverage and coordinates are recomputed from the underlying HSPs.
+    """
+    if not gene_candidates or merge_gap_kb <= 0:
+        return gene_candidates
+
+    max_merge_span_kb = FAMILY_MAX_MERGE_SPAN_KB
+
+    grouped: Dict[tuple[str, str, str], List[Dict]] = defaultdict(list)
+    for cand in gene_candidates:
+        key = (cand["query_id"], cand["scaffold"], cand["strand"])
+        grouped[key].append(cand)
+
+    merged_all: List[Dict] = []
+
+    for (query_id, scaffold, strand), cands in grouped.items():
+        cands_sorted = sorted(cands, key=lambda c: c["genomic_start"])
+        i = 0
+        n = len(cands_sorted)
+
+        while i < n:
+            current_group = [cands_sorted[i]]
+            current_end = cands_sorted[i]["genomic_end"]
+            group_start = cands_sorted[i]["genomic_start"]
+            j = i + 1
+
+            while j < n:
+                nxt = cands_sorted[j]
+                gap_bp = nxt["genomic_start"] - current_end
+                gap_kb = gap_bp / 1000.0
+
+                if gap_kb > merge_gap_kb:
+                    break
+
+                # Check that merged span would not exceed family-level limit
+                potential_start = min(group_start, nxt["genomic_start"])
+                potential_end = max(current_end, nxt["genomic_end"])
+                potential_span_kb = (potential_end - potential_start) / 1000.0
+                if max_merge_span_kb is not None and potential_span_kb > max_merge_span_kb:
+                    break
+
+                current_group.append(nxt)
+                current_end = max(current_end, nxt["genomic_end"])
+                group_start = min(group_start, nxt["genomic_start"])
+                j += 1
+
+            # Build merged candidate from all HSPs in current_group
+            all_hsps = []
+            for cand in current_group:
+                all_hsps.extend(cand["hsps"])
+
+            if not all_hsps:
+                i = j
+                continue
+
+            g_start = min(h["genomic_start"] for h in all_hsps)
+            g_end = max(h["genomic_end"] for h in all_hsps)
+            cov = calculate_union_query_coverage(all_hsps)
+
+            merged_all.append(
+                {
+                    "query_id": query_id,
+                    "scaffold": scaffold,
+                    "strand": strand,
+                    "genomic_start": g_start,
+                    "genomic_end": g_end,
+                    "query_coverage": cov,
+                    "num_hsps": len(all_hsps),
+                    "hsps": all_hsps,
+                }
+            )
+
+            i = j
+
+    return merged_all
+
+
 def cluster_hsps_greedy(
     hsps: List[Dict],
     paralog_coverage_threshold: float = PARALOG_COVERAGE_THRESHOLD,
     min_cluster_coverage: float = MIN_CLUSTER_COVERAGE,
     query_overlap_threshold: float = QUERY_OVERLAP_THRESHOLD,
+    max_gap_kb: float = MAX_GAP_KB,
+    merge_gap_kb: float | None = None,
 ) -> List[Dict]:
     """
     Two-step clustering: per-query, then cross-query deduplication.
@@ -482,9 +584,18 @@ def cluster_hsps_greedy(
             query_id,
             paralog_coverage_threshold,
             min_cluster_coverage,
-            query_overlap_threshold
+            query_overlap_threshold,
+            MAX_CLUSTER_SPAN_KB,
+            max_gap_kb,
         )
         all_gene_candidates.extend(gene_candidates)
+
+    # Optional Step 1b: merge genomically proximate candidates from SAME query.
+    if merge_gap_kb is not None and merge_gap_kb > 0:
+        all_gene_candidates = merge_proximal_gene_candidates_same_query(
+            all_gene_candidates,
+            merge_gap_kb,
+        )
 
     # Step 2: Cross-query deduplication
     final_genes = deduplicate_genes_across_queries(all_gene_candidates)
@@ -512,6 +623,338 @@ def count_phase1_bk_targets(phase1_dir: Path) -> int:
     return total
 
 
+def get_phase1_bk_genes(phase1_dir: Path) -> tuple[list[dict], int]:
+    """
+    Extract BK ground truth at GENE level from Phase 1 locus_definitions.tsv.
+
+    Uses gene_chromosomes / gene_starts / gene_ends columns added by
+    add_gene_coordinates.py to build one record per gene.
+
+    Returns:
+        (genes, total_gene_count) where each gene is:
+        {
+            'locus_id': str,
+            'gene_id': str,
+            'chromosome': str,
+            'start': int,
+            'end': int,
+        }
+    """
+    locus_defs = phase1_dir / "locus_definitions.tsv"
+    if not locus_defs.exists():
+        return [], 0
+
+    genes: list[dict] = []
+    total_genes = 0
+
+    with open(locus_defs) as f:
+        header = next(f).strip().split('\t')
+
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) < len(header):
+                continue
+
+            row = dict(zip(header, parts))
+            locus_id = row.get('locus_id', '')
+            if not locus_id.startswith('BK_'):
+                continue
+
+            # Require per-gene coordinates – if missing, skip this locus for gene-level validation.
+            if 'gene_starts' not in row or 'gene_ends' not in row:
+                continue
+            if not row['gene_starts'] or not row['gene_ends']:
+                continue
+
+            cluster_members = [
+                g.strip()
+                for g in row.get('cluster_members', '').split(',')
+                if g.strip()
+            ]
+            gene_chroms = [
+                c.strip()
+                for c in row.get('gene_chromosomes', '').split(',')
+                if c.strip()
+            ]
+
+            try:
+                gene_starts = [int(x) for x in row['gene_starts'].split(',') if x]
+                gene_ends = [int(x) for x in row['gene_ends'].split(',') if x]
+            except ValueError:
+                # Malformed coordinates – skip this locus.
+                continue
+
+            # Determine how many genes we can safely use from this row.
+            n_coords = min(len(gene_starts), len(gene_ends))
+            if cluster_members:
+                n_coords = min(n_coords, len(cluster_members))
+            if gene_chroms:
+                n_coords = min(n_coords, len(gene_chroms))
+
+            if n_coords == 0:
+                continue
+
+            chrom_fallback = row.get('chromosome', '')
+
+            for i in range(n_coords):
+                gene_id = (
+                    cluster_members[i]
+                    if i < len(cluster_members)
+                    else f"{locus_id}_gene{i+1}"
+                )
+                chrom = (
+                    gene_chroms[i]
+                    if gene_chroms and i < len(gene_chroms)
+                    else chrom_fallback
+                )
+
+                start = gene_starts[i]
+                end = gene_ends[i]
+
+                genes.append(
+                    {
+                        'locus_id': locus_id,
+                        'gene_id': gene_id,
+                        'chromosome': chrom,
+                        'start': start,
+                        'end': end,
+                    }
+                )
+                total_genes += 1
+
+    return genes, total_genes
+
+
+def get_phase1_bk_loci(phase1_dir: Path) -> tuple[list[dict], int]:
+    """
+    Extract ground truth BK loci from Phase 1 locus_definitions.tsv.
+
+    Returns:
+        (loci, total_gene_count) where loci is list of dicts with:
+        {locus_id, chromosome, start, end, expected_genes}
+    """
+    locus_defs = phase1_dir / "locus_definitions.tsv"
+    if not locus_defs.exists():
+        return [], 0
+
+    loci = []
+    total_genes = 0
+
+    with open(locus_defs) as f:
+        header = next(f).strip().split('\t')
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) < len(header):
+                continue
+
+            row = dict(zip(header, parts))
+            if row.get('locus_id', '').startswith('BK_'):
+                expected_genes = int(row['cluster_size'])
+                loci.append({
+                    'locus_id': row['locus_id'],
+                    'chromosome': row['chromosome'],
+                    'start': int(row['locus_span_start']),
+                    'end': int(row['locus_span_end']),
+                    'expected_genes': expected_genes
+                })
+                total_genes += expected_genes
+
+    return loci, total_genes
+
+
+def validate_detections_vs_groundtruth(detected_clusters: list[dict], ground_truth_coords: list[dict]) -> dict:
+    """
+    Legacy locus-level validation used by older calibration flows.
+
+    Kept for backwards compatibility; new factorial calibration uses
+    validate_detections_vs_groundtruth_per_gene for gene-level scoring.
+    """
+    if not ground_truth_coords:
+        return {
+            'true_positives': 0,
+            'false_negatives': 0,
+            'false_positives': len(detected_clusters),
+            'total_detected': len(detected_clusters),
+            'total_ground_truth_genes': 0,
+            'matched_loci': [],
+            'missed_loci': [],
+            'extra_genes': detected_clusters
+        }
+
+    # Helper to normalize chromosome names (strip .1 suffix)
+    def normalize_chrom(chrom: str) -> str:
+        return chrom.split('.')[0] if chrom else ''
+
+    # Track which ground truth loci were found
+    matched_gt_loci = set()
+    matched_detections = []
+    unmatched_detections = []
+
+    for det in detected_clusters:
+        det_chrom = normalize_chrom(det.get('scaffold', ''))
+        det_start = det.get('genomic_start', 0)
+        det_end = det.get('genomic_end', 0)
+
+        # Check if this detection overlaps any ground truth locus
+        matched = False
+        for gt in ground_truth_coords:
+            gt_chrom = normalize_chrom(gt['chromosome'])
+            if det_chrom == gt_chrom:
+                # Check for overlap (allowing some slop)
+                if not (det_end < gt['start'] - 50000 or det_start > gt['end'] + 50000):
+                    matched_gt_loci.add(gt['locus_id'])
+                    matched_detections.append(det)
+                    matched = True
+                    break
+
+        if not matched:
+            unmatched_detections.append(det)
+
+    # Calculate metrics
+    total_gt_genes = sum(gt['expected_genes'] for gt in ground_truth_coords)
+    all_gt_loci = set(gt['locus_id'] for gt in ground_truth_coords)
+    missed_loci = all_gt_loci - matched_gt_loci
+
+    # True positives: detected genes that overlap ground truth
+    # False negatives: ground truth genes NOT found (may include partial loci)
+    tp_count = len(matched_detections)
+    fn_count = total_gt_genes - tp_count
+    fp_count = len(unmatched_detections)
+
+    return {
+        'true_positives': tp_count,
+        'false_negatives': fn_count,
+        'false_positives': fp_count,
+        'total_detected': len(detected_clusters),
+        'total_ground_truth_genes': total_gt_genes,
+        'matched_loci': list(matched_gt_loci),
+        'missed_loci': list(missed_loci),
+        'extra_genes': unmatched_detections
+    }
+
+
+def validate_detections_vs_groundtruth_per_gene(
+    detected_clusters: list[dict],
+    ground_truth_genes: list[dict],
+) -> dict:
+    """
+    Compare detected gene coordinates to ground truth at GENE level.
+
+    Each ground truth gene is counted at most once:
+        - If ≥1 detection overlaps the gene → 1 true positive.
+        - Additional detections overlapping the same gene are counted as false positives.
+
+    Detections that do not overlap any ground truth gene are also false positives.
+
+    Returns:
+        {
+            'true_positives': int,   # Ground truth genes with ≥1 detection
+            'false_negatives': int,  # Ground truth genes not detected
+            'false_positives': int,  # Detected genes not matching any ground truth
+            'total_detected': int,
+            'total_ground_truth_genes': int,
+            'matched_loci': list,    # Loci containing ≥1 detected gene
+            'missed_loci': list,     # Loci where all genes were missed
+            'extra_genes': list,     # Detection dicts classified as false positives
+            'matched_genes': list,   # Ground truth gene dicts with ≥1 detection
+            'missed_genes': list,    # Ground truth gene dicts with 0 detections
+        }
+    """
+    if not ground_truth_genes:
+        return {
+            'true_positives': 0,
+            'false_negatives': 0,
+            'false_positives': len(detected_clusters),
+            'total_detected': len(detected_clusters),
+            'total_ground_truth_genes': 0,
+            'matched_loci': [],
+            'missed_loci': [],
+            'extra_genes': detected_clusters
+        }
+
+    # Helper to normalize chromosome names (strip .1 suffix)
+    def normalize_chrom(chrom: str) -> str:
+        return chrom.split('.')[0] if chrom else ''
+
+    total_detected = len(detected_clusters)
+    total_gt_genes = len(ground_truth_genes)
+
+    # Map detections to the single best-overlapping ground truth gene (if any).
+    det_to_gene_idx: list[int | None] = [None] * total_detected
+
+    for i, det in enumerate(detected_clusters):
+        det_chrom = normalize_chrom(det.get('scaffold', ''))
+        det_start = det.get('genomic_start', 0)
+        det_end = det.get('genomic_end', 0)
+
+        best_idx: int | None = None
+        best_overlap = 0
+
+        for j, gt in enumerate(ground_truth_genes):
+            gt_chrom = normalize_chrom(gt['chromosome'])
+            if det_chrom != gt_chrom:
+                continue
+
+            gt_start = gt['start']
+            gt_end = gt['end']
+
+            overlap_start = max(det_start, gt_start)
+            overlap_end = min(det_end, gt_end)
+            if overlap_end < overlap_start:
+                continue
+
+            overlap_len = overlap_end - overlap_start + 1
+            if overlap_len > best_overlap:
+                best_overlap = overlap_len
+                best_idx = j
+
+        det_to_gene_idx[i] = best_idx
+
+    # Count detections per gene.
+    gene_hit_counts = [0] * total_gt_genes
+    for idx in det_to_gene_idx:
+        if idx is not None:
+            gene_hit_counts[idx] += 1
+
+    tp_genes = sum(1 for c in gene_hit_counts if c > 0)
+    fn_genes = total_gt_genes - tp_genes
+
+    # Any detection that is unassigned, or a second+ hit to the same gene, is a false positive.
+    extra_detections: list[dict] = []
+    first_hit_taken = [False] * total_gt_genes
+
+    for det, idx in zip(detected_clusters, det_to_gene_idx):
+        if idx is None:
+            extra_detections.append(det)
+        else:
+            if not first_hit_taken[idx]:
+                first_hit_taken[idx] = True
+            else:
+                extra_detections.append(det)
+
+    fp_count = len(extra_detections)
+
+    # Derive matched/missed loci and gene lists for reporting.
+    matched_genes = [g for g, c in zip(ground_truth_genes, gene_hit_counts) if c > 0]
+    missed_genes = [g for g, c in zip(ground_truth_genes, gene_hit_counts) if c == 0]
+
+    matched_loci = sorted({g['locus_id'] for g in matched_genes})
+    missed_loci = sorted({g['locus_id'] for g in missed_genes})
+
+    return {
+        'true_positives': tp_genes,
+        'false_negatives': fn_genes,
+        'false_positives': fp_count,
+        'total_detected': total_detected,
+        'total_ground_truth_genes': total_gt_genes,
+        'matched_loci': matched_loci,
+        'missed_loci': missed_loci,
+        'extra_genes': extra_detections,
+        'matched_genes': matched_genes,
+        'missed_genes': missed_genes,
+    }
+
+
 def find_bk_blast_xml(blast_xml_dir: Path) -> Path | None:
     """Find BK BLAST XML file in the blast_xml directory."""
     for xml_file in blast_xml_dir.glob("*.xml"):
@@ -524,15 +967,16 @@ def calibrate_threshold(
     phase1_dir: Path,
     blast_xml_dir: Path,
     default_threshold: float = QUERY_OVERLAP_THRESHOLD,
-) -> tuple[float, float]:
-    """Auto-calibrate query overlap threshold and min coverage using BK ground truth.
+    max_evalue: float = 1e-5,
+) -> tuple[float, float, float]:
+    """Auto-calibrate query overlap threshold, min coverage, AND E-value using BK ground truth.
 
-    Tests multiple thresholds on BK genome and selects the one that best
+    Tests multiple combinations of parameters on BK genome and selects the one that best
     matches Phase 1 BK gene count. If recovery is poor (<80%), retries with
     lower min_cluster_coverage to handle fragmentary HSPs (unstructured proteins).
 
     Returns:
-        (calibrated_query_overlap_threshold, calibrated_min_coverage)
+        (calibrated_query_overlap_threshold, calibrated_min_coverage, calibrated_evalue)
     """
     print()
     print("=" * 80)
@@ -544,8 +988,8 @@ def calibrate_threshold(
 
     if phase1_bk_count == 0:
         print("  No BK genes in Phase 1 - using default parameters")
-        print(f"  → Defaults: query_overlap={default_threshold}, min_coverage={MIN_CLUSTER_COVERAGE}")
-        return (default_threshold, MIN_CLUSTER_COVERAGE)
+        print(f"  → Defaults: query_overlap={default_threshold}, min_coverage={MIN_CLUSTER_COVERAGE}, evalue={max_evalue}")
+        return (default_threshold, MIN_CLUSTER_COVERAGE, max_evalue, PARALOG_COVERAGE_THRESHOLD, MAX_GAP_KB)
 
     print(f"  Phase 1 BK ground truth: {phase1_bk_count} genes")
 
@@ -553,130 +997,414 @@ def calibrate_threshold(
     bk_xml = find_bk_blast_xml(blast_xml_dir)
     if not bk_xml:
         print("  No BK BLAST results found - using default parameters")
-        print(f"  → Defaults: query_overlap={default_threshold}, min_coverage={MIN_CLUSTER_COVERAGE}")
-        return (default_threshold, MIN_CLUSTER_COVERAGE)
+        print(f"  → Defaults: query_overlap={default_threshold}, min_coverage={MIN_CLUSTER_COVERAGE}, evalue={max_evalue}")
+        return (default_threshold, MIN_CLUSTER_COVERAGE, max_evalue, PARALOG_COVERAGE_THRESHOLD, MAX_GAP_KB)
 
     print(f"  BK BLAST XML: {bk_xml.name}")
     print()
 
-    # Test thresholds with default min_cluster_coverage
+    # Parse BLAST XML once (contains all HSPs with their E-values)
+    all_hsps = parse_blast_xml_with_query_coords(bk_xml)
+
+    # STEP 1: Calibrate E-value threshold
+    # Test multiple E-value cutoffs to find the one that best matches Phase 1
+    evalue_thresholds = [1e-5, 1e-10, 1e-15, 1e-20, 1e-30]
     test_thresholds = [0.1, 0.2, 0.3, 0.5, 0.7]
+
+    print("  STEP 1: Calibrating E-value threshold")
+    print("  " + "-" * 76)
+
+    evalue_results = []
+    for evalue in evalue_thresholds:
+        # Filter HSPs by this E-value
+        hsps = filter_hsps_by_evalue(all_hsps, evalue)
+
+        if not hsps:
+            print(f"    E-value ≤ {evalue:.0e}: 0 HSPs (too strict)")
+            continue
+
+        # Test query overlap thresholds with this E-value
+        best_for_evalue = None
+        best_diff_for_evalue = float('inf')
+
+        for threshold in test_thresholds:
+            clusters = cluster_hsps_greedy(
+                hsps,
+                query_overlap_threshold=threshold,
+                min_cluster_coverage=MIN_CLUSTER_COVERAGE,
+            )
+
+            bk_count = len(clusters)
+            diff = abs(bk_count - phase1_bk_count)
+            recovery_pct = (bk_count / phase1_bk_count) * 100 if phase1_bk_count > 0 else 0
+
+            if diff < best_diff_for_evalue:
+                best_diff_for_evalue = diff
+                best_for_evalue = (threshold, MIN_CLUSTER_COVERAGE, evalue, bk_count, diff, recovery_pct)
+
+        if best_for_evalue:
+            evalue_results.append(best_for_evalue)
+            threshold, min_cov, eval_val, count, diff, rec_pct = best_for_evalue
+            print(f"    E-value ≤ {eval_val:.0e}: {len(hsps)} HSPs → best: {count} genes ({rec_pct:.0f}% recovery, ±{diff})")
+
+    if not evalue_results:
+        print("  ERROR: No valid E-value thresholds found")
+        return (default_threshold, MIN_CLUSTER_COVERAGE, max_evalue)
+
+    # Select best E-value (minimize difference from ground truth)
+    best = min(evalue_results, key=lambda x: x[4])
+    best_threshold, best_min_coverage, best_evalue, best_count, best_diff, best_recovery_pct = best
+
+    print()
+    print(f"  → Best E-value: {best_evalue:.0e} ({best_count} genes, {best_recovery_pct:.0f}% recovery)")
+    print()
+
+    # STEP 1.5: Calibrate paralog_coverage and gap thresholds
+    print(f"  STEP 1.5: Calibrating deduplication & gap parameters (E-value={best_evalue:.0e})")
+    print("  " + "-" * 76)
+
+    hsps = filter_hsps_by_evalue(all_hsps, best_evalue)
+
+    # Test paralog_coverage_threshold (affects deduplication)
+    paralog_thresholds = [0.1, 0.2, 0.3, 0.5, 0.7]
+    # Test max_gap_kb (affects HSP merging)
+    gap_thresholds = [10, 20, 50, 100]
+
+    param_results = []
+    for paralog_thresh in paralog_thresholds:
+        for gap_thresh in gap_thresholds:
+            # Test with default query_overlap
+            clusters = cluster_hsps_greedy(
+                hsps,
+                paralog_coverage_threshold=paralog_thresh,
+                query_overlap_threshold=QUERY_OVERLAP_THRESHOLD,
+                min_cluster_coverage=MIN_CLUSTER_COVERAGE,
+                max_gap_kb=gap_thresh,
+            )
+
+            bk_count = len(clusters)
+            diff = abs(bk_count - phase1_bk_count)
+            recovery_pct = (bk_count / phase1_bk_count) * 100 if phase1_bk_count > 0 else 0
+
+            param_results.append((paralog_thresh, gap_thresh, bk_count, diff, recovery_pct))
+
+    # Select best parameter combination
+    best_params = min(param_results, key=lambda x: x[3])
+    best_paralog_thresh, best_gap_thresh, best_param_count, best_param_diff, best_param_recovery = best_params
+
+    print(f"    Tested {len(param_results)} combinations")
+    print(f"    Best: paralog_coverage={best_paralog_thresh:.1f}, gap={best_gap_thresh:.0f}kb")
+    print(f"          → {best_param_count} genes ({best_param_recovery:.0f}% recovery, ±{best_param_diff})")
+    print()
+
+    # STEP 2: Fine-tune query overlap threshold with all calibrated parameters
+    print(f"  STEP 2: Fine-tuning query overlap")
+    print(f"         (E-value={best_evalue:.0e}, paralog={best_paralog_thresh:.1f}, gap={best_gap_thresh:.0f}kb)")
+    print("  " + "-" * 76)
+
     results = []
 
-    print("  Testing query overlap thresholds (min_coverage=0.5):")
     for threshold in test_thresholds:
-        # Parse BLAST XML
-        hsps = parse_blast_xml_with_query_coords(bk_xml)
-
-        # Cluster with this threshold
         clusters = cluster_hsps_greedy(
             hsps,
+            paralog_coverage_threshold=best_paralog_thresh,
             query_overlap_threshold=threshold,
             min_cluster_coverage=MIN_CLUSTER_COVERAGE,
+            max_gap_kb=best_gap_thresh,
         )
 
         bk_count = len(clusters)
         diff = abs(bk_count - phase1_bk_count)
         recovery_pct = (bk_count / phase1_bk_count) * 100 if phase1_bk_count > 0 else 0
-        results.append((threshold, MIN_CLUSTER_COVERAGE, bk_count, diff, recovery_pct))
+        results.append((threshold, MIN_CLUSTER_COVERAGE, best_evalue, best_paralog_thresh, best_gap_thresh, bk_count, diff, recovery_pct))
 
         status = "✓" if diff == 0 else f"±{diff}"
         print(f"    Threshold {threshold:.1f}: {bk_count} genes ({recovery_pct:.0f}% recovery, {status})")
 
-    # Select best threshold (minimum difference from Phase 1)
-    best = min(results, key=lambda x: x[3])
-    best_recovery_pct = best[4]
+    # Select best parameters
+    best = min(results, key=lambda x: x[6])
+    best_threshold, best_min_coverage, best_evalue, best_paralog_thresh, best_gap_thresh, best_count, best_diff, best_recovery_pct = best
 
     # STAGED CALIBRATION: Progressively relax min_coverage only when needed
     # Stage 1 (above): min_coverage=0.5 (normal, conservative)
     # Stage 2 (below): min_coverage=0.3 if recovery <80% (fragmentary HSPs)
     # Stage 3 (below): min_coverage=0.1 if still <80% (extreme cases like Glutenin)
 
-    # Stage 2: If recovery is poor (<80%), retry with lower min_cluster_coverage
+    # STEP 3: If recovery is poor (<80%), retry with lower min_cluster_coverage
     if best_recovery_pct < 80:
         print()
-        print(f"  ⚠️  Low recovery ({best_recovery_pct:.0f}%) - retrying with lower min_coverage=0.3")
-        print(f"     (handles fragmentary HSPs from unstructured proteins)")
-        print()
+        print(f"  STEP 3: Low recovery ({best_recovery_pct:.0f}%) - testing min_coverage=0.3")
+        print(f"          (handles fragmentary HSPs from unstructured proteins)")
+        print("  " + "-" * 76)
 
         stage2_results = []
-        print("  Testing query overlap thresholds (min_coverage=0.3):")
         for threshold in test_thresholds:
-            hsps = parse_blast_xml_with_query_coords(bk_xml)
             clusters = cluster_hsps_greedy(
-                hsps,
+                hsps,  # Already filtered by best_evalue
+                paralog_coverage_threshold=best_paralog_thresh,
                 query_overlap_threshold=threshold,
                 min_cluster_coverage=0.3,
+                max_gap_kb=best_gap_thresh,
             )
 
             bk_count = len(clusters)
             diff = abs(bk_count - phase1_bk_count)
             recovery_pct = (bk_count / phase1_bk_count) * 100 if phase1_bk_count > 0 else 0
-            stage2_results.append((threshold, 0.3, bk_count, diff, recovery_pct))
+            stage2_results.append((threshold, 0.3, best_evalue, best_paralog_thresh, best_gap_thresh, bk_count, diff, recovery_pct))
 
             status = "✓" if diff == 0 else f"±{diff}"
             print(f"    Threshold {threshold:.1f}: {bk_count} genes ({recovery_pct:.0f}% recovery, {status})")
 
         # Select best from stage 2
-        best_stage2 = min(stage2_results, key=lambda x: x[3])
+        best_stage2 = min(stage2_results, key=lambda x: x[6])
 
         # Use stage 2 if it improves recovery
-        if best_stage2[3] < best[3]:
+        if best_stage2[6] < best[6]:
             best = best_stage2
             print()
             print(f"  ✓ min_coverage=0.3 improved recovery!")
 
-        # Stage 3: If STILL <80%, try even lower min_coverage=0.1 (extreme cases)
-        stage2_recovery = best[4]
+        # STEP 4: If STILL <80%, try even lower min_coverage=0.1 (extreme cases)
+        stage2_recovery = best[7]
         if stage2_recovery < 80:
             print()
-            print(f"  ⚠️  Still low recovery ({stage2_recovery:.0f}%) - retrying with min_coverage=0.1")
-            print(f"     (extreme fallback for highly fragmentary proteins)")
-            print()
+            print(f"  STEP 4: Still low recovery ({stage2_recovery:.0f}%) - testing min_coverage=0.1")
+            print(f"          (extreme fallback for highly fragmentary proteins)")
+            print("  " + "-" * 76)
 
             stage3_results = []
-            print("  Testing query overlap thresholds (min_coverage=0.1):")
             for threshold in test_thresholds:
-                hsps = parse_blast_xml_with_query_coords(bk_xml)
                 clusters = cluster_hsps_greedy(
-                    hsps,
+                    hsps,  # Already filtered by best_evalue
+                    paralog_coverage_threshold=best_paralog_thresh,
                     query_overlap_threshold=threshold,
                     min_cluster_coverage=0.1,
+                    max_gap_kb=best_gap_thresh,
                 )
 
                 bk_count = len(clusters)
                 diff = abs(bk_count - phase1_bk_count)
                 recovery_pct = (bk_count / phase1_bk_count) * 100 if phase1_bk_count > 0 else 0
-                stage3_results.append((threshold, 0.1, bk_count, diff, recovery_pct))
+                stage3_results.append((threshold, 0.1, best_evalue, best_paralog_thresh, best_gap_thresh, bk_count, diff, recovery_pct))
 
                 status = "✓" if diff == 0 else f"±{diff}"
                 print(f"    Threshold {threshold:.1f}: {bk_count} genes ({recovery_pct:.0f}% recovery, {status})")
 
             # Select best from stage 3
-            best_stage3 = min(stage3_results, key=lambda x: x[3])
+            best_stage3 = min(stage3_results, key=lambda x: x[6])
 
             # Use stage 3 if it improves recovery (AND doesn't oversplit by >20%)
             # Oversplit check prevents false positives from excessive fragmentation
-            if best_stage3[3] < best[3] and best_stage3[4] <= 120:
+            if best_stage3[6] < best[6] and best_stage3[7] <= 120:
                 best = best_stage3
                 print()
                 print(f"  ✓ min_coverage=0.1 improved recovery!")
             else:
-                if best_stage3[4] > 120:
+                if best_stage3[7] > 120:
                     print()
-                    print(f"  ⚠️  min_coverage=0.1 oversplits ({best_stage3[4]:.0f}% recovery) - keeping min_coverage={best[1]:.1f}")
+                    print(f"  ⚠️  min_coverage=0.1 oversplits ({best_stage3[7]:.0f}% recovery) - keeping min_coverage={best[1]:.1f}")
 
     calibrated_threshold = best[0]
     calibrated_min_coverage = best[1]
+    calibrated_evalue = best[2]
+    calibrated_paralog_thresh = best[3]
+    calibrated_gap_thresh = best[4]
 
     print()
-    print(f"  → Calibrated parameters:")
-    print(f"     query_overlap_threshold: {calibrated_threshold:.1f}")
-    print(f"     min_cluster_coverage: {calibrated_min_coverage:.1f}")
-    print(f"     BK recovery: {best[2]}/{phase1_bk_count} genes ({best[4]:.0f}%)")
+    print("=" * 80)
+    print("CALIBRATION COMPLETE")
+    print("=" * 80)
+    print(f"  query_overlap_threshold: {calibrated_threshold:.1f}")
+    print(f"  min_cluster_coverage: {calibrated_min_coverage:.1f}")
+    print(f"  evalue_threshold: {calibrated_evalue:.0e}")
+    print(f"  paralog_coverage_threshold: {calibrated_paralog_thresh:.1f}")
+    print(f"  max_gap_kb: {calibrated_gap_thresh:.0f}")
+    print(f"  BK recovery: {best[5]}/{phase1_bk_count} genes ({best[7]:.0f}%)")
+    print("=" * 80)
     print()
 
-    return (calibrated_threshold, calibrated_min_coverage)
+    return (calibrated_threshold, calibrated_min_coverage, calibrated_evalue, calibrated_paralog_thresh, calibrated_gap_thresh)
+
+
+def calibrate_threshold_factorial(
+    phase1_dir: Path,
+    blast_xml_dir: Path,
+    default_threshold: float = QUERY_OVERLAP_THRESHOLD,
+    max_evalue: float = 1e-5,
+) -> tuple[float, float, float, float, float, float]:
+    """
+    FACTORIAL calibration: Test ALL parameter combinations to find global optimum.
+
+    Returns: (query_overlap, min_coverage, evalue, paralog_coverage, max_gap_kb)
+    """
+    print()
+    print("=" * 80)
+    print("FACTORIAL PARAMETER CALIBRATION (GLOBAL OPTIMUM)")
+    print("=" * 80)
+
+    # Get Phase 1 BK ground truth from locus_definitions.tsv
+    ground_truth_genes, total_gt_genes = get_phase1_bk_genes(phase1_dir)
+
+    if total_gt_genes == 0:
+        print("  No BK genes with per-gene coordinates in Phase 1 - using defaults")
+        return (
+            default_threshold,
+            MIN_CLUSTER_COVERAGE,
+            max_evalue,
+            PARALOG_COVERAGE_THRESHOLD,
+            MAX_GAP_KB,
+            0.0,
+        )
+
+    # Estimate a family-level cap on merged same-query cluster spans from BK gene lengths.
+    spans_kb = [
+        (g['end'] - g['start']) / 1000.0
+        for g in ground_truth_genes
+        if g['end'] > g['start']
+    ]
+    if spans_kb:
+        spans_kb_sorted = sorted(spans_kb)
+        median_span = spans_kb_sorted[len(spans_kb_sorted) // 2]
+        max_span = spans_kb_sorted[-1]
+        # Allow merges up to 1.5× the longest known gene or 3× the median, whichever is larger.
+        # This permits large-intron genes (like RL) while guarding against fusing entire tandem arrays.
+        global FAMILY_MAX_MERGE_SPAN_KB
+        FAMILY_MAX_MERGE_SPAN_KB = max(max_span * 1.5, median_span * 3.0)
+    else:
+        FAMILY_MAX_MERGE_SPAN_KB = None
+
+    num_loci = len({g['locus_id'] for g in ground_truth_genes})
+    print(f"  Phase 1 BK ground truth: {total_gt_genes} genes across {num_loci} loci")
+
+    # Find BK BLAST XML
+    bk_xml = find_bk_blast_xml(blast_xml_dir)
+    if not bk_xml:
+        print("  No BK BLAST results found - using defaults")
+        return (
+            default_threshold,
+            MIN_CLUSTER_COVERAGE,
+            max_evalue,
+            PARALOG_COVERAGE_THRESHOLD,
+            MAX_GAP_KB,
+            0.0,
+        )
+
+    print(f"  BK BLAST XML: {bk_xml.name}")
+    print()
+
+    # Parse all HSPs once
+    all_hsps = parse_blast_xml_with_query_coords(bk_xml)
+
+    # Define parameter ranges
+    evalue_vals = [1e-5, 1e-10, 1e-15, 1e-20, 1e-30]
+    paralog_vals = [0.1, 0.3, 0.5, 0.7]
+    gap_vals = [10, 20, 50, 100, 150, 200]
+    # Same-query merge distance (0 = disabled)
+    merge_gap_vals = [0.0, 10.0, 30.0, 60.0]
+    query_overlap_vals = [0.1, 0.2, 0.5]
+    min_coverage_vals = [0.5, 0.3, 0.1]
+
+    total_combos = (
+        len(evalue_vals)
+        * len(paralog_vals)
+        * len(gap_vals)
+        * len(merge_gap_vals)
+        * len(query_overlap_vals)
+        * len(min_coverage_vals)
+    )
+
+    print(f"  Testing {total_combos} parameter combinations:")
+    print(f"    E-values: {len(evalue_vals)}, Paralog: {len(paralog_vals)}, Gap: {len(gap_vals)}")
+    print(f"    Merge gap: {len(merge_gap_vals)}, Query overlap: {len(query_overlap_vals)}, Min coverage: {len(min_coverage_vals)}")
+    print()
+
+    best_params = None
+    best_diff = float('inf')
+    best_fp = float('inf')
+    best_validation = None
+    best_recall = 0
+
+    tested = 0
+    for evalue in evalue_vals:
+        # Filter HSPs once per E-value
+        hsps = filter_hsps_by_evalue(all_hsps, evalue)
+        if not hsps:
+            continue
+
+        for paralog_thresh in paralog_vals:
+            for gap_thresh in gap_vals:
+                for merge_gap in merge_gap_vals:
+                    for query_thresh in query_overlap_vals:
+                        for min_cov in min_coverage_vals:
+                            tested += 1
+
+                            # Test this combination
+                            clusters = cluster_hsps_greedy(
+                                hsps,
+                                paralog_coverage_threshold=paralog_thresh,
+                                min_cluster_coverage=min_cov,
+                                query_overlap_threshold=query_thresh,
+                                max_gap_kb=gap_thresh,
+                                merge_gap_kb=merge_gap if merge_gap > 0 else None,
+                            )
+
+                            # Validate against ground truth gene coordinates
+                            validation = validate_detections_vs_groundtruth_per_gene(
+                                clusters,
+                                ground_truth_genes,
+                            )
+                            tp = validation['true_positives']
+                            fp = validation['false_positives']
+
+                            # Optimize: minimize difference from ground truth (get as close to 100% as possible)
+                            diff = abs(tp - total_gt_genes)
+                            recall = tp / total_gt_genes if total_gt_genes > 0 else 0
+
+                            # Update best: minimize deviation from ground truth, then minimize false positives
+                            if diff < best_diff or (diff == best_diff and fp < best_fp):
+                                best_diff = diff
+                                best_fp = fp
+                                best_validation = validation
+                                best_recall = recall
+                                best_params = (query_thresh, min_cov, evalue, paralog_thresh, gap_thresh, merge_gap)
+
+    if best_params is None:
+        print("  ERROR: No valid parameter combinations found")
+        return (
+            default_threshold,
+            MIN_CLUSTER_COVERAGE,
+            max_evalue,
+            PARALOG_COVERAGE_THRESHOLD,
+            MAX_GAP_KB,
+            0.0,
+        )
+
+    query_thresh, min_cov, evalue, paralog_thresh, gap_thresh, merge_gap = best_params
+
+    print(f"  Tested {tested} combinations")
+    print()
+    print("=" * 80)
+    print("CALIBRATION COMPLETE (GLOBAL OPTIMUM)")
+    print("=" * 80)
+    print(f"  query_overlap_threshold: {query_thresh:.1f}")
+    print(f"  min_cluster_coverage: {min_cov:.1f}")
+    print(f"  evalue_threshold: {evalue:.0e}")
+    print(f"  paralog_coverage_threshold: {paralog_thresh:.1f}")
+    print(f"  max_gap_kb: {gap_thresh:.0f}")
+    print(f"  merge_gap_kb: {merge_gap:.0f}")
+    print()
+    print("  VALIDATION METRICS:")
+    print(f"    Ground truth: {total_gt_genes} genes across {num_loci} loci")
+    print(f"    True positives: {best_validation['true_positives']} genes found")
+    print(f"    False negatives: {best_validation['false_negatives']} genes missed")
+    print(f"    False positives: {best_validation['false_positives']} extra genes")
+    print(f"    Recall: {best_recall*100:.1f}% of ground truth genes detected")
+    if best_validation['missed_loci']:
+        print(f"    Missed loci: {', '.join(best_validation['missed_loci'])}")
+    print("=" * 80)
+    print()
+
+    return best_params
 
 
 def parse_args() -> argparse.Namespace:
@@ -707,7 +1435,7 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Phase4_v2 output directory",
     )
-    p.add_argument("--evalue", type=str, default="1e-5")
+    p.add_argument("--evalue", type=str, default="1e-15")
     p.add_argument("--max-targets", type=int, default=10000)
     p.add_argument("--threads", type=int, default=16)
     p.add_argument(
@@ -796,6 +1524,14 @@ def main() -> None:
     print(f"[2] Found {len(genome_dbs)} genome databases")
     print()
 
+    # Defaults for clustering parameters (may be overridden by calibration)
+    final_threshold = QUERY_OVERLAP_THRESHOLD
+    final_min_coverage = MIN_CLUSTER_COVERAGE
+    final_evalue = float(args.evalue)
+    final_paralog_thresh = PARALOG_COVERAGE_THRESHOLD
+    final_gap_thresh = MAX_GAP_KB
+    final_merge_gap = 0.0
+
     # Determine query overlap threshold and min_coverage (calibrate or use fixed)
     if args.query_overlap_threshold is not None:
         # User specified threshold explicitly
@@ -832,11 +1568,19 @@ def main() -> None:
                 )
                 print(" done" if ok else " FAILED")
 
-        # Calibrate threshold and min_coverage
-        final_threshold, final_min_coverage = calibrate_threshold(
+        # Calibrate ALL clustering parameters using factorial grid search
+        (
+            final_threshold,
+            final_min_coverage,
+            final_evalue,
+            final_paralog_thresh,
+            final_gap_thresh,
+            final_merge_gap,
+        ) = calibrate_threshold_factorial(
             args.phase1_dir,
             blast_dir,
             default_threshold=QUERY_OVERLAP_THRESHOLD,
+            max_evalue=float(args.evalue),
         )
 
     all_rows: List[Dict] = []
@@ -864,15 +1608,18 @@ def main() -> None:
                 continue
 
         hsps = parse_blast_xml_with_query_coords(xml_path)
+        hsps = filter_hsps_by_evalue(hsps, final_evalue)
         if not hsps:
             print(f"    {genome_name}: no HSPs found")
             continue
 
         clusters = cluster_hsps_greedy(
             hsps,
-            paralog_coverage_threshold=PARALOG_COVERAGE_THRESHOLD,
+            paralog_coverage_threshold=final_paralog_thresh,
             min_cluster_coverage=final_min_coverage,
             query_overlap_threshold=final_threshold,
+            max_gap_kb=final_gap_thresh,
+            merge_gap_kb=final_merge_gap if final_merge_gap > 0 else None,
         )
 
         if not clusters:
