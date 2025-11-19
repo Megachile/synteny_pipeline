@@ -1319,10 +1319,10 @@ def calibrate_threshold_factorial(
     print()
 
     best_params = None
-    best_diff = float('inf')
-    best_fp = float('inf')
+    best_score = float("inf")
     best_validation = None
-    best_recall = 0
+    best_recall = 0.0
+    best_fp_ratio = 0.0
 
     tested = 0
     for evalue in evalue_vals:
@@ -1353,20 +1353,40 @@ def calibrate_threshold_factorial(
                                 clusters,
                                 ground_truth_genes,
                             )
-                            tp = validation['true_positives']
-                            fp = validation['false_positives']
+                            tp = validation["true_positives"]
+                            fp = validation["false_positives"]
 
-                            # Optimize: minimize difference from ground truth (get as close to 100% as possible)
-                            diff = abs(tp - total_gt_genes)
-                            recall = tp / total_gt_genes if total_gt_genes > 0 else 0
+                            # Recall and FP ratio relative to BK ground truth.
+                            if total_gt_genes > 0:
+                                recall = tp / total_gt_genes
+                                fp_ratio = fp / total_gt_genes
+                            else:
+                                recall = 0.0
+                                fp_ratio = 0.0
 
-                            # Update best: minimize deviation from ground truth, then minimize false positives
-                            if diff < best_diff or (diff == best_diff and fp < best_fp):
-                                best_diff = diff
-                                best_fp = fp
+                            # FP-aware objective (mirrors prototype_high_fp_calibration.py):
+                            # - Strongly penalize recall < 90%
+                            # - Within the acceptable window, trade off FP ratio against distance from 100% recall.
+                            if total_gt_genes == 0:
+                                score = float("inf")
+                            elif recall < 0.9:
+                                score = 1e6 + (0.9 - recall) * 1e3
+                            else:
+                                score = fp_ratio * 100.0 + abs(1.0 - recall) * 10.0
+
+                            if score < best_score:
+                                best_score = score
                                 best_validation = validation
                                 best_recall = recall
-                                best_params = (query_thresh, min_cov, evalue, paralog_thresh, gap_thresh, merge_gap)
+                                best_fp_ratio = fp_ratio
+                                best_params = (
+                                    query_thresh,
+                                    min_cov,
+                                    evalue,
+                                    paralog_thresh,
+                                    gap_thresh,
+                                    merge_gap,
+                                )
 
     if best_params is None:
         print("  ERROR: No valid parameter combinations found")
@@ -1398,6 +1418,8 @@ def calibrate_threshold_factorial(
     print(f"    True positives: {best_validation['true_positives']} genes found")
     print(f"    False negatives: {best_validation['false_negatives']} genes missed")
     print(f"    False positives: {best_validation['false_positives']} extra genes")
+    if total_gt_genes > 0:
+        print(f"    FP ratio (FP/GT): {best_fp_ratio:.3f}")
     print(f"    Recall: {best_recall*100:.1f}% of ground truth genes detected")
     if best_validation['missed_loci']:
         print(f"    Missed loci: {', '.join(best_validation['missed_loci'])}")
@@ -1405,6 +1427,191 @@ def calibrate_threshold_factorial(
     print()
 
     return best_params
+
+
+def calibrate_threshold_factorial_per_locus(
+    phase1_dir: Path,
+    blast_xml_dir: Path,
+    query_to_locus: Dict[str, str],
+    default_threshold: float = QUERY_OVERLAP_THRESHOLD,
+    max_evalue: float = 1e-5,
+) -> tuple[tuple[float, float, float, float, float, float], Dict[str, tuple[float, float, float, float, float, float]]]:
+    """
+    FACTORIAL calibration per BK locus.
+
+    Returns:
+        (global_best_params, params_by_locus)
+
+    Each params tuple is:
+        (query_overlap, min_coverage, evalue, paralog_coverage, max_gap_kb, merge_gap_kb)
+    """
+    # Get Phase 1 BK ground truth genes
+    ground_truth_genes, total_gt_genes = get_phase1_bk_genes(phase1_dir)
+
+    if total_gt_genes == 0:
+        return (
+            (
+                default_threshold,
+                MIN_CLUSTER_COVERAGE,
+                max_evalue,
+                PARALOG_COVERAGE_THRESHOLD,
+                MAX_GAP_KB,
+                0.0,
+            ),
+            {},
+        )
+
+    # FAMILY_MAX_MERGE_SPAN_KB is a family-level parameter: set from all BK genes.
+    spans_kb = [
+        (g["end"] - g["start"]) / 1000.0
+        for g in ground_truth_genes
+        if g["end"] > g["start"]
+    ]
+    if spans_kb:
+        spans_kb_sorted = sorted(spans_kb)
+        median_span = spans_kb_sorted[len(spans_kb_sorted) // 2]
+        max_span = spans_kb_sorted[-1]
+        global FAMILY_MAX_MERGE_SPAN_KB
+        FAMILY_MAX_MERGE_SPAN_KB = max(max_span * 1.5, median_span * 3.0)
+    else:
+        FAMILY_MAX_MERGE_SPAN_KB = None
+
+    # Find BK BLAST XML
+    bk_xml = find_bk_blast_xml(blast_xml_dir)
+    if not bk_xml:
+        return (
+            (
+                default_threshold,
+                MIN_CLUSTER_COVERAGE,
+                max_evalue,
+                PARALOG_COVERAGE_THRESHOLD,
+                MAX_GAP_KB,
+                0.0,
+            ),
+            {},
+        )
+
+    # Parse all HSPs once
+    all_hsps = parse_blast_xml_with_query_coords(bk_xml)
+
+    # Map BK genes by locus
+    genes_by_locus: Dict[str, List[dict]] = {}
+    for g in ground_truth_genes:
+        lid = g["locus_id"]
+        genes_by_locus.setdefault(lid, []).append(g)
+
+    # Map HSPs to locus via query_to_locus
+    hsps_by_locus: Dict[str, List[Dict]] = {}
+    for h in all_hsps:
+        qid = h.get("query_id", "")
+        base_qid = qid.split("|")[0]
+        locus = query_to_locus.get(qid) or query_to_locus.get(base_qid)
+        if not locus:
+            continue
+        if not locus.startswith("BK_"):
+            continue
+        hsps_by_locus.setdefault(locus, []).append(h)
+
+    # Inner factorial calibration for a single (genes, hsps) subset
+    def _calibrate_for_subset(
+        genes_subset: List[dict],
+        hsps_subset: List[Dict],
+    ) -> tuple[float, float, float, float, float, float]:
+        total_gt = len(genes_subset)
+        if total_gt == 0 or not hsps_subset:
+            return (
+                default_threshold,
+                MIN_CLUSTER_COVERAGE,
+                max_evalue,
+                PARALOG_COVERAGE_THRESHOLD,
+                MAX_GAP_KB,
+                0.0,
+            )
+
+        evalue_vals = [1e-5, 1e-10, 1e-15, 1e-20, 1e-30]
+        paralog_vals = [0.1, 0.3, 0.5, 0.7]
+        gap_vals = [10, 20, 50, 100, 150, 200]
+        merge_gap_vals = [0.0, 10.0, 30.0, 60.0]
+        query_overlap_vals = [0.1, 0.2, 0.5]
+        min_coverage_vals = [0.5, 0.3, 0.1]
+
+        best_params_local = None
+        best_score_local = float("inf")
+
+        for evalue in evalue_vals:
+            loc_hsps = filter_hsps_by_evalue(hsps_subset, evalue)
+            if not loc_hsps:
+                continue
+
+            for paralog_thresh in paralog_vals:
+                for gap_thresh in gap_vals:
+                    for merge_gap in merge_gap_vals:
+                        for query_thresh in query_overlap_vals:
+                            for min_cov in min_coverage_vals:
+                                clusters = cluster_hsps_greedy(
+                                    loc_hsps,
+                                    paralog_coverage_threshold=paralog_thresh,
+                                    min_cluster_coverage=min_cov,
+                                    query_overlap_threshold=query_thresh,
+                                    max_gap_kb=gap_thresh,
+                                    merge_gap_kb=merge_gap if merge_gap > 0 else None,
+                                )
+
+                                validation = validate_detections_vs_groundtruth_per_gene(
+                                    clusters,
+                                    genes_subset,
+                                )
+                                tp = validation["true_positives"]
+                                fp = validation["false_positives"]
+
+                                if total_gt > 0:
+                                    recall = tp / total_gt
+                                    fp_ratio = fp / total_gt
+                                else:
+                                    recall = 0.0
+                                    fp_ratio = 0.0
+
+                                if total_gt == 0:
+                                    score = float("inf")
+                                elif recall < 0.9:
+                                    score = 1e6 + (0.9 - recall) * 1e3
+                                else:
+                                    score = fp_ratio * 100.0 + abs(1.0 - recall) * 10.0
+
+                                if score < best_score_local:
+                                    best_score_local = score
+                                    best_params_local = (
+                                        query_thresh,
+                                        min_cov,
+                                        evalue,
+                                        paralog_thresh,
+                                        gap_thresh,
+                                        merge_gap,
+                                    )
+
+        if best_params_local is None:
+            return (
+                default_threshold,
+                MIN_CLUSTER_COVERAGE,
+                max_evalue,
+                PARALOG_COVERAGE_THRESHOLD,
+                MAX_GAP_KB,
+                0.0,
+            )
+        return best_params_local
+
+    # Global best (fallback/default): use all BK genes and all BK HSPs
+    global_best = _calibrate_for_subset(ground_truth_genes, all_hsps)
+
+    # Per-locus parameters
+    params_by_locus: Dict[str, tuple[float, float, float, float, float, float]] = {}
+    for locus_id, genes_subset in genes_by_locus.items():
+        hsps_subset = hsps_by_locus.get(locus_id)
+        if not hsps_subset:
+            continue
+        params_by_locus[locus_id] = _calibrate_for_subset(genes_subset, hsps_subset)
+
+    return global_best, params_by_locus
 
 
 def parse_args() -> argparse.Namespace:
@@ -1531,6 +1738,7 @@ def main() -> None:
     final_paralog_thresh = PARALOG_COVERAGE_THRESHOLD
     final_gap_thresh = MAX_GAP_KB
     final_merge_gap = 0.0
+    per_locus_params: Dict[str, tuple[float, float, float, float, float, float]] = {}
 
     # Determine query overlap threshold and min_coverage (calibrate or use fixed)
     if args.query_overlap_threshold is not None:
@@ -1568,7 +1776,15 @@ def main() -> None:
                 )
                 print(" done" if ok else " FAILED")
 
-        # Calibrate ALL clustering parameters using factorial grid search
+        # Calibrate clustering parameters using FP-aware factorial search.
+        # This returns a global default AND per-locus parameters for BK loci.
+        global_best, per_locus_params = calibrate_threshold_factorial_per_locus(
+            args.phase1_dir,
+            blast_dir,
+            query_to_locus,
+            default_threshold=QUERY_OVERLAP_THRESHOLD,
+            max_evalue=float(args.evalue),
+        )
         (
             final_threshold,
             final_min_coverage,
@@ -1576,12 +1792,7 @@ def main() -> None:
             final_paralog_thresh,
             final_gap_thresh,
             final_merge_gap,
-        ) = calibrate_threshold_factorial(
-            args.phase1_dir,
-            blast_dir,
-            default_threshold=QUERY_OVERLAP_THRESHOLD,
-            max_evalue=float(args.evalue),
-        )
+        ) = global_best
 
     all_rows: List[Dict] = []
 
@@ -1607,27 +1818,62 @@ def main() -> None:
             if not ok:
                 continue
 
-        hsps = parse_blast_xml_with_query_coords(xml_path)
-        hsps = filter_hsps_by_evalue(hsps, final_evalue)
-        if not hsps:
+        hsps_all = parse_blast_xml_with_query_coords(xml_path)
+        if not hsps_all:
             print(f"    {genome_name}: no HSPs found")
             continue
 
-        clusters = cluster_hsps_greedy(
-            hsps,
-            paralog_coverage_threshold=final_paralog_thresh,
-            min_cluster_coverage=final_min_coverage,
-            query_overlap_threshold=final_threshold,
-            max_gap_kb=final_gap_thresh,
-            merge_gap_kb=final_merge_gap if final_merge_gap > 0 else None,
-        )
+        # Partition HSPs by parent locus (via query_to_locus) and cluster per locus.
+        locus_to_hsps: Dict[str, List[Dict]] = {}
+        for h in hsps_all:
+            qid = h.get("query_id", "")
+            base_qid = qid.split("|")[0]
+            parent_locus = query_to_locus.get(qid) or query_to_locus.get(base_qid)
+            if not parent_locus:
+                continue
+            locus_to_hsps.setdefault(parent_locus, []).append(h)
+
+        clusters: List[Dict] = []
+        for parent_locus, hsps in locus_to_hsps.items():
+            (
+                locus_thresh,
+                locus_min_cov,
+                locus_evalue,
+                locus_paralog,
+                locus_gap,
+                locus_merge_gap,
+            ) = per_locus_params.get(
+                parent_locus,
+                (
+                    final_threshold,
+                    final_min_coverage,
+                    final_evalue,
+                    final_paralog_thresh,
+                    final_gap_thresh,
+                    final_merge_gap,
+                ),
+            )
+
+            hsps_filt = filter_hsps_by_evalue(hsps, locus_evalue)
+            if not hsps_filt:
+                continue
+
+            loc_clusters = cluster_hsps_greedy(
+                hsps_filt,
+                paralog_coverage_threshold=locus_paralog,
+                min_cluster_coverage=locus_min_cov,
+                query_overlap_threshold=locus_thresh,
+                max_gap_kb=locus_gap,
+                merge_gap_kb=locus_merge_gap if locus_merge_gap > 0 else None,
+            )
+            clusters.extend(loc_clusters)
 
         if not clusters:
             print(f"    {genome_name}: no clusters above coverage threshold")
             continue
 
         print(
-            f"    {genome_name}: {len(hsps)} HSPs → {len(clusters)} gene-level hits"
+            f"    {genome_name}: {len(hsps_all)} HSPs → {len(clusters)} gene-level hits"
         )
 
         # Convert clusters to rows, attaching parent_locus via query_to_locus

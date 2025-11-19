@@ -397,115 +397,193 @@ def extract_block_genes(block, query_protein_file, genome_fasta, output_dir):
     if not best_features:
         return []
 
-    # Group features by gene (gene_id from GFF attributes)
-    genes_by_id = defaultdict(lambda: {'features': [], 'cds_features': []})
+    # ----------------------------------------------------------------------
+    # Group features into candidate genes and pick the best model per block
+    # ----------------------------------------------------------------------
+    gene_features = [f for f in best_features if f["type"] == "gene"]
+    cds_features_all = [
+        f for f in best_features if f["type"].lower() in ["cds", "coding_exon", "exon"]
+    ]
 
-    for feature in best_features:
-        if feature['type'] == 'gene':
-            # Extract gene_id from attributes
-            attrs = feature['attributes']
+    genes = []
+    if gene_features:
+        # Use gene feature coordinates to group CDS/exon features
+        for gf in gene_features:
+            attrs = gf["attributes"]
             gene_id = None
-            for attr in attrs.split(';'):
+            for attr in attrs.split(";"):
                 attr = attr.strip()
-                if attr.startswith('gene_id'):
-                    gene_id = attr.split()[1]
+                if attr.startswith("gene_id"):
+                    parts = attr.split()
+                    if len(parts) >= 2:
+                        gene_id = parts[1]
                     break
+            if gene_id is None:
+                continue
+            g_start = gf["start"]
+            g_end = gf["end"]
+            g_strand = gf["strand"]
+            g_seqname = gf["seqname"]
+            assigned = [
+                f
+                for f in cds_features_all
+                if f["seqname"] == g_seqname
+                and f["strand"] == g_strand
+                and not (f["end"] < g_start or f["start"] > g_end)
+            ]
+            if assigned:
+                genes.append((gene_id, assigned))
+    else:
+        # No explicit gene features; treat all CDS features as one candidate
+        if cds_features_all:
+            genes.append(("1", cds_features_all))
 
-            if gene_id:
-                genes_by_id[gene_id]['gene_info'] = feature
-        elif feature['type'] in ['cds', 'exon', 'coding_exon']:
-            # Add to first gene (Exonerate typically outputs one gene per run)
-            gene_id = '1'
-            genes_by_id[gene_id]['cds_features'].append(feature)
-            genes_by_id[gene_id]['features'].append(feature)
+    if not genes:
+        return []
 
-    # If no genes found by gene_id, create a single gene from all CDS features
-    if not genes_by_id:
-        cds_features = [f for f in best_features if f['type'] in ['cds', 'exon', 'coding_exon']]
-        if cds_features:
-            genes_by_id['1'] = {
-                'cds_features': cds_features,
-                'features': cds_features,
-                'strand': cds_features[0]['strand']
-            }
-
-    # Extract CDS and classify each gene
-    extracted_genes = []
-
-    for gene_id, gene_data in genes_by_id.items():
-        cds_features = gene_data['cds_features']
-
+    # Build candidates with classification
+    candidates = []
+    for gene_id, cds_features in genes:
         if not cds_features:
             continue
 
-        # Extract CDS sequence
         cds_seq = extract_cds_sequence(
             genome_file=best_region_file,
-            features=cds_features
+            features=cds_features,
         )
-
-        # Classify functional status with query-length awareness
         classification = classify_gene_status(cds_features, cds_seq, query_length_aa)
 
         # Extract full genomic sequence (gene with introns)
         genomic_seq = None
         if cds_features:
-            gene_start = min(f['start'] for f in cds_features)
-            gene_end = max(f['end'] for f in cds_features)
-
-            with open(best_region_file, 'r') as f:
-                for record in SeqIO.parse(f, 'fasta'):
-                    genomic_seq = str(record.seq)[gene_start-1:gene_end]
-                    if cds_features[0]['strand'] == '-':
+            gene_start = min(f["start"] for f in cds_features)
+            gene_end = max(f["end"] for f in cds_features)
+            with open(best_region_file, "r") as f:
+                for record in SeqIO.parse(f, "fasta"):
+                    genomic_seq = str(record.seq)[gene_start - 1 : gene_end]
+                    if cds_features[0]["strand"] == "-":
                         genomic_seq = str(Seq(genomic_seq).reverse_complement())
                     break
 
-        # Translate CDS to protein
         protein_seq = None
         if cds_seq and len(cds_seq) % 3 == 0:
             try:
                 protein_seq = str(Seq(cds_seq).translate(to_stop=False))
-            except:
+            except Exception:
                 protein_seq = None
 
-        # Save sequences
-        if cds_seq:
-            # Save CDS sequence
-            cds_file = output_dir / f"{block['block_id']}_gene{gene_id}_cds.fasta"
-            with open(cds_file, 'w') as f:
-                header = f">gene{gene_id} {block['scaffold']}:{block['start']}-{block['end']} strand:{gene_data.get('strand', '+')} status:{classification['functional_status']} exons:{len(cds_features)}"
-                f.write(header + "\n")
-                f.write(cds_seq + "\n")
+        candidates.append(
+            {
+                "exon_gene_id": gene_id,
+                "cds_features": cds_features,
+                "cds_seq": cds_seq,
+                "genomic_seq": genomic_seq,
+                "protein_seq": protein_seq,
+                "classification": classification,
+            }
+        )
 
-        if genomic_seq:
-            # Save genomic sequence
-            genomic_file = output_dir / f"{block['block_id']}_gene{gene_id}_genomic.fasta"
-            with open(genomic_file, 'w') as f:
-                header = f">gene{gene_id} {block['scaffold']}:{block['start']}-{block['end']} strand:{gene_data.get('strand', '+')} type:genomic_with_introns length:{len(genomic_seq)}bp"
-                f.write(header + "\n")
-                f.write(genomic_seq + "\n")
+    if not candidates:
+        return []
 
-        if protein_seq:
-            # Save protein sequence
-            protein_file = output_dir / f"{block['block_id']}_gene{gene_id}_protein.fasta"
-            with open(protein_file, 'w') as f:
-                header = f">gene{gene_id} {block['scaffold']}:{block['start']}-{block['end']} strand:{gene_data.get('strand', '+')} length:{len(protein_seq)}aa"
-                f.write(header + "\n")
-                f.write(protein_seq + "\n")
+    # Choose best candidate: prefer intact > fragment > pseudogene, then coverage
+    def status_rank(fs: str) -> int:
+        if fs == "intact":
+            return 2
+        if fs == "fragment":
+            return 1
+        if fs == "pseudogene":
+            return 0
+        return -1
 
-        extracted_genes.append({
-            'gene_id': gene_id,
-            'scaffold': block['scaffold'],
-            'start': block['start'],
-            'end': block['end'],
-            'strand': gene_data.get('strand', '+'),
-            'functional_status': classification['functional_status'],
-            'cds_seq': cds_seq,
-            'protein_seq': protein_seq,
-            'genomic_seq': genomic_seq,
-            'num_exons': len(cds_features),
-            'best_flank': best_flank
-        })
+    best_idx = max(
+        range(len(candidates)),
+        key=lambda i: (
+            status_rank(candidates[i]["classification"]["functional_status"]),
+            candidates[i]["classification"]["coverage_pct"],
+        ),
+    )
+    best = candidates[best_idx]
+
+    cds_features = best["cds_features"]
+    cds_seq = best["cds_seq"]
+    genomic_seq = best["genomic_seq"]
+    protein_seq = best["protein_seq"]
+    classification = best["classification"]
+
+    # Length sanity flag
+    qlen = query_length_aa or 0
+    plen = classification.get("extracted_length_aa", 0)
+    length_flag = "unknown"
+    if qlen > 0 and plen > 0:
+        ratio = plen / qlen
+        if 0.8 <= ratio <= 1.3:
+            length_flag = "ok"
+        elif ratio < 0.8:
+            length_flag = "short"
+        else:
+            length_flag = "long"
+
+    # Save sequences: always name the chosen model as gene1 for downstream tools
+    extracted_genes = []
+    gene_id_out = "1"
+
+    if cds_seq:
+        cds_file = output_dir / f"{block['block_id']}_gene{gene_id_out}_cds.fasta"
+        with open(cds_file, "w") as f:
+            header = (
+                f">gene{gene_id_out} {block['scaffold']}:{block['start']}-{block['end']} "
+                f"strand:{cds_features[0].get('strand', '+')} "
+                f"status:{classification['functional_status']} "
+                f"exons:{len(cds_features)} "
+                f"query_len:{qlen}aa "
+                f"cov:{classification['coverage_pct']:.1f}% "
+                f"len_flag:{length_flag}"
+            )
+            f.write(header + "\n")
+            f.write(cds_seq + "\n")
+
+    if genomic_seq:
+        genomic_file = output_dir / f"{block['block_id']}_gene{gene_id_out}_genomic.fasta"
+        with open(genomic_file, "w") as f:
+            header = (
+                f">gene{gene_id_out} {block['scaffold']}:{block['start']}-{block['end']} "
+                f"strand:{cds_features[0].get('strand', '+')} "
+                f"type:genomic_with_introns length:{len(genomic_seq)}bp"
+            )
+            f.write(header + "\n")
+            f.write(genomic_seq + "\n")
+
+    if protein_seq:
+        protein_file = output_dir / f"{block['block_id']}_gene{gene_id_out}_protein.fasta"
+        with open(protein_file, "w") as f:
+            header = (
+                f">gene{gene_id_out} {block['scaffold']}:{block['start']}-{block['end']} "
+                f"strand:{cds_features[0].get('strand', '+')} "
+                f"length:{len(protein_seq)}aa "
+                f"query_len:{qlen}aa "
+                f"cov:{classification['coverage_pct']:.1f}% "
+                f"len_flag:{length_flag}"
+            )
+            f.write(header + "\n")
+            f.write(protein_seq + "\n")
+
+    extracted_genes.append(
+        {
+            "gene_id": gene_id_out,
+            "scaffold": block["scaffold"],
+            "start": block["start"],
+            "end": block["end"],
+            "strand": cds_features[0].get("strand", "+"),
+            "functional_status": classification["functional_status"],
+            "cds_seq": cds_seq,
+            "protein_seq": protein_seq,
+            "genomic_seq": genomic_seq,
+            "num_exons": len(cds_features),
+            "best_flank": best_flank,
+            "length_flag": length_flag,
+        }
+    )
 
     # Clean up temp files
     if best_region_file:
