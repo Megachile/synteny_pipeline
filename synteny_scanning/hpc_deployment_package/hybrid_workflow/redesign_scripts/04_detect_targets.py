@@ -1697,6 +1697,12 @@ def parse_args() -> argparse.Namespace:
         default=40,
         help="(unused) retained for backward-compatible CLI",
     )
+    p.add_argument(
+        "--genome-filter",
+        type=str,
+        default=None,
+        help="Only run against genomes matching this substring (e.g., 'belonocnema_kinseyi')",
+    )
     return p.parse_args()
 
 
@@ -1757,16 +1763,26 @@ def main() -> None:
     genome_dbs: Dict[str, Dict[str, object]] = {}
     for db_file in sorted(args.genome_db_dir.glob("*.nhr")):
         genome_name = db_file.stem
+
+        # Apply genome filter if specified
+        if args.genome_filter:
+            if args.genome_filter.lower() not in genome_name.lower():
+                continue
+
         genome_dbs[genome_name] = {
             "db": args.genome_db_dir / genome_name,
             "genome_id": _normalize_genome_id(genome_name),
         }
 
     if not genome_dbs:
-        print(f"ERROR: no *.nhr BLAST DBs found in {args.genome_db_dir}")
+        if args.genome_filter:
+            print(f"ERROR: no *.nhr BLAST DBs matching filter '{args.genome_filter}' found in {args.genome_db_dir}")
+        else:
+            print(f"ERROR: no *.nhr BLAST DBs found in {args.genome_db_dir}")
         return
 
-    print(f"[2] Found {len(genome_dbs)} genome databases")
+    print(f"[2] Found {len(genome_dbs)} genome databases" +
+          (f" matching filter '{args.genome_filter}'" if args.genome_filter else ""))
     print()
 
     # Defaults for clustering parameters (may be overridden by calibration)
