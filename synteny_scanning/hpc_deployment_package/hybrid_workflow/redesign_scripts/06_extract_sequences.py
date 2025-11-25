@@ -336,32 +336,6 @@ def compute_length_flag(query_length_aa: int, extracted_length_aa: int) -> str:
     return "long"
 
 
-def needs_rescue(classification: Dict, length_flag: str) -> bool:
-    """
-    Determine whether a candidate should be sent to the gene-centered rescue pass.
-
-    Incomplete candidates:
-      - functional_status in {fragment, pseudogene}, OR
-      - coverage_pct < 80, OR
-      - len_flag == "short"
-    """
-    fs = str(classification.get("functional_status", "unknown"))
-    if fs in {"fragment", "pseudogene"}:
-        return True
-
-    cov = classification.get("coverage_pct", 0.0) or 0.0
-    try:
-        cov_f = float(cov)
-    except Exception:
-        cov_f = 0.0
-
-    if cov_f < 80.0:
-        return True
-    if length_flag == "short":
-        return True
-    return False
-
-
 def compute_gene_genomic_span(
     block: Dict, best_flank: int, cds_features: List[Dict]
 ) -> Tuple[int, int]:
@@ -425,6 +399,74 @@ def group_exonerate_features_into_genes(features: List[Dict]) -> List[Tuple[str,
             genes.append(("1", cds_features_all))
 
     return genes
+
+
+def maybe_split_long_gene(
+    gene_id: str,
+    cds_features: List[Dict],
+    query_length_aa: int,
+    min_cov_for_split: float = 1.4,
+) -> List[Tuple[str, List[Dict]]]:
+    """
+    Heuristically split very long candidate genes into multiple sub-genes
+    based on cumulative CDS length along the target.
+
+    This is intended to handle cases where Exonerate merges tandem genes
+    into a single "mega-gene" model. We do not use any annotations; we
+    rely only on the query length and the geometry of CDS features.
+    """
+    if not cds_features or query_length_aa <= 0:
+        return [(gene_id, cds_features)]
+
+    total_cds_len = sum(f["end"] - f["start"] + 1 for f in cds_features)
+    cov = total_cds_len / float(query_length_aa * 3)
+    if cov <= float(min_cov_for_split):
+        # Not dramatically longer than the query; leave as-is.
+        return [(gene_id, cds_features)]
+
+    if len(cds_features) < 2:
+        return [(gene_id, cds_features)]
+
+    # Sort CDS features by genomic position
+    feats_sorted = sorted(cds_features, key=lambda f: (f["seqname"], f["start"], f["end"]))
+
+    target_len = query_length_aa * 3
+    max_seg_len = int(target_len * 1.4)
+    min_seg_len = int(target_len * 0.6)
+
+    segments: List[List[Dict]] = []
+    cur: List[Dict] = []
+    cur_len = 0
+
+    for f in feats_sorted:
+        fe_len = f["end"] - f["start"] + 1
+        if cur and cur_len + fe_len > max_seg_len:
+            # If current segment is reasonably sized, start a new one;
+            # otherwise allow it to grow a bit more.
+            if cur_len >= min_seg_len:
+                segments.append(cur)
+                cur = [f]
+                cur_len = fe_len
+            else:
+                cur.append(f)
+                cur_len += fe_len
+        else:
+            cur.append(f)
+            cur_len += fe_len
+
+    if cur:
+        segments.append(cur)
+
+    # If splitting did not actually create multiple segments, keep original.
+    if len(segments) <= 1:
+        return [(gene_id, cds_features)]
+
+    # Build new gene ids per segment
+    split_genes: List[Tuple[str, List[Dict]]] = []
+    for idx, seg in enumerate(segments, start=1):
+        split_genes.append((f"{gene_id}_part{idx}", seg))
+
+    return split_genes
 
 
 def build_candidate_from_features(
@@ -522,36 +564,134 @@ def is_better_candidate(
     return False
 
 
-def rescue_candidate_with_local_window(
+def parse_exonerate_alignment_summary(
+    exonerate_output: str,
+) -> Tuple[float, Optional[Tuple[int, int]]]:
+    """
+    Parse Exonerate custom RYO headers to obtain best query coverage and
+    corresponding target coordinates (window-relative).
+
+    Returns:
+        (best_query_cov_fraction, (best_tab, best_tae) or None)
+    """
+    best_cov = 0.0
+    best_tab: Optional[int] = None
+    best_tae: Optional[int] = None
+
+    current_qlen: Optional[int] = None
+    last_qab: Optional[int] = None
+    last_qae: Optional[int] = None
+
+    with open(exonerate_output, "r") as f:
+        for line in f:
+            if line.startswith("# Query: "):
+                # Example: "# Query: XP_... (343 bp)"
+                if "(" in line and "bp" in line:
+                    try:
+                        size_part = line.split("(", 1)[1].split("bp", 1)[0]
+                        size_str = "".join(ch for ch in size_part if ch.isdigit())
+                        current_qlen = int(size_str)
+                    except Exception:
+                        current_qlen = None
+            elif line.startswith("# Query range: "):
+                # Example: "# Query range: 1-343"
+                try:
+                    rng = line.split(":", 1)[1].strip()
+                    qs, qe = rng.split("-", 1)
+                    last_qab = int(qs)
+                    last_qae = int(qe)
+                except Exception:
+                    last_qab = None
+                    last_qae = None
+            elif line.startswith("# Target range: "):
+                # Example: "# Target range: 123-456"
+                try:
+                    rng = line.split(":", 1)[1].strip()
+                    ts, te = rng.split("-", 1)
+                    tab = int(ts)
+                    tae = int(te)
+                except Exception:
+                    continue
+
+                if current_qlen and last_qab is not None and last_qae is not None:
+                    qcov = (last_qae - last_qab + 1) / float(current_qlen)
+                    if qcov > best_cov:
+                        best_cov = qcov
+                        best_tab = tab
+                        best_tae = tae
+
+    if best_tab is not None and best_tae is not None:
+        return best_cov, (best_tab, best_tae)
+    return best_cov, None
+
+
+def parse_region_header(fasta_path: str) -> Optional[Tuple[str, int, int]]:
+    """
+    Parse the scaffold and genomic coordinates from a region FASTA header.
+
+    Headers are written by extract_genomic_region as:
+      >scaffold:start-end
+    """
+    try:
+        with open(fasta_path, "r") as f:
+            for line in f:
+                if line.startswith(">"):
+                    header = line[1:].strip()
+                    if ":" in header and "-" in header:
+                        scaff, coords = header.split(":", 1)
+                        s_str, e_str = coords.split("-", 1)
+                        return scaff, int(s_str), int(e_str)
+                    break
+    except Exception:
+        return None
+    return None
+
+
+def maybe_rescue_block_with_alignment_window(
     block: Dict,
     genome_fasta: str,
     query_protein_file: str,
-    candidate: Dict,
-    query_length_aa: int,
+    best_region_file: str,
+    best_exonerate_output: str,
+    best_query_cov: float,
+    best_target_range: Optional[Tuple[int, int]],
     output_dir: Path,
     rescue_flank: int = 10000,
-) -> Dict:
+    min_improvement: float = 0.10,
+    complete_threshold: float = 0.90,
+) -> Tuple[List[Dict], str, float, Optional[Tuple[int, int]]]:
     """
-    Run a second-pass, gene-centered Exonerate window for an incomplete candidate.
+    Optionally run a second Exonerate pass in an alignment-centered rescue window.
 
-    Uses only canonical pipeline inputs (block geometry + Exonerate CDS features)
-    to define the rescue window; does not rely on BK annotations.
+    This uses Exonerate's own query-range coverage and target range from the
+    best initial run to define a genomic window around the aligned region.
+    If the rescue run achieves a clearly better query coverage, its features
+    replace the original ones for downstream gene reconstruction.
     """
-    cds_features = candidate.get("cds_features") or []
-    best_flank = candidate.get("best_flank", 0)
+    # Create unique target tag for output filenames
+    target_tag = f"{block['block_id']}_{block['start']}_{block['end']}"
 
-    if not cds_features:
-        return candidate
+    # If we are already effectively complete, skip rescue.
+    if best_query_cov >= complete_threshold:
+        return parse_exonerate_gff(best_exonerate_output), best_region_file, best_query_cov, best_target_range
 
-    try:
-        gene_start, gene_end = compute_gene_genomic_span(block, int(best_flank), cds_features)
-    except Exception:
-        return candidate
+    if best_target_range is None:
+        return parse_exonerate_gff(best_exonerate_output), best_region_file, best_query_cov, best_target_range
 
-    rescue_start = max(1, gene_start - int(rescue_flank))
-    rescue_end = gene_end + int(rescue_flank)
+    header = parse_region_header(best_region_file)
+    if header is None:
+        return parse_exonerate_gff(best_exonerate_output), best_region_file, best_query_cov, best_target_range
 
-    # Extract rescue window FASTA with no additional flank (already included).
+    region_scaffold, region_start, region_end = header
+    tab, tae = best_target_range
+
+    # Convert target (window-relative) positions to genomic coordinates.
+    align_start = region_start + tab - 1
+    align_end = region_start + tae - 1
+
+    rescue_start = max(1, align_start - int(rescue_flank))
+    rescue_end = align_end + int(rescue_flank)
+
     rescue_region = extract_genomic_region(
         genome_fasta=str(genome_fasta),
         scaffold=block["scaffold"],
@@ -560,9 +700,9 @@ def rescue_candidate_with_local_window(
         flank=0,
     )
     if not rescue_region:
-        return candidate
+        return parse_exonerate_gff(best_exonerate_output), best_region_file, best_query_cov, best_target_range
 
-    rescue_output = output_dir / f"{block['block_id']}_gene{candidate.get('exon_gene_id', '1')}_rescue.txt"
+    rescue_output = output_dir / f"{target_tag}_exonerate_rescue.txt"
     success = run_exonerate(
         query_protein=str(query_protein_file),
         target_dna=rescue_region,
@@ -573,38 +713,37 @@ def rescue_candidate_with_local_window(
     if not success:
         Path(rescue_region).unlink(missing_ok=True)
         rescue_output.unlink(missing_ok=True)
-        return candidate
+        return parse_exonerate_gff(best_exonerate_output), best_region_file, best_query_cov, best_target_range
 
     rescue_features = parse_exonerate_gff(str(rescue_output))
     if not rescue_features:
         Path(rescue_region).unlink(missing_ok=True)
         rescue_output.unlink(missing_ok=True)
-        return candidate
+        return parse_exonerate_gff(best_exonerate_output), best_region_file, best_query_cov, best_target_range
 
-    rescue_genes = group_exonerate_features_into_genes(rescue_features)
-    rescue_candidates: List[Dict] = []
-    for gene_id, cds_feats in rescue_genes:
-        rc = build_candidate_from_features(
-            gene_internal_id=gene_id,
-            cds_features=cds_feats,
-            region_fasta=rescue_region,
-            query_length_aa=query_length_aa,
-        )
-        if rc is not None:
-            rc["best_flank"] = best_flank
-            rescue_candidates.append(rc)
+    rescue_cov, rescue_target_range = parse_exonerate_alignment_summary(str(rescue_output))
 
-    # Clean up temporary rescue files to avoid inode bloat.
+    # Decide whether rescue is meaningfully better.
+    improved = False
+    # Strong improvement: rescue clearly outperforms original and/or crosses
+    # the completeness threshold.
+    if rescue_cov >= max(best_query_cov + float(min_improvement), complete_threshold):
+        improved = True
+    # For clearly deficient initial coverage, allow a rescue that reaches a
+    # reasonable threshold even if it does not hit the 0.9 bar.
+    elif best_query_cov < 0.70 and rescue_cov >= 0.80:
+        improved = True
+
+    if improved:
+        # Drop original region; keep rescue region instead.
+        Path(best_region_file).unlink(missing_ok=True)
+        Path(rescue_output).unlink(missing_ok=True)
+        return rescue_features, rescue_region, rescue_cov, rescue_target_range
+
+    # Otherwise keep original and discard rescue artifacts.
     Path(rescue_region).unlink(missing_ok=True)
-    rescue_output.unlink(missing_ok=True)
-
-    if not rescue_candidates:
-        return candidate
-
-    best_rescue = sorted(rescue_candidates, key=candidate_sort_key, reverse=True)[0]
-    if is_better_candidate(best_rescue, candidate):
-        return best_rescue
-    return candidate
+    Path(rescue_output).unlink(missing_ok=True)
+    return parse_exonerate_gff(best_exonerate_output), best_region_file, best_query_cov, best_target_range
 
 # =============================================================================
 # EXTRACTION WITH ADAPTIVE WINDOWING (consolidated from extract_with_exonerate.py)
@@ -629,6 +768,10 @@ def extract_block_genes(block, query_protein_file, genome_fasta, output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
 
+    # Create unique target tag including coordinates to avoid overwriting
+    # when multiple targets share the same block_id
+    target_tag = f"{block['block_id']}_{block['start']}_{block['end']}"
+
     # Adaptive windowing strategy
     flank_sizes = [0, 1000, 5000, 10000, 15000, 20000, 50000, 100000, 200000]
 
@@ -641,19 +784,26 @@ def extract_block_genes(block, query_protein_file, genome_fasta, output_dir):
     except:
         query_length_aa = 169  # Default fallback
 
-    best_features = []
+    best_features: List[Dict] = []
     best_region_file = None
     best_exonerate_output = None
     best_flank = 0
-    best_coverage = 0
+    best_coverage = 0.0
+    best_query_cov = 0.0
+    best_target_range: Optional[Tuple[int, int]] = None
+
+    # If an HSP-based envelope is available for this block, prefer it as the
+    # core window; otherwise fall back to the Phase5 target start/end.
+    core_start = block.get("hsp_env_start", block["start"])
+    core_end = block.get("hsp_env_end", block["end"])
 
     for flank in flank_sizes:
         # Extract genomic region with current flanking size
         region_file = extract_genomic_region(
             genome_fasta=str(genome_fasta),
             scaffold=block['scaffold'],
-            start=block['start'],
-            end=block['end'],
+            start=core_start,
+            end=core_end,
             flank=flank
         )
 
@@ -661,7 +811,7 @@ def extract_block_genes(block, query_protein_file, genome_fasta, output_dir):
             continue
 
         # Run Exonerate
-        exonerate_output = output_dir / f"{block['block_id']}_exonerate_flank{flank}.txt"
+        exonerate_output = output_dir / f"{target_tag}_exonerate_flank{flank}.txt"
         success = run_exonerate(
             query_protein=str(query_protein_file),
             target_dna=region_file,
@@ -673,23 +823,28 @@ def extract_block_genes(block, query_protein_file, genome_fasta, output_dir):
             Path(region_file).unlink(missing_ok=True)
             continue
 
-        # Parse Exonerate results
+        # Parse Exonerate results (GFF features + alignment summary)
         features = parse_exonerate_gff(str(exonerate_output))
 
         if not features:
             Path(region_file).unlink(missing_ok=True)
             continue
 
+        run_query_cov, run_target_range = parse_exonerate_alignment_summary(str(exonerate_output))
+
         # Calculate coverage
         cds_features = [f for f in features if f['type'].lower() in ['cds', 'coding_exon', 'exon']]
         total_cds_length = sum(f['end'] - f['start'] + 1 for f in cds_features) if cds_features else 0
         coverage = total_cds_length / (query_length_aa * 3) if query_length_aa > 0 else 0
 
-        # Check for completeness
-        is_complete = coverage >= 0.90  # 90% coverage threshold
+        # Prefer Exonerate's own query-range coverage when available
+        effective_cov = run_query_cov if run_query_cov > 0.0 else coverage
+
+        # Check for completeness using alignment-aware coverage
+        is_complete = effective_cov >= 0.90  # 90% coverage threshold
 
         # Keep track of best result
-        if coverage > best_coverage:
+        if effective_cov > best_coverage:
             if best_region_file and best_region_file != region_file:
                 Path(best_region_file).unlink(missing_ok=True)
 
@@ -697,7 +852,9 @@ def extract_block_genes(block, query_protein_file, genome_fasta, output_dir):
             best_region_file = region_file
             best_exonerate_output = exonerate_output
             best_flank = flank
-            best_coverage = coverage
+            best_coverage = effective_cov
+            best_query_cov = run_query_cov if run_query_cov > 0.0 else coverage
+            best_target_range = run_target_range
 
         # If we found a complete gene, stop searching
         if is_complete:
@@ -712,15 +869,51 @@ def extract_block_genes(block, query_protein_file, genome_fasta, output_dir):
         return []
 
     # ----------------------------------------------------------------------
+    # Optional alignment-centered rescue at the block level
+    # ----------------------------------------------------------------------
+    # Use Exonerate's query-range coverage to decide whether to re-run in
+    # a gene-centered expanded window around the aligned region.
+    if best_exonerate_output is not None and best_region_file is not None:
+        rescued_features, rescued_region_file, rescued_cov, rescued_target_range = (
+            maybe_rescue_block_with_alignment_window(
+                block=block,
+                genome_fasta=str(genome_fasta),
+                query_protein_file=str(query_protein_file),
+                best_region_file=str(best_region_file),
+                best_exonerate_output=str(best_exonerate_output),
+                best_query_cov=float(best_query_cov or 0.0),
+                best_target_range=best_target_range,
+                output_dir=output_dir,
+            )
+        )
+        best_features = rescued_features
+        best_region_file = rescued_region_file
+        best_query_cov = rescued_cov
+        best_target_range = rescued_target_range
+
+    # ----------------------------------------------------------------------
     # Group features into candidate genes and build per-gene candidates
     # ----------------------------------------------------------------------
-    genes = group_exonerate_features_into_genes(best_features)
+    base_genes = group_exonerate_features_into_genes(best_features)
+    if not base_genes:
+        return []
+
+    # Optionally split very long genes (likely merged tandems) into
+    # multiple sub-genes using CDS length heuristics.
+    genes: List[Tuple[str, List[Dict]]] = []
+    for gene_id, cds_features in base_genes:
+        for sgid, seg_feats in maybe_split_long_gene(
+            gene_id=gene_id,
+            cds_features=cds_features,
+            query_length_aa=query_length_aa,
+        ):
+            genes.append((sgid, seg_feats))
 
     if not genes:
         return []
 
     # Build candidates with classification
-    candidates = []
+    candidates: List[Dict] = []
     for gene_id, cds_features in genes:
         cand = build_candidate_from_features(
             gene_internal_id=gene_id,
@@ -741,11 +934,10 @@ def extract_block_genes(block, query_protein_file, genome_fasta, output_dir):
         return extracted_genes
 
     # ----------------------------------------------------------------------
-    # Optional gene-centered rescue for incomplete candidates
+    # Finalize candidates: compute length flags and write out sequences
     # ----------------------------------------------------------------------
     qlen = query_length_aa or 0
 
-    rescued_candidates: List[Dict] = []
     for cand in candidates:
         cls = cand.get("classification", {}) or {}
         plen = cls.get("extracted_length_aa", 0) or 0
@@ -753,35 +945,12 @@ def extract_block_genes(block, query_protein_file, genome_fasta, output_dir):
             plen_i = int(plen)
         except Exception:
             plen_i = 0
-        length_flag = compute_length_flag(qlen, plen_i)
-        cand["length_flag"] = length_flag
-
-        if needs_rescue(cls, length_flag):
-            # Run a single gene-centered rescue attempt for this candidate.
-            rescued = rescue_candidate_with_local_window(
-                block=block,
-                genome_fasta=str(genome_fasta),
-                query_protein_file=str(query_protein_file),
-                candidate=cand,
-                query_length_aa=qlen,
-                output_dir=output_dir,
-            )
-            # Recompute length_flag after rescue in case coverage/length changed.
-            r_cls = rescued.get("classification", {}) or {}
-            r_plen = r_cls.get("extracted_length_aa", 0) or 0
-            try:
-                r_plen_i = int(r_plen)
-            except Exception:
-                r_plen_i = 0
-            rescued["length_flag"] = compute_length_flag(qlen, r_plen_i)
-            rescued_candidates.append(rescued)
-        else:
-            rescued_candidates.append(cand)
+        cand["length_flag"] = compute_length_flag(qlen, plen_i)
 
     # Choose ordering: prefer intact > fragment > pseudogene, then coverage.
     # We still write the best candidate as gene1 to preserve downstream
     # assumptions, but keep additional candidates as gene2, gene3, ...
-    sorted_candidates = sorted(rescued_candidates, key=candidate_sort_key, reverse=True)
+    sorted_candidates = sorted(candidates, key=candidate_sort_key, reverse=True)
 
     for idx, cand in enumerate(sorted_candidates, start=1):
         gene_id_out = str(idx)
@@ -795,7 +964,7 @@ def extract_block_genes(block, query_protein_file, genome_fasta, output_dir):
         strand = cds_features[0].get("strand", "+") if cds_features else "+"
 
         if cds_seq:
-            cds_file = output_dir / f"{block['block_id']}_gene{gene_id_out}_cds.fasta"
+            cds_file = output_dir / f"{target_tag}_gene{gene_id_out}_cds.fasta"
             with open(cds_file, "w") as f:
                 header = (
                     f">gene{gene_id_out} {block['scaffold']}:{block['start']}-{block['end']} "
@@ -810,7 +979,7 @@ def extract_block_genes(block, query_protein_file, genome_fasta, output_dir):
                 f.write(cds_seq + "\n")
 
         if genomic_seq:
-            genomic_file = output_dir / f"{block['block_id']}_gene{gene_id_out}_genomic.fasta"
+            genomic_file = output_dir / f"{target_tag}_gene{gene_id_out}_genomic.fasta"
             with open(genomic_file, "w") as f:
                 header = (
                     f">gene{gene_id_out} {block['scaffold']}:{block['start']}-{block['end']} "
@@ -821,7 +990,7 @@ def extract_block_genes(block, query_protein_file, genome_fasta, output_dir):
                 f.write(genomic_seq + "\n")
 
         if protein_seq:
-            protein_file = output_dir / f"{block['block_id']}_gene{gene_id_out}_protein.fasta"
+            protein_file = output_dir / f"{target_tag}_gene{gene_id_out}_protein.fasta"
             with open(protein_file, "w") as f:
                 header = (
                     f">gene{gene_id_out} {block['scaffold']}:{block['start']}-{block['end']} "
@@ -1033,6 +1202,53 @@ def deduplicate_targets_by_overlap(targets_df):
     return dedup_df, removed_rows
 
 # =============================================================================
+# HSP-BASED WINDOW ENVELOPES
+# =============================================================================
+
+def get_hsp_envelope(
+    phase2_root: Path,
+    parent_locus: str,
+    genome_name: str,
+    block_id: str,
+) -> Optional[Tuple[int, int]]:
+    """
+    Compute a genomic envelope from all Phase 2 HSPs for a given
+    (parent_locus, genome, block_id).
+
+    Uses flanking_blast_all.tsv if present:
+      qseqid, sseqid, scaffold_desc, strand, coord_start, coord_end,
+      evalue, bitscore, pident, length, genome, block_id
+    """
+    phase2_dir = phase2_root / parent_locus
+    hits_path = phase2_dir / "flanking_blast_all.tsv"
+    if not hits_path.exists():
+        return None
+
+    try:
+        df = pd.read_csv(hits_path, sep="\t")
+    except Exception:
+        return None
+
+    required = {"coord_start", "coord_end", "genome", "block_id"}
+    if not required.issubset(df.columns):
+        return None
+
+    sub = df[(df["genome"] == genome_name) & (df["block_id"] == block_id)]
+    if sub.empty:
+        return None
+
+    try:
+        start = int(sub["coord_start"].min())
+        end = int(sub["coord_end"].max())
+    except Exception:
+        return None
+
+    if start <= 0 or end <= 0 or end < start:
+        return None
+
+    return start, end
+
+# =============================================================================
 # MAIN WORKFLOW
 # =============================================================================
 
@@ -1100,6 +1316,9 @@ def main():
 
     print(f"  Total targets for extraction: {len(targets_df)}", flush=True)
 
+    # Ensure output directory exists before any writes
+    args.output_dir.mkdir(exist_ok=True, parents=True)
+
     # Pre-extraction dedup on syntenic targets only (do not touch unplaceables)
     try:
         syn_only = targets_df[targets_df.get('placement', '') == 'synteny'].copy()
@@ -1117,6 +1336,14 @@ def main():
         print(f"  Targets after overlap-dedup: {len(targets_df)}", flush=True)
     except Exception as e:
         print(f"  WARNING: pre-extraction dedup failed: {e}", flush=True)
+
+    # Infer family base directory (outputs/<family>) for optional HSP envelopes
+    base_dir = (
+        args.query_proteins.parent.parent
+        if args.query_proteins.parent.name.startswith("phase4")
+        else args.query_proteins.parent
+    )
+    phase2_root = base_dir / "phase2_synteny_v2"
 
     # Group by genome
     print("\n[2] Grouping targets by genome...", flush=True)
@@ -1188,6 +1415,11 @@ def main():
                     unique_tag = f"{up_scaf}_{up_start}_{up_end}"
                     target_output_dir = args.output_dir / genome_name / 'UNPLACED' / unique_tag
                 target_output_dir.mkdir(exist_ok=True, parents=True)
+
+                # NOTE: HSP envelope lookup disabled - the target's start/end coordinates
+                # already come from Phase 4 tblastn clustering and are the correct
+                # coordinates for Exonerate extraction. Phase 2 HSPs are for flanking
+                # anchor genes (synteny detection), not target genes.
 
                 # Extract specific query protein
                 temp_query = target_output_dir / f"query_{expected_query}.faa"
