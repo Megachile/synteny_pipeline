@@ -1268,6 +1268,8 @@ def parse_args():
     parser.add_argument('--genome-fasta-dir', type=Path,
                         default=Path(__file__).resolve().parent.parent.parent / 'data' / 'ragtag_output',
                         help='Directory containing genome FASTA files (default: data/ragtag_output)')
+    parser.add_argument('--genome-override-dir', type=Path,
+                        help='Optional override directory - genomes here take precedence (for BK NC_* reference)')
     parser.add_argument('--output-dir', required=True, type=Path,
                         help='Output directory for extracted sequences')
     parser.add_argument('--unplaceable-evalue', type=float, default=1e-10,
@@ -1289,6 +1291,7 @@ def main():
     print(f"  Unplaceable targets: {args.unplaceable if args.unplaceable else 'None'}")
     print(f"  Query proteins: {args.query_proteins}")
     print(f"  Genome FASTA dir: {args.genome_fasta_dir}")
+    print(f"  Genome override dir: {args.genome_override_dir if args.genome_override_dir else 'None'}")
     print(f"  Output directory: {args.output_dir}")
     print(f"\nParameters:")
     print(f"  Unplaceable e-value threshold: {args.unplaceable_evalue}")
@@ -1361,7 +1364,15 @@ def main():
     for genome_name, genome_targets in genome_groups:
         print(f"\n  {genome_name}: {len(genome_targets)} targets", flush=True)
 
-        genome_fasta = args.genome_fasta_dir / genome_name / "ragtag.scaffold.fasta"
+        # Check override directory first (for BK NC_* reference), then fall back to default
+        genome_fasta = None
+        if args.genome_override_dir:
+            override_fasta = args.genome_override_dir / genome_name / "ragtag.scaffold.fasta"
+            if override_fasta.exists():
+                genome_fasta = override_fasta
+                print(f"    Using override genome: {genome_fasta}", flush=True)
+        if genome_fasta is None:
+            genome_fasta = args.genome_fasta_dir / genome_name / "ragtag.scaffold.fasta"
         if not genome_fasta.exists():
             print(f"    WARNING: Genome FASTA not found, skipping")
             failed_genomes.append(genome_name)
