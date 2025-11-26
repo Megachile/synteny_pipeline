@@ -1265,8 +1265,9 @@ def parse_args():
                         help='Path to unplaceable_targets.tsv from Phase 5 (optional)')
     parser.add_argument('--query-proteins', required=True, type=Path,
                         help='Path to combined_targets.faa with query proteins')
-    parser.add_argument('--genome-fasta-dir', required=True, type=Path,
-                        help='Directory containing genome FASTA files')
+    parser.add_argument('--genome-fasta-dir', type=Path,
+                        default=Path(__file__).resolve().parent.parent.parent / 'data' / 'ragtag_output',
+                        help='Directory containing genome FASTA files (default: data/ragtag_output)')
     parser.add_argument('--output-dir', required=True, type=Path,
                         help='Output directory for extracted sequences')
     parser.add_argument('--unplaceable-evalue', type=float, default=1e-10,
