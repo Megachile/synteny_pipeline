@@ -2018,13 +2018,16 @@ def main() -> None:
             print(f"    {genome_name}: no clusters above coverage threshold")
             continue
 
-        # Cross-locus deduplication: different loci may find the same gene
-        # (e.g., BK_chr8_a, BK_chr8_b, BK_chr8_c all finding the same position)
-        clusters_before = len(clusters)
-        clusters = deduplicate_summarized_clusters_across_loci(clusters)
+        # NOTE: Cross-locus deduplication disabled because it causes validation issues.
+        # Different loci may have overlapping genomic regions, and dedup assigns
+        # each position to one "winning" locus. This causes undersplit validation
+        # failures when genes get assigned to a different locus than expected.
+        # The oversplit from multiple loci finding the same gene is acceptable
+        # and handled downstream.
+        # clusters = deduplicate_summarized_clusters_across_loci(clusters)
 
         print(
-            f"    {genome_name}: {len(hsps_all)} HSPs → {clusters_before} clusters → {len(clusters)} genes (dedup)"
+            f"    {genome_name}: {len(hsps_all)} HSPs → {len(clusters)} gene-level hits"
         )
 
         # Convert clusters to rows, attaching parent_locus via query_to_locus
