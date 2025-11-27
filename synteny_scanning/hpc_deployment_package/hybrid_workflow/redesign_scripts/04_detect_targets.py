@@ -1627,19 +1627,18 @@ def calibrate_threshold_factorial_per_locus(
                                 tp = validation["true_positives"]
                                 fp = validation["false_positives"]
 
-                                if total_gt > 0:
-                                    recall = tp / total_gt
-                                    fp_ratio = fp / total_gt
-                                else:
-                                    recall = 0.0
-                                    fp_ratio = 0.0
+                                # Scoring: penalize undersplit (missed genes) MORE than oversplit
+                                # Rationale: oversplit can be merged downstream, undersplit cannot
+                                # be recovered without expensive re-alignment (exonerate monsters)
+                                fn_count = total_gt - tp  # missed genes (undersplit)
+                                fp_count = fp             # extra detections (oversplit)
 
                                 if total_gt == 0:
                                     score = float("inf")
-                                elif recall < 0.9:
-                                    score = 1e6 + (0.9 - recall) * 1e3
                                 else:
-                                    score = fp_ratio * 100.0 + abs(1.0 - recall) * 10.0
+                                    # 100:1 penalty ratio - strongly prefer finding all genes
+                                    # even at the cost of some false positives
+                                    score = fn_count * 100.0 + fp_count * 1.0
 
                                 if score < best_score_local:
                                     best_score_local = score
