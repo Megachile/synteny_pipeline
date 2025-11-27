@@ -93,6 +93,91 @@ def _load_gff_gene_positions(gff_path: Path) -> dict[str, tuple[str, int, int]]:
     return positions
 
 
+def _calculate_flanking_spans_from_fasta(phase1_dir: Path, genome_gff_dir: Path) -> pd.DataFrame:
+    """
+    Calculate flanking gene spans directly from flanking FASTA files and GFF.
+
+    For each locus, reads the flanking FASTA, extracts gene IDs from headers,
+    looks up their coordinates in the GFF, and returns min/max as the span.
+    """
+    from Bio import SeqIO
+
+    rows = []
+
+    # Find BK GFF for coordinate lookup - try multiple locations
+    bk_gff = None
+    candidates = [
+        genome_gff_dir / 'belonocnema_kinseyi' / 'GCF_010883055.1_B_treatae_v1_genomic.gff',
+        Path('/carc/scratch/projects/emartins/2016456/adam/genomes/belonocnema_kinseyi/GCF_010883055.1_B_treatae_v1_genomic.gff'),
+        Path('/carc/scratch/projects/emartins/2016456/adam/genomes/belonocnema_kinseyi/bkinseyi_genome.gff'),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            bk_gff = candidate
+            break
+
+    # Also try glob search if still not found
+    if bk_gff is None and genome_gff_dir.exists():
+        for candidate in genome_gff_dir.glob('**/GCF_010883055*.gff'):
+            bk_gff = candidate
+            break
+        if bk_gff is None:
+            for candidate in genome_gff_dir.glob('**/bkinseyi*.gff'):
+                bk_gff = candidate
+                break
+
+    if bk_gff is None or not bk_gff.exists():
+        print(f"Warning: BK GFF not found (tried {len(candidates)} locations)")
+        return pd.DataFrame(columns=['locus_id', 'flanking_span_start', 'flanking_span_end', 'flanking_span_kb'])
+
+    print(f"  Loading BK gene positions from {bk_gff.name}...")
+    gene_positions = _load_gff_gene_positions(bk_gff)
+    print(f"  Loaded positions for {len(gene_positions)} genes")
+
+    # Find all flanking FASTA files
+    flanking_files = list(phase1_dir.glob('*_flanking*.faa'))
+    if not flanking_files:
+        print(f"  No flanking FASTA files found in {phase1_dir}")
+        return pd.DataFrame(columns=['locus_id', 'flanking_span_start', 'flanking_span_end', 'flanking_span_kb'])
+
+    for fasta_file in flanking_files:
+        # Extract locus_id from filename (e.g., BK_chr6_a_flanking.faa -> BK_chr6_a)
+        locus_id = fasta_file.stem.replace('_flanking_dedup', '').replace('_flanking', '')
+
+        try:
+            coords = []
+            for record in SeqIO.parse(fasta_file, 'fasta'):
+                # Header format: >XP_033221061.1|LOC117175465 U1 XP_033221061.1 description
+                # Extract LOC ID
+                header_parts = record.id.split('|')
+                if len(header_parts) >= 2:
+                    loc_id = header_parts[1].split()[0]  # Get LOC117175465
+                    if loc_id in gene_positions:
+                        chrom, start, end = gene_positions[loc_id]
+                        coords.append((start, end))
+
+            if coords:
+                min_coord = min(c[0] for c in coords)
+                max_coord = max(c[1] for c in coords)
+                span_kb = (max_coord - min_coord) / 1000.0
+
+                rows.append({
+                    'locus_id': locus_id,
+                    'flanking_span_start': min_coord,
+                    'flanking_span_end': max_coord,
+                    'flanking_span_kb': span_kb
+                })
+                print(f"    {locus_id}: {len(coords)} genes, span={span_kb:.1f} kb ({min_coord:,}-{max_coord:,})")
+        except Exception as e:
+            print(f"  Warning: Failed to process {fasta_file.name}: {e}")
+            continue
+
+    if not rows:
+        return pd.DataFrame(columns=['locus_id', 'flanking_span_start', 'flanking_span_end', 'flanking_span_kb'])
+
+    return pd.DataFrame(rows)
+
+
 def _calculate_flanking_spans(phase1_dir: Path, genome_gff_dir: Path) -> pd.DataFrame:
     """Calculate flanking gene spans from debug_flanking files and GFF."""
     # Genome ID mapping for common abbreviations
@@ -281,16 +366,29 @@ def postprocess_phase1(phase1_dir: Path, genome_gff_dir: Path | None = None) -> 
     # Add expected chromosome from locus_id
     df['expected_chromosome'] = df['locus_id'].astype(str).apply(_expected_chr_from_locus_id)
 
-    # Calculate flanking gene spans from debug files + GFF
+    # Calculate flanking gene spans from FASTA files + GFF (preferred method)
     if genome_gff_dir and genome_gff_dir.exists():
-        flanking_spans = _calculate_flanking_spans(phase1_dir, genome_gff_dir)
-        if not flanking_spans.empty and 'target_gene' in df.columns:
-            df = df.merge(flanking_spans, on='target_gene', how='left')
-            # Calculate span in kb
-            if {'flanking_span_start', 'flanking_span_end'} <= set(df.columns):
-                df['flanking_span_kb'] = ((df['flanking_span_end'].fillna(0).astype(float) -
-                                          df['flanking_span_start'].fillna(0).astype(float)).clip(lower=0)) / 1000.0
-                print(f"Added flanking spans for {df['flanking_span_kb'].notna().sum()} loci")
+        print("\n[Calculating flanking gene spans from FASTA files...]")
+        flanking_spans = _calculate_flanking_spans_from_fasta(phase1_dir, genome_gff_dir)
+
+        if not flanking_spans.empty:
+            # Merge on locus_id (new method returns locus_id directly)
+            df = df.merge(flanking_spans, on='locus_id', how='left', suffixes=('', '_new'))
+            # Use new values, keeping any existing non-null values
+            for col in ['flanking_span_start', 'flanking_span_end', 'flanking_span_kb']:
+                if f'{col}_new' in df.columns:
+                    df[col] = df[f'{col}_new'].fillna(df.get(col, pd.NA))
+                    df.drop(columns=[f'{col}_new'], inplace=True, errors='ignore')
+            print(f"Added flanking spans for {df['flanking_span_kb'].notna().sum()} loci")
+        else:
+            # Fallback to old debug file method
+            flanking_spans = _calculate_flanking_spans(phase1_dir, genome_gff_dir)
+            if not flanking_spans.empty and 'target_gene' in df.columns:
+                df = df.merge(flanking_spans, on='target_gene', how='left')
+                if {'flanking_span_start', 'flanking_span_end'} <= set(df.columns):
+                    df['flanking_span_kb'] = ((df['flanking_span_end'].fillna(0).astype(float) -
+                                              df['flanking_span_start'].fillna(0).astype(float)).clip(lower=0)) / 1000.0
+                    print(f"Added flanking spans for {df['flanking_span_kb'].notna().sum()} loci (from debug files)")
 
     # Join locus envelope boundaries from debug files (legacy format)
     dbg = _read_debug_boundaries(phase1_dir)
