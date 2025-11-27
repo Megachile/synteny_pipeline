@@ -299,6 +299,37 @@ def _compute_locus_scale(df: pd.DataFrame) -> pd.Series:
     return df.apply(scale, axis=1)
 
 
+def _find_gff_file(genome_gff_dir: Path, prefix: str) -> Path | None:
+    """Find GFF file for a genome prefix (BK or LB) with flexible path matching."""
+    # Define search patterns for each genome
+    search_patterns = {
+        'BK': [
+            # Direct file in root
+            'genomic.gff',
+            # Subdirectory patterns
+            'belonocnema_kinseyi/*.gff',
+            'belonocnema_kinseyi/**/*.gff',
+            '**/GCF_010883055*.gff',
+            '**/bkinseyi*.gff',
+        ],
+        'LB': [
+            # Subdirectory patterns
+            'Leptopilina_boulardi/**/*.gff',
+            'leptopilina_boulardi/**/*.gff',
+            '**/GCF_015476425*.gff',
+            '**/GCF_019393585*.gff',  # Alternative LB assembly
+        ],
+    }
+
+    patterns = search_patterns.get(prefix, [])
+    for pattern in patterns:
+        matches = list(genome_gff_dir.glob(pattern))
+        if matches:
+            return matches[0]
+
+    return None
+
+
 def extract_cluster_gene_coordinates(phase1_dir: Path, genome_gff_dir: Path) -> None:
     """Extract and save individual gene coordinates for each cluster member from GFF files."""
     locus_defs = phase1_dir / 'locus_definitions.tsv'
@@ -307,6 +338,9 @@ def extract_cluster_gene_coordinates(phase1_dir: Path, genome_gff_dir: Path) -> 
 
     df = pd.read_csv(locus_defs, sep='\t')
     all_gene_coords = []
+
+    # Cache GFF positions by genome prefix to avoid re-parsing
+    gff_cache: dict[str, dict] = {}
 
     for _, row in df.iterrows():
         locus_id = row['locus_id']
@@ -318,27 +352,38 @@ def extract_cluster_gene_coordinates(phase1_dir: Path, genome_gff_dir: Path) -> 
         # Parse cluster members
         gene_ids = [g.strip() for g in str(cluster_members).split(',')]
 
-        # Determine GFF file based on genome/locus prefix
-        gff_file = None
+        # Determine genome prefix
+        prefix = None
         if locus_id.startswith('BK'):
-            gff_file = genome_gff_dir / 'belonocnema_kinseyi' / 'GCF_010883055.1_B_treatae_v1_genomic.gff'
+            prefix = 'BK'
         elif locus_id.startswith('LB'):
-            gff_file = genome_gff_dir / 'leptopilina_boulardi' / 'GCF_015476425.1_ASM1547642v1_genomic.gff'
-        # Add more genome mappings as needed
+            prefix = 'LB'
 
-        if gff_file and gff_file.exists():
-            positions = _load_gff_gene_positions(gff_file)
-            for gene_id in gene_ids:
-                if gene_id in positions:
-                    chrom, start, end = positions[gene_id]
-                    all_gene_coords.append({
-                        'locus_id': locus_id,
-                        'gene_id': gene_id,
-                        'chromosome': chrom,
-                        'start': start,
-                        'end': end,
-                        'length': end - start + 1
-                    })
+        if prefix is None:
+            continue
+
+        # Load GFF positions (cached)
+        if prefix not in gff_cache:
+            gff_file = _find_gff_file(genome_gff_dir, prefix)
+            if gff_file and gff_file.exists():
+                print(f"  Loading {prefix} GFF: {gff_file}")
+                gff_cache[prefix] = _load_gff_gene_positions(gff_file)
+            else:
+                print(f"  WARNING: No GFF file found for {prefix} in {genome_gff_dir}")
+                gff_cache[prefix] = {}
+
+        positions = gff_cache.get(prefix, {})
+        for gene_id in gene_ids:
+            if gene_id in positions:
+                chrom, start, end = positions[gene_id]
+                all_gene_coords.append({
+                    'locus_id': locus_id,
+                    'gene_id': gene_id,
+                    'chromosome': chrom,
+                    'start': start,
+                    'end': end,
+                    'length': end - start + 1
+                })
 
     if all_gene_coords:
         output_file = phase1_dir / 'cluster_gene_coordinates.tsv'
@@ -422,7 +467,8 @@ def parse_args():
     p.add_argument('--loc-ids', required=True, help='Comma-separated LOC IDs (e.g., LOC...,LOC...)')
     p.add_argument('--gene-family', required=True, help='Gene family label')
     p.add_argument('--output-dir', required=True, type=Path, help='Output directory for phase1_v2 outputs')
-    p.add_argument('--genome-gff-dir', type=Path, help='Directory containing genome GFF files for flanking span calculation')
+    p.add_argument('--genome-gff-dir', required=True, type=Path,
+                   help='Directory containing genome GFF files (REQUIRED for per-gene coordinate extraction)')
     return p.parse_args()
 
 
@@ -445,13 +491,28 @@ def main():
     locus_defs = postprocess_phase1(out_dir, genome_gff_dir=args.genome_gff_dir)
     print(f'  Updated: {locus_defs}')
 
-    # 3) Extract individual gene coordinates
-    if args.genome_gff_dir:
-        print('\n[3] Extracting cluster gene coordinates from GFF...')
-        extract_cluster_gene_coordinates(out_dir, args.genome_gff_dir)
+    # 3) Extract individual gene coordinates (REQUIRED for Phase 4 calibration)
+    print('\n[3] Extracting cluster gene coordinates from GFF...')
+    extract_cluster_gene_coordinates(out_dir, args.genome_gff_dir)
+
+    # Validate that gene coordinates were extracted
+    gene_coords_file = out_dir / 'cluster_gene_coordinates.tsv'
+    if not gene_coords_file.exists():
+        print(f'ERROR: Failed to create {gene_coords_file}')
+        print('       This file is REQUIRED for Phase 4 factorial calibration.')
+        print('       Check that GFF files exist in --genome-gff-dir')
+        raise FileNotFoundError(f'Missing required output: {gene_coords_file}')
+
+    coords_df = pd.read_csv(gene_coords_file, sep='\t')
+    if len(coords_df) == 0:
+        print(f'ERROR: {gene_coords_file} is empty')
+        print('       No gene coordinates could be extracted from GFF files.')
+        raise ValueError(f'Empty gene coordinates file: {gene_coords_file}')
+
+    print(f'  ✓ Extracted {len(coords_df)} gene coordinates')
 
     # 4) Summary
-    print('\n[3] Summary (preview):')
+    print('\n[4] Summary (preview):')
     try:
         df = pd.read_csv(locus_defs, sep='\t')
         cols = [c for c in ['locus_id','genome','expected_chromosome','locus_span_kb','locus_scale'] if c in df.columns]
