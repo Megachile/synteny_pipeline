@@ -322,17 +322,9 @@ def create_gene_family_matrix(gene_family, loci_list, all_targets_df, synteny_bl
                 # Extraction was attempted but failed
                 continue
 
-            # Status letters: I=intact, P=pseudogene, F=fragment
+            # Just show length - I/F/P status removed as unreliable
             if length > 0:
-                if status == 'intact':
-                    status_letter = 'I'
-                elif status == 'pseudogene':
-                    status_letter = 'P'
-                elif status == 'fragment':
-                    status_letter = 'F'
-                else:
-                    status_letter = '?'
-                target_str = f"{length}{status_letter}"
+                target_str = str(length)
             else:
                 # Unplaceable or failed extraction: record as generic hit
                 target_str = "hit"

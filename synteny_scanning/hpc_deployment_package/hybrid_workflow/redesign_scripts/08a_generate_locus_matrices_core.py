@@ -471,10 +471,9 @@ def create_locus_matrix(locus_id, locus_info, blocks_df, targets_df, swissprot_d
             parts = []
             if meta:
                 length = meta.get('length_aa', 0)
-                status = meta.get('status', 'unknown')
                 if length > 0:
-                    status_letter = 'I' if status == 'intact' else 'F' if status == 'fragment' else 'P'
-                    parts.append(f"{length}{status_letter}")
+                    # Just show length - I/F/P status removed as unreliable
+                    parts.append(str(length))
 
             # Only add generic "hit" if no metadata found (not extracted)
             if not parts:
