@@ -403,6 +403,8 @@ def parse_args():
                         help='Directory containing per-locus matrices from Phase 8a (defaults to output-dir)')
     parser.add_argument('--exclude-genomes', type=str, default='GCA_010883055.1',
                         help='Comma-separated genome IDs to exclude (e.g., deprecated BK accession)')
+    parser.add_argument('--exclude-genomes-file', type=Path,
+                        help='File with genome IDs to exclude (one per line, # comments)')
 
     return parser.parse_args()
 
@@ -449,10 +451,23 @@ def main():
     # Species mapping
     species_map, phylo_order_map = load_species_and_phylo(args.species_map)
     # Exclude deprecated/renamed genomes
+    exclude_set: set[str] = set()
     if args.exclude_genomes:
         for g in [x.strip() for x in args.exclude_genomes.split(',') if x.strip()]:
-            species_map.pop(g, None)
-            phylo_order_map.pop(g, None)
+            exclude_set.add(g)
+    # Also read from exclusion file if provided
+    if args.exclude_genomes_file and args.exclude_genomes_file.exists():
+        with open(args.exclude_genomes_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    exclude_set.add(line)
+    # Apply exclusions
+    for g in exclude_set:
+        species_map.pop(g, None)
+        phylo_order_map.pop(g, None)
+    if exclude_set:
+        print(f"  Excluded {len(exclude_set)} genomes")
     print(f"  Loaded species mapping for {len(species_map)} genomes")
 
     # Load sequence metadata from extracted sequences

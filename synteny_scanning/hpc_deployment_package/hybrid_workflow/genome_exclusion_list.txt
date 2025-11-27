@@ -1,0 +1,22 @@
+# Redundant assemblies - excluded based on lower synteny recovery
+# Keep only best assembly per species for: L. boulardi, L. heterotoma, G. brasiliensis
+#
+# L. boulardi - KEEP: GCA_019393585.1 (34.6% avg), EXCLUDE rest:
+GCA_032872485.1
+GCA_011634795.1
+GCA_015476485.1
+GCA_003121605.1
+#
+# L. heterotoma - KEEP: GCA_015476425.1 (27.8% avg), EXCLUDE rest:
+GCA_010016045.1
+GCA_009602685.1
+GCA_032872495.1
+GCA_009026005.1
+GCA_009025955.1
+#
+# G. brasiliensis - KEEP: GCA_037103545.1 (29.0% avg), EXCLUDE rest:
+GCA_037103505.1
+GCA_037103525.1
+GCA_037103535.1
+GCA_009823575.1
+GCA_037103515.1
