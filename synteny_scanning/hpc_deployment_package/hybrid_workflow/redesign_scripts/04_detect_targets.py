@@ -659,10 +659,10 @@ def count_phase1_bk_targets(phase1_dir: Path) -> int:
 
 def get_phase1_bk_genes(phase1_dir: Path) -> tuple[list[dict], int]:
     """
-    Extract BK ground truth at GENE level from Phase 1 locus_definitions.tsv.
+    Extract BK ground truth at GENE level from Phase 1 cluster_gene_coordinates.tsv.
 
-    Uses gene_chromosomes / gene_starts / gene_ends columns added by
-    add_gene_coordinates.py to build one record per gene.
+    This file is created by Phase 1 using GFF annotations and contains one row
+    per gene with exact coordinates.
 
     Returns:
         (genes, total_gene_count) where each gene is:
@@ -674,12 +674,41 @@ def get_phase1_bk_genes(phase1_dir: Path) -> tuple[list[dict], int]:
             'end': int,
         }
     """
+    # Primary source: cluster_gene_coordinates.tsv (created by Phase 1)
+    gene_coords_file = phase1_dir / "cluster_gene_coordinates.tsv"
+
+    if gene_coords_file.exists():
+        genes: list[dict] = []
+        with open(gene_coords_file) as f:
+            header = next(f).strip().split('\t')
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) < len(header):
+                    continue
+                row = dict(zip(header, parts))
+                locus_id = row.get('locus_id', '')
+                # Only BK loci for ground truth
+                if not locus_id.startswith('BK_'):
+                    continue
+                try:
+                    genes.append({
+                        'locus_id': locus_id,
+                        'gene_id': row.get('gene_id', ''),
+                        'chromosome': row.get('chromosome', ''),
+                        'start': int(row.get('start', 0)),
+                        'end': int(row.get('end', 0)),
+                    })
+                except ValueError:
+                    continue
+        if genes:
+            return genes, len(genes)
+
+    # Fallback: try to extract from locus_definitions.tsv (legacy format)
     locus_defs = phase1_dir / "locus_definitions.tsv"
     if not locus_defs.exists():
         return [], 0
 
-    genes: list[dict] = []
-    total_genes = 0
+    genes = []
 
     with open(locus_defs) as f:
         header = next(f).strip().split('\t')
