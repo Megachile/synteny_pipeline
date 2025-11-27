@@ -495,6 +495,70 @@ def deduplicate_genes_across_queries(gene_candidates: List[Dict]) -> List[Dict]:
     return final_genes
 
 
+def deduplicate_summarized_clusters_across_loci(clusters: List[Dict]) -> List[Dict]:
+    """
+    Merge summarized clusters from different loci that overlap genomically.
+
+    This handles the case where different loci (each with their own query proteins)
+    find the same gene copy. Unlike deduplicate_genes_across_queries, this works
+    on already-summarized clusters (no "hsps" key).
+
+    Keeps the cluster with the best bitscore as representative.
+    """
+    if not clusters:
+        return []
+
+    # Sort by position
+    sorted_clusters = sorted(clusters, key=lambda x: (x["scaffold"], x["strand"], x["genomic_start"]))
+
+    merged = []
+    current_group = [sorted_clusters[0]]
+
+    for cluster in sorted_clusters[1:]:
+        # Check if on same scaffold/strand as current group
+        if (cluster["scaffold"] != current_group[0]["scaffold"] or
+            cluster["strand"] != current_group[0]["strand"]):
+            # Different location - finalize current group
+            merged.append(current_group)
+            current_group = [cluster]
+            continue
+
+        # Calculate the extent of the current merged group
+        group_start = min(g["genomic_start"] for g in current_group)
+        group_end = max(g["genomic_end"] for g in current_group)
+        group_span = group_end - group_start
+
+        # Calculate overlap with merged group extent
+        overlap_start = max(group_start, cluster["genomic_start"])
+        overlap_end = min(group_end, cluster["genomic_end"])
+        overlap_bp = max(0, overlap_end - overlap_start)
+
+        # Cluster span
+        cluster_span = cluster["genomic_end"] - cluster["genomic_start"]
+        min_span = min(group_span, cluster_span) if group_span > 0 else cluster_span
+
+        # Merge if significant overlap (>50% of smaller span)
+        if min_span > 0 and overlap_bp > 0.5 * min_span:
+            current_group.append(cluster)
+        else:
+            # No significant overlap - finalize current group, start new
+            merged.append(current_group)
+            current_group = [cluster]
+
+    # Don't forget last group
+    if current_group:
+        merged.append(current_group)
+
+    # Pick best representative from each merged group
+    final_clusters = []
+    for group in merged:
+        # Keep the cluster with best bitscore
+        best = max(group, key=lambda g: g["best_bitscore"])
+        final_clusters.append(best)
+
+    return final_clusters
+
+
 def merge_proximal_gene_candidates_same_query(
     gene_candidates: List[Dict],
     merge_gap_kb: float,
@@ -1954,8 +2018,13 @@ def main() -> None:
             print(f"    {genome_name}: no clusters above coverage threshold")
             continue
 
+        # Cross-locus deduplication: different loci may find the same gene
+        # (e.g., BK_chr8_a, BK_chr8_b, BK_chr8_c all finding the same position)
+        clusters_before = len(clusters)
+        clusters = deduplicate_summarized_clusters_across_loci(clusters)
+
         print(
-            f"    {genome_name}: {len(hsps_all)} HSPs → {len(clusters)} gene-level hits"
+            f"    {genome_name}: {len(hsps_all)} HSPs → {clusters_before} clusters → {len(clusters)} genes (dedup)"
         )
 
         # Convert clusters to rows, attaching parent_locus via query_to_locus
