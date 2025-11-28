@@ -3,7 +3,7 @@
 #SBATCH --array=1-1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=30G
-#SBATCH --time=04:00:00
+#SBATCH --time=08:00:00
 #SBATCH --partition=general
 #SBATCH --output=logs/phase6_extract_v2_%A_%a.out
 #SBATCH --error=logs/phase6_extract_v2_%A_%a.err
