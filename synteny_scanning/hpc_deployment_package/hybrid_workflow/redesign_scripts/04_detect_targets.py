@@ -549,12 +549,29 @@ def deduplicate_summarized_clusters_across_loci(clusters: List[Dict]) -> List[Di
     if current_group:
         merged.append(current_group)
 
-    # Pick best representative from each merged group
+    # For each merged group, emit ONE hit per unique query_id that contributed.
+    # This ensures each locus gets credit (since query_id maps to locus).
+    # Use the best cluster's genomic coordinates but preserve each query's identity.
     final_clusters = []
     for group in merged:
-        # Keep the cluster with best bitscore
+        # Get the best representative for genomic coordinates and stats
         best = max(group, key=lambda g: g["best_bitscore"])
-        final_clusters.append(best)
+
+        # Find all unique query_ids that contributed
+        unique_queries = set(c["query_id"] for c in group)
+
+        # Emit one hit per unique query, using best's coordinates
+        for qid in unique_queries:
+            # Find the best cluster for this specific query
+            query_clusters = [c for c in group if c["query_id"] == qid]
+            query_best = max(query_clusters, key=lambda c: c["best_bitscore"])
+
+            # Use the merged group's extent but this query's stats
+            hit = query_best.copy()
+            hit["genomic_start"] = best["genomic_start"]
+            hit["genomic_end"] = best["genomic_end"]
+            hit["genomic_span_kb"] = best["genomic_span_kb"]
+            final_clusters.append(hit)
 
     return final_clusters
 
@@ -1969,79 +1986,42 @@ def main() -> None:
             print(f"    {genome_name}: no HSPs found")
             continue
 
-        # Partition HSPs by parent locus (via query_to_locus) and cluster per locus.
-        locus_to_hsps: Dict[str, List[Dict]] = {}
-        for h in hsps_all:
-            qid = h.get("query_id", "")
-            base_qid = qid.split("|")[0]
-            parent_locus = query_to_locus.get(qid) or query_to_locus.get(base_qid)
-            if not parent_locus:
-                continue
-            locus_to_hsps.setdefault(parent_locus, []).append(h)
+        # LOCUS-AGNOSTIC APPROACH: Pool all HSPs together regardless of query.
+        # Phase 4's job is to find WHERE genes are located, not assign to loci.
+        # Locus assignment happens in Phase 5 via synteny.
 
-        clusters: List[Dict] = []
-        for parent_locus, hsps in locus_to_hsps.items():
-            (
-                locus_thresh,
-                locus_min_cov,
-                locus_evalue,
-                locus_paralog,
-                locus_gap,
-                locus_merge_gap,
-            ) = per_locus_params.get(
-                parent_locus,
-                (
-                    final_threshold,
-                    final_min_coverage,
-                    final_evalue,
-                    final_paralog_thresh,
-                    final_gap_thresh,
-                    final_merge_gap,
-                ),
-            )
+        # Filter by e-value using global threshold
+        hsps_filt = filter_hsps_by_evalue(hsps_all, final_evalue)
+        if not hsps_filt:
+            print(f"    {genome_name}: no HSPs passed e-value filter")
+            continue
 
-            hsps_filt = filter_hsps_by_evalue(hsps, locus_evalue)
-            if not hsps_filt:
-                continue
-
-            loc_clusters = cluster_hsps_greedy(
-                hsps_filt,
-                paralog_coverage_threshold=locus_paralog,
-                min_cluster_coverage=locus_min_cov,
-                query_overlap_threshold=locus_thresh,
-                max_gap_kb=locus_gap,
-                merge_gap_kb=locus_merge_gap if locus_merge_gap > 0 else None,
-            )
-            clusters.extend(loc_clusters)
+        # Cluster all HSPs together with global parameters
+        clusters = cluster_hsps_greedy(
+            hsps_filt,
+            paralog_coverage_threshold=final_paralog_thresh,
+            min_cluster_coverage=final_min_coverage,
+            query_overlap_threshold=final_threshold,
+            max_gap_kb=final_gap_thresh,
+            merge_gap_kb=final_merge_gap if final_merge_gap > 0 else None,
+        )
 
         if not clusters:
             print(f"    {genome_name}: no clusters above coverage threshold")
             continue
 
-        # NOTE: Cross-locus deduplication disabled because it causes validation issues.
-        # Different loci may have overlapping genomic regions, and dedup assigns
-        # each position to one "winning" locus. This causes undersplit validation
-        # failures when genes get assigned to a different locus than expected.
-        # The oversplit from multiple loci finding the same gene is acceptable
-        # and handled downstream.
-        # clusters = deduplicate_summarized_clusters_across_loci(clusters)
+        # Deduplicate overlapping clusters (same position found by multiple queries)
+        clusters_before = len(clusters)
+        clusters = deduplicate_summarized_clusters_across_loci(clusters)
 
         print(
-            f"    {genome_name}: {len(hsps_all)} HSPs → {len(clusters)} gene-level hits"
+            f"    {genome_name}: {len(hsps_all)} HSPs → {clusters_before} clusters → {len(clusters)} genes"
         )
 
-        # Convert clusters to rows, attaching parent_locus via query_to_locus
+        # Convert clusters to rows - LOCUS-AGNOSTIC (no locus_id/parent_locus)
+        # Phase 4 outputs gene positions; Phase 5 assigns to loci via synteny
         for c in clusters:
-            qid = c["query_id"]
-            parent_locus = query_to_locus.get(qid) or query_to_locus.get(
-                qid.split("|")[0], ""
-            )
-            if not parent_locus:
-                continue
-
             row = {
-                "locus_id": parent_locus,
-                "parent_locus": parent_locus,
                 "genome": genome_id,
                 "scaffold": c["scaffold"],
                 "strand": c["strand"],
@@ -2051,7 +2031,7 @@ def main() -> None:
                 "num_hsps": c["num_hsps"],
                 "best_evalue": c["best_evalue"],
                 "best_bitscore": c["best_bitscore"],
-                "query_id": qid,
+                "query_id": c["query_id"],  # Keep for reference, but not for locus assignment
                 "query_start_min": c["query_start_min"],
                 "query_end_max": c["query_end_max"],
                 "query_span_coverage": c["query_span_coverage"],
