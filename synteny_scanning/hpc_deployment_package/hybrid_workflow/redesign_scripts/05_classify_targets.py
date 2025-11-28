@@ -309,13 +309,16 @@ def main():
                                   rescue_upper_kb=args.rescue_upper_kb,
                                   rescue_min_evalue=args.rescue_min_evalue)
 
-    # Add locus_name column for compatibility with legacy matrix scripts
-    classified['locus_name'] = classified['locus_id']
+    # Add locus_id and locus_name columns for compatibility with legacy matrix scripts
+    # Use parent_locus from Phase 4 output, with fallback to locus_id if present
+    locus_col = 'parent_locus' if 'parent_locus' in classified.columns else 'locus_id'
+    classified['locus_id'] = classified[locus_col]
+    classified['locus_name'] = classified[locus_col]
 
     # Add gene_family column for compatibility with legacy matrix scripts
     if locus_defs is not None and 'gene_family' in locus_defs.columns:
         family_map = {str(r['locus_id']): str(r['gene_family']) for _, r in locus_defs.iterrows()}
-        classified['gene_family'] = classified['locus_id'].astype(str).map(family_map)
+        classified['gene_family'] = classified[locus_col].astype(str).map(family_map)
     else:
         # Fallback: infer from output directory path or use 'unknown'
         classified['gene_family'] = 'unknown'
