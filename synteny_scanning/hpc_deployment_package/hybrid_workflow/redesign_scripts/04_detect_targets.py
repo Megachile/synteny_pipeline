@@ -2018,9 +2018,19 @@ def main() -> None:
             f"    {genome_name}: {len(hsps_all)} HSPs → {clusters_before} clusters → {len(clusters)} genes"
         )
 
-        # Convert clusters to rows - LOCUS-AGNOSTIC (no locus_id/parent_locus)
-        # Phase 4 outputs gene positions; Phase 5 assigns to loci via synteny
+        # Convert clusters to rows
+        # Phase 4 finds gene positions; Phase 5 uses parent_locus + synteny for classification
         for c in clusters:
+            # Derive parent_locus from query_id using query_to_locus mapping
+            # This is the locus whose query protein found this hit
+            query_id = c["query_id"]
+            parent_locus = query_to_locus.get(query_id, "")
+            # Try alternate forms if direct lookup fails
+            if not parent_locus:
+                # Try without |LOC... suffix
+                base_qid = query_id.split("|")[0]
+                parent_locus = query_to_locus.get(base_qid, "unknown")
+
             row = {
                 "genome": genome_id,
                 "scaffold": c["scaffold"],
@@ -2031,7 +2041,8 @@ def main() -> None:
                 "num_hsps": c["num_hsps"],
                 "best_evalue": c["best_evalue"],
                 "best_bitscore": c["best_bitscore"],
-                "query_id": c["query_id"],  # Keep for reference, but not for locus assignment
+                "query_id": query_id,
+                "parent_locus": parent_locus,  # Locus whose query found this hit
                 "query_start_min": c["query_start_min"],
                 "query_end_max": c["query_end_max"],
                 "query_span_coverage": c["query_span_coverage"],
