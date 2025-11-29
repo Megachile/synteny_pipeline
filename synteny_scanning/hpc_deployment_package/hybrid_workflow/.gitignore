@@ -1,0 +1,82 @@
+# ============================================================================
+# ONLY TRACK SCRIPTS - IGNORE EVERYTHING ELSE
+# ============================================================================
+
+# Ignore everything by default
+/*
+
+# ONLY allow these directories
+!/scripts/
+!/redesign_scripts/
+!/helixer_pipeline/
+!/.gitignore
+!/README.md
+
+# Within scripts directories, ignore Python cache
+scripts/__pycache__/
+redesign_scripts/__pycache__/
+helixer_pipeline/__pycache__/
+*.pyc
+*.pyo
+
+# ============================================================================
+# EXPLICITLY IGNORE (even if accidentally added)
+# ============================================================================
+
+# Outputs and results
+outputs/
+logs/
+qc_results/
+qc_results_balanced/
+archive*/
+deprecated/
+temp_*/
+tblastn_recovery_test/
+
+# Data files
+data/
+inputs/
+ref/
+*_dbs/
+
+# Large files
+*.fasta
+*.fastq
+*.xml
+*.tsv
+*.csv
+*.out
+*.err
+*.log
+
+# Temporary files
+temp_*
+test_*
+*.tmp
+
+# Beads tracker
+.beads/
+
+# SLURM scripts (generated, not canonical)
+run_*.slurm
+*.slurm
+!scripts/*.slurm
+!redesign_scripts/*.slurm
+!helixer_pipeline/*.slurm
+
+# Python generated
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Documentation (keep only critical ones)
+*_SUMMARY.md
+*_RESULTS.md
+*_ANALYSIS.md
+*_ISSUES.md
+*_NOTES.md
+*_PLAN.md
+*_STATUS.md
+SESSION_*.md
+WORKFLOW_BLUEPRINT*.md
