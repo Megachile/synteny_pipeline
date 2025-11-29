@@ -1272,8 +1272,12 @@ def parse_args():
                         help='Optional override directory - genomes here take precedence (for BK NC_* reference)')
     parser.add_argument('--output-dir', required=True, type=Path,
                         help='Output directory for extracted sequences')
-    parser.add_argument('--unplaceable-evalue', type=float, default=1e-10,
-                        help='E-value threshold for unplaceable targets (default: 1e-10)')
+    parser.add_argument('--unplaceable-evalue', type=float, default=1e-50,
+                        help='E-value threshold for unplaceable targets (default: 1e-50)')
+    parser.add_argument('--unplaceable-query-coverage', type=float, default=0.85,
+                        help='Min query coverage for unplaceable targets (default: 0.85 = 85%%)')
+    parser.add_argument('--unplaceable-max', type=int, default=100,
+                        help='Max unplaceable targets to include (default: 100, avoids domain-hit explosion)')
     parser.add_argument('--verbose', action='store_true',
                         help='Print verbose extraction progress')
 
@@ -1295,6 +1299,8 @@ def main():
     print(f"  Output directory: {args.output_dir}")
     print(f"\nParameters:")
     print(f"  Unplaceable e-value threshold: {args.unplaceable_evalue}")
+    print(f"  Unplaceable query coverage min: {args.unplaceable_query_coverage}")
+    print(f"  Unplaceable max targets: {args.unplaceable_max}")
     print(f"  Classification: Query-length-aware (>= 90% = intact)")
 
     # Load filtered targets
@@ -1311,8 +1317,21 @@ def main():
         unplaceable_df = pd.read_csv(args.unplaceable, sep='\t')
         print(f"  Loaded {len(unplaceable_df)} unplaceable targets", flush=True)
 
+        # Filter by e-value
         strong_unplaceable = unplaceable_df[unplaceable_df['best_evalue'] < args.unplaceable_evalue]
-        print(f"  Kept {len(strong_unplaceable)} strong unplaceable targets", flush=True)
+        print(f"  After e-value filter (<{args.unplaceable_evalue}): {len(strong_unplaceable)}", flush=True)
+
+        # Filter by query coverage (avoid domain-only hits)
+        cov_col = 'combined_query_coverage' if 'combined_query_coverage' in strong_unplaceable.columns else 'query_span_coverage'
+        if cov_col in strong_unplaceable.columns:
+            strong_unplaceable = strong_unplaceable[strong_unplaceable[cov_col] >= args.unplaceable_query_coverage]
+            print(f"  After query coverage filter (>={args.unplaceable_query_coverage}): {len(strong_unplaceable)}", flush=True)
+
+        # Cap total unplaceable targets (avoid massive families like serine proteases)
+        if len(strong_unplaceable) > args.unplaceable_max:
+            # Keep best by e-value
+            strong_unplaceable = strong_unplaceable.nsmallest(args.unplaceable_max, 'best_evalue')
+            print(f"  Capped to top {args.unplaceable_max} by e-value: {len(strong_unplaceable)}", flush=True)
 
         targets_df = pd.concat([syntenic_df, strong_unplaceable], ignore_index=True)
     else:
