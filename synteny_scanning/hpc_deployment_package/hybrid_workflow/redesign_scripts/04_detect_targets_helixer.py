@@ -520,19 +520,52 @@ def main():
     # Write output
     if all_results:
         output_df = pd.DataFrame(all_results)
+        n_before_dedup = len(output_df)
 
-        # Reorder columns to match tblastn format
+        # Deduplicate: same gene can be hit by multiple query proteins from different loci
+        # Keep the best hit (lowest e-value) per unique target_gene_id
+        # But track all loci that matched this gene
+        if 'target_gene_id' in output_df.columns and len(output_df) > 0:
+            # Group by target_gene_id and aggregate
+            def aggregate_gene_hits(group):
+                # Sort by e-value to get best hit
+                group = group.sort_values('best_evalue')
+                best = group.iloc[0].copy()
+
+                # Collect all unique loci that matched this gene
+                all_loci = group['parent_locus'].dropna().unique()
+                all_loci = [l for l in all_loci if l and l != 'unknown']
+                best['all_matched_loci'] = ';'.join(sorted(set(all_loci))) if all_loci else ''
+                best['n_loci_matched'] = len(all_loci)
+
+                # Collect all query IDs
+                all_queries = group['query_id'].unique()
+                best['all_query_ids'] = ';'.join(sorted(set(str(q) for q in all_queries)))
+                best['n_queries_matched'] = len(all_queries)
+
+                return best
+
+            output_df = output_df.groupby('target_gene_id', as_index=False).apply(
+                aggregate_gene_hits, include_groups=False
+            ).reset_index(drop=True)
+
+            n_after_dedup = len(output_df)
+            print(f"\n  Deduplication: {n_before_dedup} → {n_after_dedup} unique genes "
+                  f"({n_before_dedup - n_after_dedup} duplicates removed)")
+
+        # Reorder columns to match tblastn format (plus new columns)
         column_order = [
             'genome', 'scaffold', 'strand', 'start', 'end', 'span_kb',
             'num_hsps', 'best_evalue', 'best_bitscore', 'query_id', 'parent_locus',
             'query_start_min', 'query_end_max', 'query_span_coverage',
-            'combined_query_coverage', 'gene_family', 'target_gene_id'
+            'combined_query_coverage', 'gene_family', 'target_gene_id',
+            'all_matched_loci', 'n_loci_matched', 'all_query_ids', 'n_queries_matched'
         ]
         output_df = output_df[[c for c in column_order if c in output_df.columns]]
 
         output_file = args.output_dir / "all_target_loci.tsv"
         output_df.to_csv(output_file, sep='\t', index=False)
-        print(f"\n[OUTPUT] Wrote {len(output_df)} target genes to {output_file}")
+        print(f"\n[OUTPUT] Wrote {len(output_df)} unique target genes to {output_file}")
     else:
         print("\n[WARNING] No target genes found!")
 
