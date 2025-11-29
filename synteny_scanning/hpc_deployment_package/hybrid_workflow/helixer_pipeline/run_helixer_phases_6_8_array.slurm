@@ -124,11 +124,51 @@ if [ $? -ne 0 ]; then
 fi
 
 # =========================================
+# Phase 7b: Annotate BK flanking proteins with SwissProt (for column headers)
+# =========================================
+echo ""
+echo "=== PHASE 7b: Annotate BK flanking proteins ==="
+BK_SWISSPROT_DIR="${PHASE1_DIR}/bk_swissprot"
+BK_SWISSPROT_FILE="${BK_SWISSPROT_DIR}/bk_flanking_swissprot.tsv"
+
+if [ ! -f "$BK_SWISSPROT_FILE" ]; then
+    echo "  Creating BK SwissProt annotations..."
+    mkdir -p "$BK_SWISSPROT_DIR"
+
+    # Combine all BK flanking proteins
+    cat ${PHASE1_DIR}/*_flanking.faa > /tmp/bk_flanking_${FAMILY}.faa 2>/dev/null || true
+    cat ${PHASE1_DIR}/*_flanking_dedup.faa >> /tmp/bk_flanking_${FAMILY}.faa 2>/dev/null || true
+
+    if [ -s /tmp/bk_flanking_${FAMILY}.faa ]; then
+        diamond blastp \
+            --query /tmp/bk_flanking_${FAMILY}.faa \
+            --db ${SWISSPROT_DB%.dmnd} \
+            --out "$BK_SWISSPROT_FILE" \
+            --outfmt 6 qseqid sseqid pident length evalue bitscore stitle \
+            --evalue 1e-5 \
+            --max-target-seqs 1 \
+            --threads 4 \
+            --quiet
+        echo "  Created: $BK_SWISSPROT_FILE"
+        rm -f /tmp/bk_flanking_${FAMILY}.faa
+    else
+        echo "  No BK flanking proteins found"
+    fi
+else
+    echo "  Using existing: $BK_SWISSPROT_FILE"
+fi
+
+# =========================================
 # Phase 8a: Generate locus matrices
 # =========================================
 echo ""
 echo "=== PHASE 8a: Generate locus-specific matrices ==="
 echo "  Output: $PHASE8_OUT"
+
+BK_SWISSPROT_ARG=""
+if [ -f "$BK_SWISSPROT_FILE" ]; then
+    BK_SWISSPROT_ARG="--bk-swissprot $BK_SWISSPROT_FILE"
+fi
 
 python helixer_pipeline/08a_generate_locus_matrices_helixer.py \
     --family "$FAMILY" \
@@ -137,7 +177,8 @@ python helixer_pipeline/08a_generate_locus_matrices_helixer.py \
     --phase6-dir "$PHASE6_OUT" \
     --phase7-dir "$PHASE7_OUT" \
     --species-map "$SPECIES_MAP" \
-    --output-dir "$PHASE8_OUT"
+    --output-dir "$PHASE8_OUT" \
+    $BK_SWISSPROT_ARG
 
 if [ $? -ne 0 ]; then
     echo "ERROR: Phase 8a failed for $FAMILY"

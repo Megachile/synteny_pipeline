@@ -31,6 +31,73 @@ from typing import Dict, Tuple
 import pandas as pd
 
 
+def shorten_swissprot_name(stitle: str, max_len: int = 25) -> str:
+    """
+    Shorten SwissProt stitle for column headers.
+
+    Input format: "sp|P29981|CP4C1_BLADI Cytochrome P450 4C1 OS=Blaberus discoidalis..."
+    Output: "Cytochrome P450 4C1"
+    """
+    if not stitle:
+        return ''
+
+    name = stitle
+
+    # Handle sp|ID|GENE format - extract description after the ID parts
+    if stitle.startswith('sp|') or stitle.startswith('tr|'):
+        parts = stitle.split(' ', 1)
+        if len(parts) > 1:
+            name = parts[1]  # Everything after "sp|XXX|YYY "
+
+    # Remove organism info "OS=Species name..."
+    name = re.sub(r'\s+OS=.*$', '', name)
+
+    # Remove common prefixes
+    name = re.sub(r'^(Probable|Putative|Uncharacterized)\s+', '', name, flags=re.IGNORECASE)
+    # Remove "RecName: Full=" prefix
+    name = re.sub(r'^RecName:\s*Full=', '', name)
+    # Remove AltName parts
+    name = re.sub(r';\s*AltName:.*$', '', name)
+
+    # Truncate if too long
+    if len(name) > max_len:
+        name = name[:max_len-2] + '..'
+
+    return name.strip()
+
+
+def load_bk_swissprot_annotations(bk_swissprot_file: Path) -> Dict[str, str]:
+    """
+    Load SwissProt annotations for BK proteins from DIAMOND output.
+
+    Expects TSV format: qseqid sseqid pident length evalue bitscore stitle
+
+    Returns: {bk_protein_id: short_swissprot_name}
+    """
+    bk_annotations = {}
+
+    if not bk_swissprot_file or not bk_swissprot_file.exists():
+        return bk_annotations
+
+    try:
+        df = pd.read_csv(bk_swissprot_file, sep='\t', header=None,
+                         names=['qseqid', 'sseqid', 'pident', 'length', 'evalue', 'bitscore', 'stitle'])
+
+        for _, row in df.iterrows():
+            # qseqid format: XP_033229649.1|LOC117181192
+            qseqid = str(row['qseqid'])
+            protein_id = qseqid.split('|')[0]  # Just the XP ID
+
+            if protein_id not in bk_annotations and pd.notna(row['stitle']):
+                short_name = shorten_swissprot_name(str(row['stitle']))
+                if short_name:
+                    bk_annotations[protein_id] = short_name
+    except Exception as e:
+        print(f"  Warning: Could not load BK annotations from {bk_swissprot_file}: {e}")
+
+    return bk_annotations
+
+
 def load_species_and_phylo(species_map_file: Path) -> Tuple[Dict[str, str], Dict[str, int]]:
     """Load species mapping and phylogenetic order."""
     species_map = {}
@@ -146,8 +213,12 @@ def create_locus_matrix(
     species_map: Dict[str, str],
     phylo_order_map: Dict[str, int],
     seq_metadata: Dict,
+    bk_annotations: Dict[str, str] = None,
 ) -> pd.DataFrame:
     """Create matrix for one locus."""
+
+    if bk_annotations is None:
+        bk_annotations = {}
 
     gene_family = locus_info.get('gene_family', locus_id)
     upstream_proteins = locus_info.get('upstream', [])
@@ -230,7 +301,12 @@ def create_locus_matrix(
 
         # Upstream proteins (U14, U13, ..., U1)
         for i, protein_id in enumerate(reversed(upstream_proteins), 1):
-            col_name = f"U{len(upstream_proteins) - i + 1}_{protein_id[:15]}"
+            pos_num = len(upstream_proteins) - i + 1
+            # Use BK SwissProt annotation if available, otherwise protein ID
+            if protein_id in bk_annotations:
+                col_name = f"U{pos_num}_{bk_annotations[protein_id]}"
+            else:
+                col_name = f"U{pos_num}_{protein_id}"
             if protein_id in genome_flanking:
                 row[col_name] = genome_flanking[protein_id]  # SwissProt annotation or "match"
             else:
@@ -251,7 +327,11 @@ def create_locus_matrix(
 
         # Downstream proteins (D1, D2, ...)
         for i, protein_id in enumerate(downstream_proteins, 1):
-            col_name = f"D{i}_{protein_id[:15]}"
+            # Use BK SwissProt annotation if available, otherwise protein ID
+            if protein_id in bk_annotations:
+                col_name = f"D{i}_{bk_annotations[protein_id]}"
+            else:
+                col_name = f"D{i}_{protein_id}"
             if protein_id in genome_flanking:
                 row[col_name] = genome_flanking[protein_id]  # SwissProt annotation or "match"
             else:
@@ -280,7 +360,9 @@ def main():
     parser.add_argument("--phase6-dir", type=Path, required=True,
                         help="Phase 6 Helixer extracted sequences")
     parser.add_argument("--phase7-dir", type=Path, default=None,
-                        help="Phase 7 SwissProt annotations (optional)")
+                        help="Phase 7 Helixer SwissProt annotations (optional)")
+    parser.add_argument("--bk-swissprot", type=Path, default=None,
+                        help="BK flanking proteins SwissProt annotations TSV (for column headers)")
     parser.add_argument("--species-map", type=Path, required=True,
                         help="Path to gca_to_species_order.tsv")
     parser.add_argument("--output-dir", type=Path, required=True,
@@ -335,13 +417,19 @@ def main():
     seq_metadata = load_extracted_seq_metadata(args.phase6_dir)
     print(f"  Extracted sequences: {len(seq_metadata)}")
 
+    # Load BK SwissProt annotations for column headers (once for all loci)
+    bk_annotations = {}
+    if args.bk_swissprot:
+        bk_annotations = load_bk_swissprot_annotations(args.bk_swissprot)
+        print(f"  BK SwissProt annotations: {len(bk_annotations)}")
+
     # Generate matrices
     print("\n[2] Generating matrices...")
 
     for locus_id, info in locus_info.items():
         matrix_df = create_locus_matrix(
             locus_id, info, targets_df, flanking_df,
-            species_map, phylo_order_map, seq_metadata
+            species_map, phylo_order_map, seq_metadata, bk_annotations
         )
 
         if not matrix_df.empty:
