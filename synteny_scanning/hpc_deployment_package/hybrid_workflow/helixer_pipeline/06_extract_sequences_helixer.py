@@ -52,17 +52,27 @@ def load_query_protein_lengths(phase1_dir: Path) -> Dict[str, int]:
     """
     Load query protein lengths from Phase 1 target FASTA files.
 
+    Phase 1 v2 structure: {phase1_dir}/{locus_id}/{locus_id}_targets.faa
+
     Returns: {locus_id: protein_length_aa}
     """
     lengths = {}
 
-    # Find all target FASTA files
-    for fasta_file in phase1_dir.glob("*_targets.faa"):
+    # Find all target FASTA files in subdirectories (Phase 1 v2 structure)
+    for fasta_file in phase1_dir.glob("*/*_targets.faa"):
         locus_id = fasta_file.stem.replace("_targets", "")
         for record in SeqIO.parse(fasta_file, 'fasta'):
             # Use first protein in each locus as query length
             lengths[locus_id] = len(str(record.seq).replace('*', '').replace('.', ''))
             break
+
+    # Also check for flat structure (backwards compatibility)
+    if not lengths:
+        for fasta_file in phase1_dir.glob("*_targets.faa"):
+            locus_id = fasta_file.stem.replace("_targets", "")
+            for record in SeqIO.parse(fasta_file, 'fasta'):
+                lengths[locus_id] = len(str(record.seq).replace('*', '').replace('.', ''))
+                break
 
     return lengths
 
@@ -271,8 +281,10 @@ def main():
         end = info.get('end', row.get('end', 0))
         strand = info.get('strand', row.get('strand', '+'))
 
-        # Get query length for this locus
-        query_length = query_lengths.get(parent_locus, 0)
+        # Get query length for this locus (use assigned_locus, fall back to parent_locus)
+        query_length = query_lengths.get(assigned_locus, 0)
+        if query_length == 0:
+            query_length = query_lengths.get(parent_locus, 0)
 
         # Create output directory: {output}/{genome}/{assigned_locus}/
         target_dir = args.output_dir / genome / assigned_locus
