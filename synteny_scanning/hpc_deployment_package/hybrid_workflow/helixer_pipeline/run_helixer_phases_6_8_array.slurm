@@ -93,6 +93,7 @@ echo "  Output: $PHASE6_OUT"
 
 python helixer_pipeline/06_extract_sequences_helixer.py \
     --family "$FAMILY" \
+    --phase1-dir "$PHASE1_DIR" \
     --phase4-dir "$PHASE4_DIR" \
     --phase5-dir "$PHASE5_DIR" \
     --helixer-dir "$HELIXER_DIR" \
