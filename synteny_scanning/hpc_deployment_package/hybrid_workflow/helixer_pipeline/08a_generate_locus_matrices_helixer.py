@@ -359,7 +359,25 @@ def create_locus_matrix(
 
         # Check if we have empty block data for this genome/locus
         has_empty_block = genome in empty_blocks_by_genome
-        has_target = bool(genome_flanking)
+        has_target = genome in targets_by_genome  # Check for actual Phase 5 target
+
+        # Position discordance detection
+        position_discordance = False
+        if has_target and has_empty_block:
+            target_scaffold = targets_by_genome[genome][0].get('scaffold', '')
+            block_scaffold = empty_blocks_by_genome[genome].get('scaffold', '')
+            if target_scaffold and block_scaffold and target_scaffold != block_scaffold:
+                position_discordance = True
+            elif target_scaffold == block_scaffold:
+                # Check position overlap (targets should be within or near the block)
+                target_start = int(targets_by_genome[genome][0].get('start', 0) or 0)
+                target_end = int(targets_by_genome[genome][0].get('end', 0) or 0)
+                block_start = int(empty_blocks_by_genome[genome].get('start', 0) or 0)
+                block_end = int(empty_blocks_by_genome[genome].get('end', 0) or 0)
+                # Check if target is within 100kb of block (generous overlap check)
+                buffer = 100000  # 100kb
+                if target_end < block_start - buffer or target_start > block_end + buffer:
+                    position_discordance = True
 
         # Calculate Phase 5 synteny if we have target
         p5_synteny_pct = 0
@@ -441,6 +459,9 @@ def create_locus_matrix(
         confidence_suffix = ''
         if has_empty_block and row['synteny_confidence'] == 'LOW':
             confidence_suffix = ' *LOW*'
+        # Add position discordance flag
+        if position_discordance:
+            confidence_suffix += ' *DISC*'
 
         if genome in targets_by_genome:
             targets_list = targets_by_genome[genome]
@@ -462,9 +483,9 @@ def create_locus_matrix(
             syn_pct = int(synteny_pct)
             if lengths:
                 lengths_str = ', '.join(str(l) for l in lengths)
-                row['TARGET'] = f"{gene_family} {syn_pct}% [{lengths_str}]"
+                row['TARGET'] = f"{gene_family} {syn_pct}% [{lengths_str}]{confidence_suffix}"
             else:
-                row['TARGET'] = f"{gene_family} {syn_pct}% [{n_targets} hit{'s' if n_targets > 1 else ''}]"
+                row['TARGET'] = f"{gene_family} {syn_pct}% [{n_targets} hit{'s' if n_targets > 1 else ''}]{confidence_suffix}"
         elif synteny_pct > 0:
             row['TARGET'] = f"{gene_family} {int(synteny_pct)}% [empty]{confidence_suffix}"
         else:

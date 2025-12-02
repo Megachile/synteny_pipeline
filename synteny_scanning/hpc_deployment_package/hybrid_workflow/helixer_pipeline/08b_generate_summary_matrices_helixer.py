@@ -225,8 +225,14 @@ def create_summary_matrix(
         else:
             row[unplaceable_col] = "-"
 
+        # Add unplaceable count for easier analysis
+        row['unplaceable_count'] = len(unplaceable_entries)
+
         # Total target count
         row['total'] = len(genome_targets)
+
+        # Syntenic target count (total - unplaceable)
+        row['syntenic_count'] = len(genome_targets) - len(unplaceable_entries)
 
         matrix_rows.append(row)
 
@@ -287,8 +293,10 @@ def main():
         print("  [ERROR] No locus definitions found")
         return 1
 
-    # Phase 2b synteny blocks
-    phase2b_file = args.phase2b_dir / "empty_synteny_blocks.tsv"
+    # Phase 2b synteny blocks (try new filename first, then old for backward compatibility)
+    phase2b_file = args.phase2b_dir / "phase2b_synteny_blocks.tsv"
+    if not phase2b_file.exists():
+        phase2b_file = args.phase2b_dir / "empty_synteny_blocks.tsv"
     if phase2b_file.exists():
         phase2b_blocks_df = pd.read_csv(phase2b_file, sep='\t')
         if 'has_target_overlap' in phase2b_blocks_df.columns:
@@ -302,16 +310,29 @@ def main():
         phase2b_blocks_df = pd.DataFrame()
         print("  No Phase 2b blocks found")
 
-    # Phase 5 targets
-    targets_file = args.phase5_dir / "all_targets_classified.tsv"
-    if not targets_file.exists():
-        # Try syntenic_targets.tsv as fallback
-        targets_file = args.phase5_dir / "syntenic_targets.tsv"
-    if targets_file.exists():
-        targets_df = pd.read_csv(targets_file, sep='\t')
+    # Phase 5 targets - load and combine syntenic + unplaceable
+    targets_df = pd.DataFrame()
+    syntenic_file = args.phase5_dir / "syntenic_targets.tsv"
+    unplaceable_file = args.phase5_dir / "unplaceable_targets.tsv"
+
+    dfs_to_concat = []
+    if syntenic_file.exists():
+        syn_df = pd.read_csv(syntenic_file, sep='\t')
+        dfs_to_concat.append(syn_df)
+    if unplaceable_file.exists():
+        unpl_df = pd.read_csv(unplaceable_file, sep='\t')
+        dfs_to_concat.append(unpl_df)
+
+    if dfs_to_concat:
+        targets_df = pd.concat(dfs_to_concat, ignore_index=True)
+        # Normalize column names for compatibility
+        # Only copy if destination column doesn't exist
+        if 'classification' in targets_df.columns and 'placement' not in targets_df.columns:
+            targets_df['placement'] = targets_df['classification']
+        if 'locus_id' in targets_df.columns and 'assigned_to' not in targets_df.columns:
+            targets_df['assigned_to'] = targets_df['locus_id']
         print(f"  Targets: {len(targets_df)}")
     else:
-        targets_df = pd.DataFrame()
         print("  No targets found")
 
     # Phase 6 metadata - try target_proteins.faa format first
@@ -361,10 +382,14 @@ def main():
         print("=" * 80)
         print(f"\nTotal targets: {len(targets_df)}")
         n_syntenic = len(targets_df[targets_df['placement'] == 'synteny'])
-        n_unplaceable = len(targets_df[targets_df['placement'] == 'unplaceable'])
+        n_unplaceable = len(targets_df[targets_df['placement'] != 'synteny'])
         print(f"  Syntenic: {n_syntenic} ({100*n_syntenic/len(targets_df):.1f}%)")
         print(f"  Unplaceable: {n_unplaceable} ({100*n_unplaceable/len(targets_df):.1f}%)")
         print(f"  Genomes with targets: {targets_df['genome'].nunique()}")
+
+        # Per-genome breakdown
+        genomes_with_unplaceables = targets_df[targets_df['placement'] != 'synteny']['genome'].nunique()
+        print(f"  Genomes with unplaceables: {genomes_with_unplaceables}")
 
     print("\n" + "=" * 80)
     print("PHASE 8b (HELIXER) COMPLETE")
