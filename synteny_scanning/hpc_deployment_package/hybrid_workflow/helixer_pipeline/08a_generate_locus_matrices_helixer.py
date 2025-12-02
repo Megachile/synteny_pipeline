@@ -4,17 +4,21 @@ Phase 8a (Helixer): Generate locus-specific matrices.
 
 Creates one matrix per locus showing:
 - All genomes (rows) sorted by phylogenetic order
-- Flanking protein presence/absence (from Helixer Phase 4b)
+- Flanking protein presence/absence with SwissProt annotations
 - Target gene status (length)
 
 This produces the SAME output format as the original tblastn Phase 8a.
 
 Inputs:
-- Phase 1 locus definitions
-- Phase 4b flanking gene info
+- Phase 1 locus definitions (BK flanking proteins)
 - Phase 5 Helixer classifications
 - Phase 6 Helixer extracted sequences (for length metadata)
+- Phase 7 SwissProt annotations (flanking_matches_annotated.tsv, phase2b_flanking_annotated.tsv)
+- Phase 2b synteny blocks (phase2b_synteny_blocks.tsv)
 - Species/phylo mapping
+
+Key insight: Phase 7 already unions Phase 5 and Phase 2b flanking proteins and annotates
+them with SwissProt. This script just displays the results in matrix format.
 
 Outputs:
 - {locus_id}_genome_swissprot_matrix.tsv (one per locus)
@@ -239,13 +243,21 @@ def create_locus_matrix(
     seq_metadata: Dict,
     bk_annotations: Dict[str, str] = None,
     empty_blocks_df: pd.DataFrame = None,
+    phase2b_flanking_annotations: Dict[str, str] = None,
 ) -> pd.DataFrame:
-    """Create matrix for one locus."""
+    """Create matrix for one locus.
+
+    Args:
+        phase2b_flanking_annotations: Dict mapping BK protein ID -> Helixer SwissProt annotation.
+            Built from Phase 7's phase2b_flanking_annotated.tsv.
+    """
 
     if bk_annotations is None:
         bk_annotations = {}
     if empty_blocks_df is None:
         empty_blocks_df = pd.DataFrame()
+    if phase2b_flanking_annotations is None:
+        phase2b_flanking_annotations = {}
 
     gene_family = locus_info.get('gene_family', locus_id)
     upstream_proteins = locus_info.get('upstream', [])
@@ -345,10 +357,13 @@ def create_locus_matrix(
             eb_data = empty_blocks_by_genome[genome]
             p2b_synteny_pct = round(eb_data['synteny_score'] * 100, 1)
             # UNION: Add Phase 2b flanking genes to genome_flanking
-            # Use BK SwissProt annotation if available (fg is a BK XP ID)
+            # Use Phase 7's Helixer SwissProt annotations (preferred) or BK annotations (fallback)
             for fg in eb_data['flanking_genes']:
                 if fg in all_flanking_proteins and fg not in genome_flanking:
-                    if fg in bk_annotations:
+                    # phase2b_flanking_annotations maps BK protein -> Helixer SwissProt annotation
+                    if fg in phase2b_flanking_annotations and phase2b_flanking_annotations[fg]:
+                        genome_flanking[fg] = phase2b_flanking_annotations[fg]
+                    elif fg in bk_annotations:
                         genome_flanking[fg] = bk_annotations[fg]
                     else:
                         genome_flanking[fg] = "match"
@@ -478,14 +493,19 @@ def main():
     locus_info = load_phase1_flanking_info(args.phase1_dir)
     print(f"  Loci: {len(locus_info)}")
 
-    # Phase 5 classifications
-    targets_file = args.phase5_dir / "all_targets_classified.tsv"
-    if targets_file.exists():
-        targets_df = pd.read_csv(targets_file, sep='\t')
-        print(f"  Targets: {len(targets_df)}")
+    # Phase 5 classifications - load syntenic targets
+    targets_df = pd.DataFrame()
+    syntenic_file = args.phase5_dir / "syntenic_targets.tsv"
+    if syntenic_file.exists():
+        targets_df = pd.read_csv(syntenic_file, sep='\t')
+        # Normalize column names for compatibility
+        if 'classification' in targets_df.columns:
+            targets_df['placement'] = targets_df['classification']
+        if 'locus_id' in targets_df.columns and 'assigned_to' not in targets_df.columns:
+            targets_df['assigned_to'] = targets_df['locus_id']
+        print(f"  Syntenic targets: {len(targets_df)}")
     else:
-        targets_df = pd.DataFrame()
-        print("  No classified targets found")
+        print("  No syntenic targets found")
 
     # Phase 5/7 flanking matches - prefer annotated version from Phase 7
     flanking_df = pd.DataFrame()
@@ -507,13 +527,42 @@ def main():
     seq_metadata = load_extracted_seq_metadata(args.phase6_dir)
     print(f"  Extracted sequences: {len(seq_metadata)}")
 
-    # Phase 2b empty synteny blocks
+    # Phase 2b synteny blocks (try new filename first, then old for backward compatibility)
     empty_blocks_df = pd.DataFrame()
-    if args.phase2b_dir and (args.phase2b_dir / "empty_synteny_blocks.tsv").exists():
-        empty_blocks_df = pd.read_csv(args.phase2b_dir / "empty_synteny_blocks.tsv", sep='\t')
-        print(f"  Empty synteny blocks: {len(empty_blocks_df)}")
+    if args.phase2b_dir:
+        phase2b_blocks_file = args.phase2b_dir / "phase2b_synteny_blocks.tsv"
+        if not phase2b_blocks_file.exists():
+            phase2b_blocks_file = args.phase2b_dir / "empty_synteny_blocks.tsv"
+
+        if phase2b_blocks_file.exists():
+            empty_blocks_df = pd.read_csv(phase2b_blocks_file, sep='\t')
+            print(f"  Phase 2b synteny blocks: {len(empty_blocks_df)}")
+        else:
+            print("  No Phase 2b synteny blocks data")
     else:
-        print("  No Phase 2b empty blocks data")
+        print("  No Phase 2b directory provided")
+
+    # Phase 7 Phase 2b flanking annotations (Helixer SwissProt annotations)
+    # Build lookup: BK protein ID -> Helixer SwissProt annotation
+    phase2b_flanking_annotations = {}
+    if args.phase7_dir:
+        phase2b_annot_file = args.phase7_dir / "phase2b_flanking_annotated.tsv"
+        if phase2b_annot_file.exists():
+            p2b_annot_df = pd.read_csv(phase2b_annot_file, sep='\t')
+            for _, row in p2b_annot_df.iterrows():
+                bk_id = str(row.get('bk_flanking_id', '')).split('|')[0]  # Get just XP ID
+                sp_name = row.get('swissprot_name', '')
+                sp_pident = row.get('swissprot_pident', 0)
+
+                if bk_id and sp_name and pd.notna(sp_name):
+                    if sp_pident and sp_pident > 0:
+                        annotation = f"{sp_name} ({int(sp_pident)}%)"
+                    else:
+                        annotation = sp_name
+                    # Keep best annotation per BK protein
+                    if bk_id not in phase2b_flanking_annotations:
+                        phase2b_flanking_annotations[bk_id] = annotation
+            print(f"  Phase 2b flanking annotations (from Phase 7): {len(phase2b_flanking_annotations)}")
 
     # Load BK SwissProt annotations for column headers (once for all loci)
     bk_annotations = {}
@@ -528,7 +577,7 @@ def main():
         matrix_df = create_locus_matrix(
             locus_id, info, targets_df, flanking_df,
             species_map, phylo_order_map, seq_metadata, bk_annotations,
-            empty_blocks_df
+            empty_blocks_df, phase2b_flanking_annotations
         )
 
         if not matrix_df.empty:

@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-Phase 2b (Helixer): Detect empty synteny blocks.
+Phase 2b (Helixer): Detect synteny blocks via flanking-first approach.
 
-Finds conserved synteny blocks (flanking genes present) where the target gene
-is ABSENT. This recovers functionality lost when moving from tblastn-based
-synteny detection to target-centric Helixer approach.
+Searches for BK flanking genes across all Helixer proteomes, then clusters
+hits to identify conserved synteny blocks. This is complementary to the
+target-first approach in Phase 4/5.
 
 Flow:
 1. DIAMOND blastp: BK flanking proteins → all Helixer proteomes
 2. Cluster flanking gene hits by scaffold/position
-3. Score clusters by flanking gene coverage
+3. Score clusters by flanking gene coverage (vs BK reference)
 4. Check if cluster overlaps existing Phase 4 target hits
-5. Non-overlapping clusters with good scores → "empty synteny blocks"
+5. Label blocks as "concordant" (has target) or "empty" (no target)
 
 Inputs:
 - Phase 1 locus flanking FASTAs (BK flanking proteins)
 - Helixer proteomes for all genomes
-- Phase 4 target hits (to exclude regions with targets)
+- Phase 4 target hits (to identify concordant blocks)
 
 Outputs:
-- empty_synteny_blocks.tsv: Regions with conserved flanking but no target
-- empty_block_details.tsv: Individual flanking gene hits
+- phase2b_synteny_blocks.tsv: All synteny blocks with concordant/empty status
+- phase2b_flanking_details.tsv: Individual flanking gene hits (Helixer IDs)
 - locus_coverage_summary.tsv: Per-locus coverage across genomes
 """
 
@@ -495,12 +495,12 @@ def main():
     # Write outputs
     if all_empty_blocks:
         pd.DataFrame(all_empty_blocks).to_csv(
-            args.output_dir / "empty_synteny_blocks.tsv", sep='\t', index=False
+            args.output_dir / "phase2b_synteny_blocks.tsv", sep='\t', index=False
         )
 
     if all_hit_details:
         pd.DataFrame(all_hit_details).to_csv(
-            args.output_dir / "empty_block_details.tsv", sep='\t', index=False
+            args.output_dir / "phase2b_flanking_details.tsv", sep='\t', index=False
         )
 
     if locus_coverage:
@@ -531,7 +531,7 @@ def main():
         for genome, count in genome_counts.items():
             print(f"  {genome}: {count} loci")
 
-    print(f"\n[OUTPUT] {args.output_dir}/empty_synteny_blocks.tsv")
+    print(f"\n[OUTPUT] {args.output_dir}/phase2b_synteny_blocks.tsv")
     print(f"[OUTPUT] {args.output_dir}/locus_coverage_summary.tsv")
 
     return 0

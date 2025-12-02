@@ -2,25 +2,32 @@
 """
 Phase 7 (Helixer): Annotate flanking genes with SwissProt.
 
-Takes the Helixer flanking proteins from Phase 4b/5 and runs DIAMOND against
-SwissProt to get functional annotations. These annotations are displayed in
-the Phase 8 matrices to visually validate synteny.
+UNIONS flanking proteins from both detection methods:
+- Phase 4b/5 (target-first): Flanking genes extracted around target hits
+- Phase 2b (flanking-first): Flanking genes found by searching BK flanking proteins
+
+Then runs DIAMOND against SwissProt to get functional annotations for ALL
+Helixer flanking proteins. Phase 8 displays these annotations in matrices.
 
 Inputs:
 - Phase 4b flanking proteins (flanking_proteins.faa)
-- Phase 5 flanking matches (flanking_matches.tsv) - tells us which flanking
-  genes matched which BK proteins
+- Phase 5 flanking matches (flanking_matches.tsv)
+- Phase 2b flanking details (phase2b_flanking_details.tsv)
+- Helixer proteomes (to extract Phase 2b proteins)
 - SwissProt DIAMOND database
 
 Outputs:
 - flanking_swissprot_annotations.tsv: SwissProt annotations for all flanking genes
-- flanking_annotations_by_target.tsv: Annotations organized by target for Phase 8
+- flanking_matches_annotated.tsv: Phase 5 matches with SwissProt annotations
+- phase2b_flanking_annotated.tsv: Phase 2b flanking with SwissProt annotations
+- combined_flanking_proteins.faa: Union FASTA for reference
 
 The key output columns used by Phase 8:
 - helixer_flanking: The Helixer gene ID
-- bk_xp: The BK protein it matched (from Phase 5)
+- bk_xp: The BK protein it matched
 - swissprot_name: Short functional name (e.g., "Cytochrome P450 3A31")
 - swissprot_pident: Percent identity to SwissProt hit
+- source: "phase5" or "phase2b"
 """
 
 from __future__ import annotations
@@ -28,11 +35,11 @@ from __future__ import annotations
 import argparse
 import re
 import subprocess
-import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Set
 
 import pandas as pd
+from Bio import SeqIO
 
 
 DEFAULT_SWISSPROT_DB = Path("/carc/scratch/projects/emartins/2016456/adam/databases/uniprot_sprot.dmnd")
@@ -134,6 +141,70 @@ def shorten_name(name: str, max_len: int = 40) -> str:
     return name
 
 
+def load_fasta_ids(fasta_path: Path) -> Set[str]:
+    """Load protein IDs from a FASTA file."""
+    ids = set()
+    if fasta_path.exists():
+        for record in SeqIO.parse(fasta_path, 'fasta'):
+            ids.add(record.id)
+    return ids
+
+
+def extract_proteins_from_helixer(
+    protein_ids: Set[str],
+    helixer_dir: Path,
+    output_fasta: Path,
+) -> Dict[str, str]:
+    """
+    Extract specific proteins from Helixer proteomes.
+
+    Handles ID format differences:
+    - Phase 2b stores: Genome_Scaffold_Number (without .1)
+    - FASTA has: Genome_Scaffold_Number.1 (with .1)
+
+    Returns dict of protein_id -> sequence (using original input IDs as keys).
+    """
+    # Group protein IDs by genome
+    genome_proteins = {}
+    for pid in protein_ids:
+        # Phase 2b IDs are like: Aulacidea_tavakolii_CM021343.1_RagTag_000668
+        # Try to match genome by directory name
+        for genome_dir in helixer_dir.iterdir():
+            if genome_dir.is_dir() and pid.startswith(genome_dir.name + '_'):
+                if genome_dir.name not in genome_proteins:
+                    genome_proteins[genome_dir.name] = set()
+                genome_proteins[genome_dir.name].add(pid)
+                break
+
+    sequences = {}
+
+    for genome, pids in genome_proteins.items():
+        proteome_file = helixer_dir / genome / f"{genome}_helixer_proteins.faa"
+        if not proteome_file.exists():
+            continue
+
+        # Build lookup: base_id -> full_id with .1 suffix
+        # Phase 2b ID: Genome_Scaffold_Number
+        # FASTA ID: Genome_Scaffold_Number.1
+        pids_with_suffix = {f"{pid}.1" for pid in pids}
+        pid_map = {f"{pid}.1": pid for pid in pids}  # Map FASTA ID back to original
+
+        for record in SeqIO.parse(proteome_file, 'fasta'):
+            if record.id in pids_with_suffix:
+                # Clean sequence for DIAMOND
+                seq = str(record.seq).replace('.', 'X').replace('*', '')
+                # Use original Phase 2b ID as key (without .1)
+                original_id = pid_map[record.id]
+                sequences[original_id] = seq
+
+    # Write output FASTA
+    with open(output_fasta, 'w') as f:
+        for pid, seq in sequences.items():
+            f.write(f">{pid}\n{seq}\n")
+
+    return sequences
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Phase 7 (Helixer): Annotate flanking genes with SwissProt"
@@ -143,6 +214,10 @@ def main():
                         help="Phase 4b directory with flanking_proteins.faa")
     parser.add_argument("--phase5-dir", type=Path, required=True,
                         help="Phase 5 directory with flanking_matches.tsv")
+    parser.add_argument("--phase2b-dir", type=Path, default=None,
+                        help="Phase 2b directory with phase2b_flanking_details.tsv (optional)")
+    parser.add_argument("--helixer-dir", type=Path, default=None,
+                        help="Helixer proteomes directory (required if --phase2b-dir provided)")
     parser.add_argument("--swissprot-db", type=Path, default=DEFAULT_SWISSPROT_DB,
                         help="SwissProt DIAMOND database")
     parser.add_argument("--output-dir", type=Path, required=True,
@@ -161,30 +236,100 @@ def main():
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Check inputs
+    # =========================================================================
+    # 1. Load Phase 4b/5 flanking proteins (target-first method)
+    # =========================================================================
+    phase5_flanking_ids = set()
+    phase5_sequences = {}
+
     flanking_faa = args.phase4b_dir / "flanking_proteins.faa"
-    if not flanking_faa.exists():
-        print(f"[ERROR] Flanking proteins not found: {flanking_faa}")
-        return 1
-
-    flanking_matches_file = args.phase5_dir / "flanking_matches.tsv"
-    if not flanking_matches_file.exists():
-        print(f"[WARNING] flanking_matches.tsv not found, will annotate all flanking genes")
-        flanking_matches_df = pd.DataFrame()
+    if flanking_faa.exists():
+        for record in SeqIO.parse(flanking_faa, 'fasta'):
+            phase5_flanking_ids.add(record.id)
+            seq = str(record.seq).replace('.', 'X').replace('*', '')
+            phase5_sequences[record.id] = seq
+        print(f"Phase 4b/5 flanking proteins: {len(phase5_flanking_ids)}")
     else:
-        flanking_matches_df = pd.read_csv(flanking_matches_file, sep='\t')
-        print(f"Loaded {len(flanking_matches_df)} flanking matches from Phase 5")
+        print(f"[WARNING] Phase 4b flanking proteins not found: {flanking_faa}")
 
+    # Load flanking matches for BK mapping
+    flanking_matches_df = pd.DataFrame()
+    flanking_matches_file = args.phase5_dir / "flanking_matches.tsv"
+    if flanking_matches_file.exists():
+        flanking_matches_df = pd.read_csv(flanking_matches_file, sep='\t')
+        print(f"Phase 5 flanking matches: {len(flanking_matches_df)}")
+
+    # =========================================================================
+    # 2. Load Phase 2b flanking proteins (flanking-first method)
+    # =========================================================================
+    phase2b_flanking_ids = set()
+    phase2b_details_df = pd.DataFrame()
+
+    if args.phase2b_dir:
+        # Try new filename first, then old filename for backward compatibility
+        phase2b_file = args.phase2b_dir / "phase2b_flanking_details.tsv"
+        if not phase2b_file.exists():
+            phase2b_file = args.phase2b_dir / "empty_block_details.tsv"
+
+        if phase2b_file.exists():
+            phase2b_details_df = pd.read_csv(phase2b_file, sep='\t')
+            phase2b_flanking_ids = set(phase2b_details_df['helixer_gene_id'].dropna().unique())
+            print(f"Phase 2b flanking proteins: {len(phase2b_flanking_ids)}")
+        else:
+            print(f"[WARNING] Phase 2b flanking details not found")
+
+    # =========================================================================
+    # 3. Union flanking proteins and identify what needs extraction
+    # =========================================================================
+    all_flanking_ids = phase5_flanking_ids | phase2b_flanking_ids
+    print(f"\nTotal unique flanking proteins (union): {len(all_flanking_ids)}")
+
+    # Find Phase 2b proteins not already in Phase 5 FASTA
+    need_extraction = phase2b_flanking_ids - phase5_flanking_ids
+    print(f"  From Phase 5 only: {len(phase5_flanking_ids - phase2b_flanking_ids)}")
+    print(f"  From Phase 2b only: {len(need_extraction)}")
+    print(f"  In both (overlap): {len(phase5_flanking_ids & phase2b_flanking_ids)}")
+
+    # =========================================================================
+    # 4. Extract Phase 2b proteins from Helixer proteomes
+    # =========================================================================
+    phase2b_sequences = {}
+    if need_extraction and args.helixer_dir:
+        print(f"\nExtracting {len(need_extraction)} Phase 2b proteins from Helixer proteomes...")
+        phase2b_fasta = args.output_dir / "phase2b_flanking_proteins.faa"
+        phase2b_sequences = extract_proteins_from_helixer(
+            need_extraction, args.helixer_dir, phase2b_fasta
+        )
+        print(f"  Extracted: {len(phase2b_sequences)}")
+        missing = need_extraction - set(phase2b_sequences.keys())
+        if missing:
+            print(f"  [WARNING] Could not extract: {len(missing)}")
+    elif need_extraction:
+        print(f"[WARNING] Need --helixer-dir to extract Phase 2b proteins")
+
+    # =========================================================================
+    # 5. Combine all flanking proteins into single FASTA
+    # =========================================================================
+    all_sequences = {**phase5_sequences, **phase2b_sequences}
+    combined_fasta = args.output_dir / "combined_flanking_proteins.faa"
+
+    with open(combined_fasta, 'w') as f:
+        for pid, seq in all_sequences.items():
+            f.write(f">{pid}\n{seq}\n")
+    print(f"\nCombined FASTA: {len(all_sequences)} proteins")
+
+    # =========================================================================
+    # 6. Run DIAMOND against SwissProt
+    # =========================================================================
     if not args.swissprot_db.exists():
         print(f"[ERROR] SwissProt database not found: {args.swissprot_db}")
         return 1
 
-    # Run DIAMOND against SwissProt
     print(f"\nRunning DIAMOND against SwissProt...")
     diamond_out = args.output_dir / "diamond_swissprot.tsv"
 
     success = run_diamond_swissprot(
-        flanking_faa, diamond_out, args.swissprot_db,
+        combined_fasta, diamond_out, args.swissprot_db,
         evalue=args.evalue, threads=args.threads
     )
 
@@ -192,7 +337,9 @@ def main():
         print("[ERROR] DIAMOND failed")
         return 1
 
-    # Parse results
+    # =========================================================================
+    # 7. Parse SwissProt results
+    # =========================================================================
     try:
         hits_df = pd.read_csv(
             diamond_out, sep='\t', header=None,
@@ -209,8 +356,13 @@ def main():
         flanking_id = hit['qseqid']
         parsed = parse_swissprot_title(hit['stitle'])
 
+        # Track source
+        source = 'both' if flanking_id in phase5_flanking_ids and flanking_id in phase2b_flanking_ids \
+                 else 'phase5' if flanking_id in phase5_flanking_ids else 'phase2b'
+
         annotations[flanking_id] = {
             'helixer_flanking': flanking_id,
+            'source': source,
             'swissprot_id': parsed['swissprot_id'],
             'swissprot_gene': parsed['swissprot_gene'],
             'swissprot_name': parsed['swissprot_name'],
@@ -223,17 +375,26 @@ def main():
 
     print(f"Annotated {len(annotations)} flanking genes")
 
-    # Save all annotations
+    # =========================================================================
+    # 8. Save outputs
+    # =========================================================================
+
+    # All annotations
     if annotations:
         annot_df = pd.DataFrame(list(annotations.values()))
         annot_df.to_csv(
             args.output_dir / "flanking_swissprot_annotations.tsv",
             sep='\t', index=False
         )
+        print(f"\n[OUTPUT] flanking_swissprot_annotations.tsv: {len(annot_df)} annotations")
 
-    # Merge with flanking matches for Phase 8
+        # Count by source
+        source_counts = annot_df['source'].value_counts()
+        for src, cnt in source_counts.items():
+            print(f"  {src}: {cnt}")
+
+    # Phase 5 matches with annotations
     if not flanking_matches_df.empty:
-        # Add SwissProt annotations to flanking matches
         enhanced_matches = []
         for _, row in flanking_matches_df.iterrows():
             match_dict = row.to_dict()
@@ -254,20 +415,38 @@ def main():
             args.output_dir / "flanking_matches_annotated.tsv",
             sep='\t', index=False
         )
-        print(f"\n[OUTPUT] flanking_matches_annotated.tsv: {len(enhanced_df)} rows")
+        print(f"[OUTPUT] flanking_matches_annotated.tsv: {len(enhanced_df)} rows")
 
-        # Show sample annotations
         n_with_annot = len([m for m in enhanced_matches if m['swissprot_name']])
-        print(f"  {n_with_annot} flanking matches have SwissProt annotations")
+        print(f"  {n_with_annot} have SwissProt annotations")
 
-        if n_with_annot > 0:
-            print("\nSample annotations:")
-            for m in enhanced_matches[:5]:
-                if m['swissprot_name']:
-                    print(f"  {m['helixer_flanking'][:40]} -> {m['bk_xp']}")
-                    print(f"    SwissProt: {m['swissprot_name']} ({m['swissprot_pident']}%)")
+    # Phase 2b flanking with annotations
+    if not phase2b_details_df.empty:
+        phase2b_annotated = []
+        for _, row in phase2b_details_df.iterrows():
+            record = row.to_dict()
+            helixer_id = row['helixer_gene_id']
 
-    print(f"\n[OUTPUT] flanking_swissprot_annotations.tsv: {len(annotations)} annotations")
+            if helixer_id in annotations:
+                annot = annotations[helixer_id]
+                record['swissprot_name'] = annot['swissprot_name_short']
+                record['swissprot_pident'] = annot['swissprot_pident']
+            else:
+                record['swissprot_name'] = ''
+                record['swissprot_pident'] = 0
+
+            phase2b_annotated.append(record)
+
+        phase2b_annot_df = pd.DataFrame(phase2b_annotated)
+        phase2b_annot_df.to_csv(
+            args.output_dir / "phase2b_flanking_annotated.tsv",
+            sep='\t', index=False
+        )
+        print(f"[OUTPUT] phase2b_flanking_annotated.tsv: {len(phase2b_annot_df)} rows")
+
+        n_with_annot = len([r for r in phase2b_annotated if r['swissprot_name']])
+        print(f"  {n_with_annot} have SwissProt annotations")
+
     print("\nPhase 7 complete.")
     return 0
 
