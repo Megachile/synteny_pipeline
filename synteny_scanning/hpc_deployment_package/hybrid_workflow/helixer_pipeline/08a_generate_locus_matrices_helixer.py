@@ -345,9 +345,13 @@ def create_locus_matrix(
             eb_data = empty_blocks_by_genome[genome]
             p2b_synteny_pct = round(eb_data['synteny_score'] * 100, 1)
             # UNION: Add Phase 2b flanking genes to genome_flanking
+            # Use BK SwissProt annotation if available (fg is a BK XP ID)
             for fg in eb_data['flanking_genes']:
                 if fg in all_flanking_proteins and fg not in genome_flanking:
-                    genome_flanking[fg] = "match"  # Phase 2b match
+                    if fg in bk_annotations:
+                        genome_flanking[fg] = bk_annotations[fg]
+                    else:
+                        genome_flanking[fg] = "match"
 
         # Use max synteny score (for concordant, this gives best evidence)
         if has_target or has_empty_block:
