@@ -16,8 +16,16 @@ Inputs:
 
 Outputs:
 - syntenic_targets.tsv: Targets with flanking gene matches
-- unplaceable_targets.tsv: Targets without synteny support
+- unplaceable_targets.tsv: Targets without synteny support (ENHANCED with detailed info)
 - flanking_matches.tsv: Detailed flanking gene comparison
+- locus_conflicts.tsv: Targets matching multiple loci
+
+Enhanced unplaceable output includes:
+- best_locus_match: Best matching locus even if below threshold
+- best_locus_score: Score for best locus
+- n_flanking_with_bk_hits: How many flanking genes hit ANY BK protein
+- unplaceable_reason: Why classification failed
+- all_locus_scores: All locus scores for debugging
 """
 
 from __future__ import annotations
@@ -223,6 +231,13 @@ def main():
     # Count flanking genes per target
     target_flanking_count = flanking_df.groupby('target_gene_id').size().to_dict()
 
+    # Track which flanking genes (per target) have ANY BK hit (not just locus-specific)
+    target_flanking_with_bk_hits = defaultdict(set)
+    for helixer_id in helixer_to_bk.keys():
+        target_id = flanking_to_target.get(helixer_id)
+        if target_id:
+            target_flanking_with_bk_hits[target_id].add(helixer_id)
+
     # Calculate synteny for each target
     target_synteny = defaultdict(lambda: defaultdict(list))
 
@@ -252,6 +267,7 @@ def main():
     for _, row in targets_df.iterrows():
         target_id = row['target_gene_id']
         n_flanking = target_flanking_count.get(target_id, 0)
+        n_flanking_with_bk = len(target_flanking_with_bk_hits.get(target_id, set()))
 
         # Calculate scores for ALL loci
         locus_scores = {}
@@ -284,7 +300,7 @@ def main():
         # Check for conflicts (multiple loci meet threshold)
         has_conflict = len(qualifying_loci) > 1
 
-        # Find best locus
+        # Find best locus (even if below threshold)
         best_locus = None
         best_score = 0
         best_matches = 0
@@ -297,6 +313,7 @@ def main():
 
         row_dict = row.to_dict()
         row_dict['n_flanking_genes'] = n_flanking
+        row_dict['n_flanking_with_bk_hits'] = n_flanking_with_bk
         row_dict['n_flanking_matches'] = best_matches
         row_dict['synteny_score'] = round(best_score, 3)
         row_dict['matched_locus'] = best_locus or ''
@@ -322,12 +339,32 @@ def main():
             row_dict['conflict_loci'] = ''
             row_dict['conflict_scores'] = ''
 
+        # Build all_locus_scores string for debugging
+        if locus_scores:
+            all_scores_str = ';'.join([f"{l}:{info['score']:.3f}" for l, info in sorted(locus_scores.items())])
+        else:
+            all_scores_str = ''
+        row_dict['all_locus_scores'] = all_scores_str
+
         if best_score >= args.min_synteny:
             row_dict['classification'] = 'syntenic'
             row_dict['locus_id'] = best_locus
+            row_dict['unplaceable_reason'] = ''
             syntenic_rows.append(row_dict)
         else:
             row_dict['classification'] = 'unplaceable'
+            # Determine reason for being unplaceable
+            if n_flanking == 0:
+                reason = 'no_flanking_genes'
+            elif n_flanking_with_bk == 0:
+                reason = 'no_bk_hits'
+            elif best_score == 0:
+                reason = 'no_locus_matches'
+            else:
+                reason = f'below_threshold_{best_score:.3f}'
+            row_dict['unplaceable_reason'] = reason
+            row_dict['best_locus_match'] = best_locus or ''
+            row_dict['best_locus_score'] = round(best_score, 3)
             unplaceable_rows.append(row_dict)
 
     # Write outputs
@@ -385,6 +422,24 @@ def main():
                 print(f"  {locus}: {n} ({n_conflict} with conflicts)")
             else:
                 print(f"  {locus}: {n}")
+
+    # Unplaceable reason summary
+    if not unplaceable_df.empty:
+        print(f"\nUnplaceable by reason:")
+        reason_counts = unplaceable_df['unplaceable_reason'].value_counts()
+        for reason, count in reason_counts.items():
+            print(f"  {reason}: {count}")
+
+        # Show targets with partial matches (below threshold but has some signal)
+        partial_matches = unplaceable_df[unplaceable_df['unplaceable_reason'].str.startswith('below_threshold')]
+        if not partial_matches.empty:
+            print(f"\nPartial matches (below threshold but has synteny signal):")
+            for _, row in partial_matches.head(10).iterrows():
+                print(f"  {row['target_gene_id']}: best={row.get('best_locus_match', 'N/A')} "
+                      f"score={row.get('best_locus_score', 0):.3f} "
+                      f"({row['n_flanking_matches']}/{row['n_flanking_genes']} flanking)")
+            if len(partial_matches) > 10:
+                print(f"  ... and {len(partial_matches) - 10} more")
 
     return 0
 

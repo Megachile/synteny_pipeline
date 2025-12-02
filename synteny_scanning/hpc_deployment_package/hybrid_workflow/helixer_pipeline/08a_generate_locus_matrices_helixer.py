@@ -118,18 +118,40 @@ def load_species_and_phylo(species_map_file: Path) -> Tuple[Dict[str, str], Dict
     return species_map, phylo_order_map
 
 
-def load_extracted_seq_metadata(extraction_dir: Path) -> Dict[Tuple[str, str], Dict]:
+def load_extracted_seq_metadata(extraction_dir: Path) -> Dict[str, Dict]:
     """
-    Load metadata from Phase 6 extracted sequences.
+    Load metadata from Phase 6/7 extracted sequences.
 
-    Returns dict keyed by (genome_id, locus_name):
-      {(genome, locus): {'length_aa': int}}
+    Returns dict keyed by target_gene_id:
+      {target_id: {'length_aa': int}}
     """
     metadata = {}
 
     if not extraction_dir or not extraction_dir.exists():
         return metadata
 
+    # Try new format: target_proteins.faa directly in the directory
+    target_proteins_file = extraction_dir / "target_proteins.faa"
+    if target_proteins_file.exists():
+        current_id = None
+        current_seq = []
+        with open(target_proteins_file) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('>'):
+                    # Save previous sequence
+                    if current_id and current_seq:
+                        metadata[current_id] = {'length_aa': len(''.join(current_seq))}
+                    current_id = line[1:].split()[0]  # Take first part of header
+                    current_seq = []
+                else:
+                    current_seq.append(line)
+            # Don't forget last sequence
+            if current_id and current_seq:
+                metadata[current_id] = {'length_aa': len(''.join(current_seq))}
+        return metadata
+
+    # Fallback: old format with genome/locus subdirectories
     for genome_dir in extraction_dir.iterdir():
         if not genome_dir.is_dir():
             continue
@@ -150,7 +172,9 @@ def load_extracted_seq_metadata(extraction_dir: Path) -> Dict[Tuple[str, str], D
                     length_match = re.search(r'length:(\d+)aa', header)
                     length_aa = int(length_match.group(1)) if length_match else 0
 
-                metadata[(genome_id, locus_name)] = {'length_aa': length_aa}
+                # Use target_id format: genome_scaffold_genenum
+                target_id = f"{genome_id}_{locus_name}"
+                metadata[target_id] = {'length_aa': length_aa}
 
     return metadata
 
@@ -214,11 +238,14 @@ def create_locus_matrix(
     phylo_order_map: Dict[str, int],
     seq_metadata: Dict,
     bk_annotations: Dict[str, str] = None,
+    empty_blocks_df: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """Create matrix for one locus."""
 
     if bk_annotations is None:
         bk_annotations = {}
+    if empty_blocks_df is None:
+        empty_blocks_df = pd.DataFrame()
 
     gene_family = locus_info.get('gene_family', locus_id)
     upstream_proteins = locus_info.get('upstream', [])
@@ -262,6 +289,29 @@ def create_locus_matrix(
 
             flanking_by_genome[genome][bk_xp] = annotation
 
+    # Index empty blocks by genome (for this locus)
+    # empty_blocks_df has: locus_id, genome, synteny_score, flanking_genes_matched
+    empty_blocks_by_genome = {}
+    if not empty_blocks_df.empty:
+        locus_empty = empty_blocks_df[empty_blocks_df['locus_id'] == locus_id]
+        for _, eb_row in locus_empty.iterrows():
+            genome = eb_row['genome']
+            if genome not in empty_blocks_by_genome:
+                empty_blocks_by_genome[genome] = {
+                    'synteny_score': eb_row['synteny_score'],
+                    'flanking_genes': set(),
+                    'scaffold': eb_row.get('scaffold', ''),
+                    'start': eb_row.get('start', ''),
+                    'end': eb_row.get('end', ''),
+                }
+            # Parse flanking genes matched (format: "XP_033229646.1;XP_033229883.1;...")
+            if pd.notna(eb_row.get('flanking_genes_matched', '')):
+                genes = str(eb_row['flanking_genes_matched']).split(';')
+                empty_blocks_by_genome[genome]['flanking_genes'].update(genes)
+            # Take best synteny score if multiple blocks
+            if eb_row['synteny_score'] > empty_blocks_by_genome[genome]['synteny_score']:
+                empty_blocks_by_genome[genome]['synteny_score'] = eb_row['synteny_score']
+
     # Build matrix rows
     matrix_rows = []
 
@@ -272,27 +322,51 @@ def create_locus_matrix(
         row['species'] = species_map.get(genome, genome)
         row['phylo_order'] = phylo_order_map.get(genome, 999)
 
-        # Check for synteny (flanking matches)
+        # Check for synteny (flanking matches) - prefer target-based, fallback to empty blocks
         genome_flanking = flanking_by_genome.get(genome, {})
         total_flanking = len(upstream_proteins) + len(downstream_proteins)
         all_flanking_proteins = set(upstream_proteins + downstream_proteins)
-        n_matches = len(set(genome_flanking.keys()) & all_flanking_proteins)
 
-        if total_flanking > 0:
-            synteny_pct = round((n_matches / total_flanking) * 100, 1)
+        # Check if we have empty block data for this genome/locus
+        has_empty_block = genome in empty_blocks_by_genome
+
+        if genome_flanking:
+            # Has target with flanking matches
+            n_matches = len(set(genome_flanking.keys()) & all_flanking_proteins)
+            if total_flanking > 0:
+                synteny_pct = round((n_matches / total_flanking) * 100, 1)
+            else:
+                synteny_pct = 0
+        elif has_empty_block:
+            # No target hit, but has empty block from Phase 2b
+            eb_data = empty_blocks_by_genome[genome]
+            # Use synteny score from empty block (already a fraction, convert to %)
+            synteny_pct = round(eb_data['synteny_score'] * 100, 1)
+            n_matches = len(eb_data['flanking_genes'] & all_flanking_proteins)
+            # Add flanking genes from empty block to genome_flanking for column population
+            for fg in eb_data['flanking_genes']:
+                if fg in all_flanking_proteins:
+                    genome_flanking[fg] = "match"
         else:
+            n_matches = 0
             synteny_pct = 0
 
         row['synteny_pct'] = synteny_pct
         row['num_proteins_found'] = n_matches
 
-        # Add scaffold info if target exists
+        # Add scaffold info - prefer target, fallback to empty block
         if genome in targets_by_genome:
             target = targets_by_genome[genome]
             row['scaffold'] = target.get('scaffold', '')
             row['strand'] = target.get('strand', '')
             row['start'] = target.get('start', '')
             row['end'] = target.get('end', '')
+        elif has_empty_block:
+            eb_data = empty_blocks_by_genome[genome]
+            row['scaffold'] = eb_data.get('scaffold', '')
+            row['strand'] = ''
+            row['start'] = eb_data.get('start', '')
+            row['end'] = eb_data.get('end', '')
         else:
             row['scaffold'] = ''
             row['strand'] = ''
@@ -314,7 +388,9 @@ def create_locus_matrix(
 
         # TARGET column
         if genome in targets_by_genome:
-            meta = seq_metadata.get((genome, locus_id), {})
+            target = targets_by_genome[genome]
+            target_id = target.get('target_gene_id', '')
+            meta = seq_metadata.get(target_id, {})
             length = meta.get('length_aa', 0)
             if length > 0:
                 row['TARGET'] = f"{gene_family} [{length}]"
@@ -357,6 +433,10 @@ def main():
                         help="Phase 1 directory with locus definitions")
     parser.add_argument("--phase5-dir", type=Path, required=True,
                         help="Phase 5 Helixer output directory")
+    parser.add_argument("--phase5b-dir", type=Path, default=None,
+                        help="Phase 5b refined classifications (for tandems)")
+    parser.add_argument("--phase2b-dir", type=Path, default=None,
+                        help="Phase 2b empty blocks directory")
     parser.add_argument("--phase6-dir", type=Path, required=True,
                         help="Phase 6 Helixer extracted sequences")
     parser.add_argument("--phase7-dir", type=Path, default=None,
@@ -417,6 +497,14 @@ def main():
     seq_metadata = load_extracted_seq_metadata(args.phase6_dir)
     print(f"  Extracted sequences: {len(seq_metadata)}")
 
+    # Phase 2b empty synteny blocks
+    empty_blocks_df = pd.DataFrame()
+    if args.phase2b_dir and (args.phase2b_dir / "empty_synteny_blocks.tsv").exists():
+        empty_blocks_df = pd.read_csv(args.phase2b_dir / "empty_synteny_blocks.tsv", sep='\t')
+        print(f"  Empty synteny blocks: {len(empty_blocks_df)}")
+    else:
+        print("  No Phase 2b empty blocks data")
+
     # Load BK SwissProt annotations for column headers (once for all loci)
     bk_annotations = {}
     if args.bk_swissprot:
@@ -429,7 +517,8 @@ def main():
     for locus_id, info in locus_info.items():
         matrix_df = create_locus_matrix(
             locus_id, info, targets_df, flanking_df,
-            species_map, phylo_order_map, seq_metadata, bk_annotations
+            species_map, phylo_order_map, seq_metadata, bk_annotations,
+            empty_blocks_df
         )
 
         if not matrix_df.empty:

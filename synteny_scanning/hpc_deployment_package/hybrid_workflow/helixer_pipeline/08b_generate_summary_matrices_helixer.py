@@ -103,29 +103,40 @@ def create_summary_matrix(
     species_map: Dict[str, str],
     phylo_order_map: Dict[str, int],
     seq_metadata: Dict,
-    locus_matrices_dir: Path,
+    phase2b_blocks_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Create summary matrix for gene family."""
+    """
+    Create summary matrix for gene family.
 
-    # Load synteny percentages from Phase 8a locus matrices
-    synteny_by_genome_locus = {}
-    for locus in loci_list:
-        matrix_file = locus_matrices_dir / f"{locus}_genome_swissprot_matrix.tsv"
-        if matrix_file.exists():
-            matrix_df = pd.read_csv(matrix_file, sep='\t')
-            for _, row in matrix_df.iterrows():
-                genome = row['genome_id']
-                synteny_pct = row.get('synteny_pct', 0)
+    Shows all synteny blocks per cell with format:
+    - Concordant (both methods): "75%* [318]"
+    - Empty block (flanking only): "35% [empty]"
+    - Target without flanking block: "[318]"
+    """
 
-                if genome not in synteny_by_genome_locus:
-                    synteny_by_genome_locus[genome] = {}
-                synteny_by_genome_locus[genome][locus] = synteny_pct
+    # Index Phase 2b blocks by (genome, locus)
+    # blocks_by_genome_locus[genome][locus] = [{synteny_score, has_target_overlap, overlapping_target_id}, ...]
+    blocks_by_genome_locus = defaultdict(lambda: defaultdict(list))
+    if not phase2b_blocks_df.empty:
+        for _, block in phase2b_blocks_df.iterrows():
+            genome = block['genome']
+            locus = block['locus_id']
+            blocks_by_genome_locus[genome][locus].append({
+                'synteny_score': block['synteny_score'],
+                'has_target_overlap': block.get('has_target_overlap', False),
+                'overlapping_target_id': block.get('overlapping_target_id', ''),
+                'scaffold': block.get('scaffold', ''),
+                'start': block.get('start', 0),
+                'end': block.get('end', 0),
+            })
 
-    # Group targets by genome
+    # Index targets by genome and target_id
     targets_by_genome = defaultdict(list)
+    targets_by_id = {}
     if not targets_df.empty:
         for _, target in targets_df.iterrows():
             targets_by_genome[target['genome']].append(target)
+            targets_by_id[target['target_gene_id']] = target
 
     # Define columns: loci + unplaceable
     unplaceable_col = f"{gene_family}_unplaceable"
@@ -145,67 +156,77 @@ def create_summary_matrix(
         for col in columns:
             row[col] = ""
 
-        # Get targets for this genome
         genome_targets = targets_by_genome.get(genome, [])
 
-        # Track counts per category
-        category_counts = defaultdict(list)
+        # Track which targets were matched to blocks
+        matched_target_ids = set()
 
-        for target in genome_targets:
-            placement = target.get('placement', '')
-            assigned_to = target.get('assigned_to', '')
-
-            if placement == 'synteny' and assigned_to in loci_list:
-                category = assigned_to
-            else:
-                category = unplaceable_col
-
-            # Get length metadata
-            if placement == 'synteny':
-                lookup_key = (genome, assigned_to)
-            else:
-                # Unplaceable: use unique tag
-                scaffold = str(target.get('scaffold', ''))
-                start = str(target.get('start', ''))
-                end = str(target.get('end', ''))
-                unique_tag = f"{scaffold}_{start}_{end}"
-                lookup_key = (genome, unique_tag)
-
-            meta = seq_metadata.get(lookup_key, {})
-            length = meta.get('length_aa', 0)
-
-            if length > 0:
-                category_counts[category].append(str(length))
-            else:
-                category_counts[category].append("hit")
-
-        # Format cells
-        for category, target_list in category_counts.items():
-            if category in row:
-                if category in loci_list:
-                    # Syntenic: include synteny percentage
-                    synteny_pct = synteny_by_genome_locus.get(genome, {}).get(category, 0)
-                    row[category] = f"{synteny_pct}% [{'; '.join(target_list)}]"
-                else:
-                    # Unplaceable
-                    row[category] = f"[{'; '.join(target_list)}]"
-
-        # Fill in loci with synteny but no targets
-        if genome in synteny_by_genome_locus:
-            for locus, synteny_pct in synteny_by_genome_locus[genome].items():
-                if locus in row and row[locus] == "":
-                    if synteny_pct > 0:
-                        row[locus] = f"{synteny_pct}% [empty]"
-                    else:
-                        row[locus] = "[not found]"
-
-        # Mark remaining empty loci
+        # Process each locus
         for locus in loci_list:
-            if locus in row and row[locus] == "":
-                row[locus] = "[not found]"
+            cell_entries = []
 
-        # Total count
-        row['total'] = sum(len(targets) for targets in category_counts.values())
+            # Get Phase 2b blocks for this genome/locus
+            locus_blocks = blocks_by_genome_locus[genome].get(locus, [])
+
+            for block in locus_blocks:
+                synteny_pct = round(block['synteny_score'] * 100, 1)
+
+                if block['has_target_overlap'] and block['overlapping_target_id']:
+                    # Concordant block - both methods found it
+                    target_id = block['overlapping_target_id']
+                    matched_target_ids.add(target_id)
+
+                    # Get AA length from metadata
+                    meta = seq_metadata.get(target_id, {})
+                    length = meta.get('length_aa', 0)
+
+                    if length > 0:
+                        cell_entries.append(f"{synteny_pct}%* [{length}]")
+                    else:
+                        cell_entries.append(f"{synteny_pct}%* [hit]")
+                else:
+                    # Empty block - flanking genes found, no target
+                    cell_entries.append(f"{synteny_pct}% [empty]")
+
+            # Check for targets assigned to this locus that weren't matched to blocks
+            for target in genome_targets:
+                if target.get('assigned_to') == locus and target['target_gene_id'] not in matched_target_ids:
+                    # Target found by target-first but no matching Phase 2b block
+                    target_id = target['target_gene_id']
+                    meta = seq_metadata.get(target_id, {})
+                    length = meta.get('length_aa', 0)
+
+                    if length > 0:
+                        cell_entries.append(f"[{length}]")
+                    else:
+                        cell_entries.append("[hit]")
+
+            # Format cell
+            if cell_entries:
+                row[locus] = ", ".join(cell_entries)
+            else:
+                row[locus] = "-"
+
+        # Handle unplaceable targets
+        unplaceable_entries = []
+        for target in genome_targets:
+            if target.get('placement') != 'synteny' or target.get('assigned_to') not in loci_list:
+                target_id = target['target_gene_id']
+                if target_id not in matched_target_ids:
+                    meta = seq_metadata.get(target_id, {})
+                    length = meta.get('length_aa', 0)
+                    if length > 0:
+                        unplaceable_entries.append(f"[{length}]")
+                    else:
+                        unplaceable_entries.append("[hit]")
+
+        if unplaceable_entries:
+            row[unplaceable_col] = ", ".join(unplaceable_entries)
+        else:
+            row[unplaceable_col] = "-"
+
+        # Total target count
+        row['total'] = len(genome_targets)
 
         matrix_rows.append(row)
 
@@ -225,12 +246,12 @@ def main():
     parser.add_argument("--family", required=True, help="Gene family name")
     parser.add_argument("--phase1-dir", type=Path, required=True,
                         help="Phase 1 directory with locus definitions")
+    parser.add_argument("--phase2b-dir", type=Path, required=True,
+                        help="Phase 2b synteny blocks directory")
     parser.add_argument("--phase5-dir", type=Path, required=True,
                         help="Phase 5 Helixer output directory")
     parser.add_argument("--phase6-dir", type=Path, required=True,
                         help="Phase 6 Helixer extracted sequences")
-    parser.add_argument("--phase8a-dir", type=Path, required=True,
-                        help="Phase 8a locus matrices directory")
     parser.add_argument("--species-map", type=Path, required=True,
                         help="Path to gca_to_species_order.tsv")
     parser.add_argument("--output-dir", type=Path, required=True,
@@ -266,8 +287,26 @@ def main():
         print("  [ERROR] No locus definitions found")
         return 1
 
+    # Phase 2b synteny blocks
+    phase2b_file = args.phase2b_dir / "empty_synteny_blocks.tsv"
+    if phase2b_file.exists():
+        phase2b_blocks_df = pd.read_csv(phase2b_file, sep='\t')
+        if 'has_target_overlap' in phase2b_blocks_df.columns:
+            n_concordant = phase2b_blocks_df['has_target_overlap'].sum()
+            n_empty = len(phase2b_blocks_df) - n_concordant
+        else:
+            n_concordant = 0
+            n_empty = len(phase2b_blocks_df)
+        print(f"  Phase 2b blocks: {len(phase2b_blocks_df)} ({n_concordant} concordant, {n_empty} empty)")
+    else:
+        phase2b_blocks_df = pd.DataFrame()
+        print("  No Phase 2b blocks found")
+
     # Phase 5 targets
     targets_file = args.phase5_dir / "all_targets_classified.tsv"
+    if not targets_file.exists():
+        # Try syntenic_targets.tsv as fallback
+        targets_file = args.phase5_dir / "syntenic_targets.tsv"
     if targets_file.exists():
         targets_df = pd.read_csv(targets_file, sep='\t')
         print(f"  Targets: {len(targets_df)}")
@@ -275,9 +314,28 @@ def main():
         targets_df = pd.DataFrame()
         print("  No targets found")
 
-    # Phase 6 metadata
-    seq_metadata = load_extracted_seq_metadata(args.phase6_dir)
-    print(f"  Extracted sequences: {len(seq_metadata)}")
+    # Phase 6 metadata - try target_proteins.faa format first
+    seq_metadata = {}
+    target_proteins_file = args.phase6_dir / "target_proteins.faa"
+    if target_proteins_file.exists():
+        current_id = None
+        current_seq = []
+        with open(target_proteins_file) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('>'):
+                    if current_id and current_seq:
+                        seq_metadata[current_id] = {'length_aa': len(''.join(current_seq))}
+                    current_id = line[1:].split()[0]
+                    current_seq = []
+                else:
+                    current_seq.append(line)
+            if current_id and current_seq:
+                seq_metadata[current_id] = {'length_aa': len(''.join(current_seq))}
+        print(f"  Extracted sequences: {len(seq_metadata)}")
+    else:
+        seq_metadata = load_extracted_seq_metadata(args.phase6_dir)
+        print(f"  Extracted sequences: {len(seq_metadata)}")
 
     # Generate summary matrices
     print("\n[2] Generating summary matrices...")
@@ -286,7 +344,7 @@ def main():
         matrix_df = create_summary_matrix(
             gene_family, loci_list, targets_df,
             species_map, phylo_order_map, seq_metadata,
-            args.phase8a_dir
+            phase2b_blocks_df
         )
 
         if not matrix_df.empty:
