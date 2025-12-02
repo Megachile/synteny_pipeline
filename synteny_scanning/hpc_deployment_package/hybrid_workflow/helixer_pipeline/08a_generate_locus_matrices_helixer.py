@@ -322,31 +322,37 @@ def create_locus_matrix(
         row['species'] = species_map.get(genome, genome)
         row['phylo_order'] = phylo_order_map.get(genome, 999)
 
-        # Check for synteny (flanking matches) - prefer target-based, fallback to empty blocks
+        # Check for synteny (flanking matches)
+        # For concordant cases (both Phase 5 target AND Phase 2b block), union the flanking genes
         genome_flanking = flanking_by_genome.get(genome, {})
         total_flanking = len(upstream_proteins) + len(downstream_proteins)
         all_flanking_proteins = set(upstream_proteins + downstream_proteins)
 
         # Check if we have empty block data for this genome/locus
         has_empty_block = genome in empty_blocks_by_genome
+        has_target = bool(genome_flanking)
 
-        if genome_flanking:
-            # Has target with flanking matches
-            n_matches = len(set(genome_flanking.keys()) & all_flanking_proteins)
+        # Calculate Phase 5 synteny if we have target
+        p5_synteny_pct = 0
+        if has_target:
+            n_p5_matches = len(set(genome_flanking.keys()) & all_flanking_proteins)
             if total_flanking > 0:
-                synteny_pct = round((n_matches / total_flanking) * 100, 1)
-            else:
-                synteny_pct = 0
-        elif has_empty_block:
-            # No target hit, but has empty block from Phase 2b
+                p5_synteny_pct = round((n_p5_matches / total_flanking) * 100, 1)
+
+        # Get Phase 2b data if available
+        p2b_synteny_pct = 0
+        if has_empty_block:
             eb_data = empty_blocks_by_genome[genome]
-            # Use synteny score from empty block (already a fraction, convert to %)
-            synteny_pct = round(eb_data['synteny_score'] * 100, 1)
-            n_matches = len(eb_data['flanking_genes'] & all_flanking_proteins)
-            # Add flanking genes from empty block to genome_flanking for column population
+            p2b_synteny_pct = round(eb_data['synteny_score'] * 100, 1)
+            # UNION: Add Phase 2b flanking genes to genome_flanking
             for fg in eb_data['flanking_genes']:
-                if fg in all_flanking_proteins:
-                    genome_flanking[fg] = "match"
+                if fg in all_flanking_proteins and fg not in genome_flanking:
+                    genome_flanking[fg] = "match"  # Phase 2b match
+
+        # Use max synteny score (for concordant, this gives best evidence)
+        if has_target or has_empty_block:
+            synteny_pct = max(p5_synteny_pct, p2b_synteny_pct)
+            n_matches = len(set(genome_flanking.keys()) & all_flanking_proteins)
         else:
             n_matches = 0
             synteny_pct = 0
