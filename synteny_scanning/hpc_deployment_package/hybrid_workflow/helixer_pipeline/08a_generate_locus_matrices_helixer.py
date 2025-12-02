@@ -30,7 +30,7 @@ import argparse
 import re
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
 import pandas as pd
 
@@ -183,17 +183,40 @@ def load_extracted_seq_metadata(extraction_dir: Path) -> Dict[str, Dict]:
     return metadata
 
 
-def load_phase1_flanking_info(phase1_dir: Path) -> Dict[str, Dict]:
-    """
-    Load flanking gene information from Phase 1.
+def shorten_bk_description(desc: str, max_len: int = 30) -> str:
+    """Shorten BK gene description for column headers."""
+    if not desc:
+        return ''
 
-    Returns: {locus_id: {'upstream': [...], 'downstream': [...], 'gene_family': str}}
+    # Remove species suffix like [Belonocnema kinseyi]
+    if '[' in desc:
+        desc = desc.split('[')[0].strip()
+
+    # Remove common prefixes/suffixes
+    desc = desc.replace(' isoform X1', '').replace(' isoform X2', '')
+    desc = desc.replace('-like', '')
+
+    # Truncate
+    if len(desc) > max_len:
+        desc = desc[:max_len-2] + '..'
+
+    return desc
+
+
+def load_phase1_flanking_info(phase1_dir: Path) -> Tuple[Dict[str, Dict], Dict[str, str]]:
+    """
+    Load flanking gene information from Phase 1, including BK annotations.
+
+    Returns:
+        locus_info: {locus_id: {'upstream': [...], 'downstream': [...], 'gene_family': str}}
+        bk_annotations: {protein_id: short_description}
     """
     locus_info = {}
+    bk_annotations = {}
 
     locus_defs = phase1_dir / 'locus_definitions.tsv'
     if not locus_defs.exists():
-        return {}
+        return {}, {}
 
     df = pd.read_csv(locus_defs, sep='\t')
 
@@ -213,11 +236,19 @@ def load_phase1_flanking_info(phase1_dir: Path) -> Dict[str, Dict]:
             with open(flanking_file) as f:
                 for line in f:
                     if line.startswith('>'):
-                        # Format: >XP_033209112.1|LOC117167954 U1 ...
+                        # Format: >XP_033232031.1|LOC117183006 U1 XP_033232031.1 description [species]
                         parts = line[1:].strip().split()
                         if len(parts) >= 2:
                             protein_id = parts[0].split('|')[0]
                             position = parts[1] if len(parts) > 1 else ''
+
+                            # Extract description (everything after position and repeated XP ID)
+                            if len(parts) >= 4:
+                                # parts[2] is usually the XP ID again, parts[3:] is description
+                                description = ' '.join(parts[3:])
+                                short_desc = shorten_bk_description(description)
+                                if short_desc and protein_id not in bk_annotations:
+                                    bk_annotations[protein_id] = short_desc
 
                             if position.startswith('U'):
                                 upstream.append(protein_id)
@@ -230,7 +261,7 @@ def load_phase1_flanking_info(phase1_dir: Path) -> Dict[str, Dict]:
             'gene_family': gene_family,
         }
 
-    return locus_info
+    return locus_info, bk_annotations
 
 
 def create_locus_matrix(
@@ -303,9 +334,15 @@ def create_locus_matrix(
 
     # Index empty blocks by genome (for this locus)
     # empty_blocks_df has: locus_id, genome, synteny_score, flanking_genes_matched
+    # Now also includes: selected, selection_reason, selection_confidence
     empty_blocks_by_genome = {}
     if not empty_blocks_df.empty:
         locus_empty = empty_blocks_df[empty_blocks_df['locus_id'] == locus_id]
+
+        # If 'selected' column exists, filter to selected blocks only
+        if 'selected' in locus_empty.columns:
+            locus_empty = locus_empty[locus_empty['selected'] == True]
+
         for _, eb_row in locus_empty.iterrows():
             genome = eb_row['genome']
             if genome not in empty_blocks_by_genome:
@@ -315,6 +352,8 @@ def create_locus_matrix(
                     'scaffold': eb_row.get('scaffold', ''),
                     'start': eb_row.get('start', ''),
                     'end': eb_row.get('end', ''),
+                    'selection_confidence': eb_row.get('selection_confidence', ''),
+                    'selection_reason': eb_row.get('selection_reason', ''),
                 }
             # Parse flanking genes matched (format: "XP_033229646.1;XP_033229883.1;...")
             if pd.notna(eb_row.get('flanking_genes_matched', '')):
@@ -323,6 +362,8 @@ def create_locus_matrix(
             # Take best synteny score if multiple blocks
             if eb_row['synteny_score'] > empty_blocks_by_genome[genome]['synteny_score']:
                 empty_blocks_by_genome[genome]['synteny_score'] = eb_row['synteny_score']
+                empty_blocks_by_genome[genome]['selection_confidence'] = eb_row.get('selection_confidence', '')
+                empty_blocks_by_genome[genome]['selection_reason'] = eb_row.get('selection_reason', '')
 
     # Build matrix rows
     matrix_rows = []
@@ -379,6 +420,13 @@ def create_locus_matrix(
         row['synteny_pct'] = synteny_pct
         row['num_proteins_found'] = n_matches
 
+        # Add synteny confidence (from tiered block selection)
+        if has_empty_block:
+            eb_data = empty_blocks_by_genome[genome]
+            row['synteny_confidence'] = eb_data.get('selection_confidence', '')
+        else:
+            row['synteny_confidence'] = ''
+
         # Add scaffold info - prefer target, fallback to empty block
         if genome in targets_by_genome:
             target = targets_by_genome[genome]
@@ -412,6 +460,11 @@ def create_locus_matrix(
                 row[col_name] = ""
 
         # TARGET column
+        # Include confidence indicator for LOW confidence synteny blocks
+        confidence_suffix = ''
+        if has_empty_block and row['synteny_confidence'] == 'LOW':
+            confidence_suffix = ' *LOW*'
+
         if genome in targets_by_genome:
             target = targets_by_genome[genome]
             target_id = target.get('target_gene_id', '')
@@ -422,7 +475,7 @@ def create_locus_matrix(
             else:
                 row['TARGET'] = f"{gene_family} [hit]"
         elif synteny_pct > 0:
-            row['TARGET'] = f"{gene_family} [empty]"
+            row['TARGET'] = f"{gene_family} [empty]{confidence_suffix}"
         else:
             row['TARGET'] = f"{gene_family} [0%]"
 
@@ -489,9 +542,10 @@ def main():
     species_map, phylo_order_map = load_species_and_phylo(args.species_map)
     print(f"  Species: {len(species_map)} genomes")
 
-    # Phase 1 flanking info
-    locus_info = load_phase1_flanking_info(args.phase1_dir)
+    # Phase 1 flanking info (includes BK annotations from FASTA headers)
+    locus_info, bk_annotations = load_phase1_flanking_info(args.phase1_dir)
     print(f"  Loci: {len(locus_info)}")
+    print(f"  BK annotations (from Phase 1): {len(bk_annotations)}")
 
     # Phase 5 classifications - load syntenic targets
     targets_df = pd.DataFrame()
@@ -564,11 +618,12 @@ def main():
                         phase2b_flanking_annotations[bk_id] = annotation
             print(f"  Phase 2b flanking annotations (from Phase 7): {len(phase2b_flanking_annotations)}")
 
-    # Load BK SwissProt annotations for column headers (once for all loci)
-    bk_annotations = {}
+    # Optional: Override BK annotations with SwissProt file (usually not needed)
     if args.bk_swissprot:
-        bk_annotations = load_bk_swissprot_annotations(args.bk_swissprot)
-        print(f"  BK SwissProt annotations: {len(bk_annotations)}")
+        swissprot_annots = load_bk_swissprot_annotations(args.bk_swissprot)
+        if swissprot_annots:
+            bk_annotations.update(swissprot_annots)
+            print(f"  BK SwissProt annotations (override): {len(swissprot_annots)}")
 
     # Generate matrices
     print("\n[2] Generating matrices...")
@@ -581,7 +636,7 @@ def main():
         )
 
         if not matrix_df.empty:
-            output_file = args.output_dir / f"{locus_id}_genome_swissprot_matrix.tsv"
+            output_file = args.output_dir / f"{args.family}_{locus_id}_genome_swissprot_matrix.tsv"
             matrix_df.to_csv(output_file, sep='\t', index=False)
 
             n_with_synteny = len(matrix_df[matrix_df['synteny_pct'] > 0])

@@ -30,10 +30,184 @@ import argparse
 import subprocess
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Optional
 
 import pandas as pd
 from Bio import SeqIO
+
+
+# BK chromosome accession -> chromosome number mapping
+# Based on NCBI RefSeq assembly GCF_010583005.2
+BK_CHR_ACCESSION_TO_NUM = {
+    'CM021338': 1, 'CM021339': 2, 'CM021340': 3, 'CM021341': 4, 'CM021342': 5,
+    'CM021343': 6, 'CM021344': 7, 'CM021345': 8, 'CM021346': 9, 'CM021347': 10,
+}
+
+# For Telenomus (GCA_020615435.1) which uses CM036XXX accessions
+TELENOMUS_CHR_ACCESSION_TO_NUM = {
+    'CM036336': 10, 'CM036337': 1, 'CM036338': 2, 'CM036339': 3, 'CM036340': 4,
+    'CM036341': 6, 'CM036342': 9, 'CM036343': 5, 'CM036344': 7, 'CM036345': 8,
+}
+
+
+def extract_expected_chromosome(locus_id: str) -> Optional[int]:
+    """
+    Extract expected chromosome number from locus ID.
+
+    Locus IDs follow pattern: BK_chr6_a, BK_chr10_i, LB_scf7761_c
+    Returns chromosome number (1-10) or None if not parseable.
+    """
+    import re
+    # Match patterns like "chr6" or "chr10"
+    match = re.search(r'chr(\d+)', locus_id)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def get_scaffold_chromosome(scaffold: str, genome_id: str) -> Optional[int]:
+    """
+    Get chromosome number for a scaffold based on RagTag mapping.
+
+    Scaffolds with _RagTag suffix are mapped to BK chromosomes.
+    Scaffolds without _RagTag are unplaced.
+
+    Returns chromosome number (1-10), or None if unplaced.
+    """
+    # Check if it's a RagTag-placed scaffold
+    if '_RagTag' not in scaffold:
+        return None  # Unplaced scaffold
+
+    # Extract the accession prefix (e.g., CM021343 from CM021343.1_RagTag)
+    base_scaffold = scaffold.replace('_RagTag', '')
+    accession_prefix = base_scaffold.split('.')[0]
+
+    # Check if this is a Telenomus genome (uses different accessions)
+    if genome_id == 'GCA_020615435.1':
+        return TELENOMUS_CHR_ACCESSION_TO_NUM.get(accession_prefix)
+
+    # Standard BK-based RagTag mapping
+    return BK_CHR_ACCESSION_TO_NUM.get(accession_prefix)
+
+
+def check_chromosome_correctness(
+    scaffold: str,
+    locus_id: str,
+    genome_id: str
+) -> Optional[bool]:
+    """
+    Check if a scaffold is on the expected chromosome for a locus.
+
+    Returns:
+        True - scaffold is on expected chromosome
+        False - scaffold is on WRONG chromosome
+        None - scaffold is unplaced (can't determine)
+    """
+    expected_chr = extract_expected_chromosome(locus_id)
+    if expected_chr is None:
+        return None  # Can't determine expected chromosome
+
+    actual_chr = get_scaffold_chromosome(scaffold, genome_id)
+    if actual_chr is None:
+        return None  # Unplaced scaffold
+
+    return actual_chr == expected_chr
+
+
+def select_best_block_tiered(blocks_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply tiered selection algorithm to choose best block per locus/genome.
+
+    TIERED SELECTION ALGORITHM:
+
+    Priority order:
+    1. Concordant + correct chr (best possible) -> HIGH confidence
+    2. Concordant + unplaced chr (still has target!) -> HIGH confidence
+    3. Concordant + wrong chr (unlikely but possible) -> HIGH confidence
+    4. Correct chr + highest score -> MEDIUM confidence
+    5. Unplaced chr + highest score (only if no correct-chr option) -> LOW confidence
+    6. Wrong chr + highest score (only if NO other option) -> LOW confidence
+
+    Returns DataFrame with added columns:
+        - selected: bool (True for selected block)
+        - selection_reason: why this block was chosen
+        - selection_confidence: HIGH/MEDIUM/LOW
+        - chr_correct: True/False/None (for diagnostics)
+    """
+    if blocks_df.empty:
+        return blocks_df
+
+    # Add chromosome correctness column
+    blocks_df = blocks_df.copy()
+    blocks_df['chr_correct'] = blocks_df.apply(
+        lambda row: check_chromosome_correctness(
+            row['scaffold'], row['locus_id'], row['genome']
+        ), axis=1
+    )
+
+    # Initialize selection columns
+    blocks_df['selected'] = False
+    blocks_df['selection_reason'] = ''
+    blocks_df['selection_confidence'] = ''
+
+    # Process each locus/genome group
+    for (locus_id, genome), group in blocks_df.groupby(['locus_id', 'genome']):
+        idx = group.index
+
+        # Categorize blocks
+        concordant = group[group['has_target_overlap'] == True]
+        correct_chr = group[group['chr_correct'] == True]
+        unplaced = group[group['chr_correct'].isna()]
+        wrong_chr = group[group['chr_correct'] == False]
+
+        selected_idx = None
+        reason = ''
+        confidence = ''
+
+        # Tier 1: Concordant blocks (always HIGH confidence - has target!)
+        if len(concordant) > 0:
+            conc_correct = concordant[concordant['chr_correct'] == True]
+            conc_unplaced = concordant[concordant['chr_correct'].isna()]
+            conc_wrong = concordant[concordant['chr_correct'] == False]
+
+            if len(conc_correct) > 0:
+                selected_idx = conc_correct['synteny_score'].idxmax()
+                reason = 'concordant_correct_chr'
+                confidence = 'HIGH'
+            elif len(conc_unplaced) > 0:
+                selected_idx = conc_unplaced['synteny_score'].idxmax()
+                reason = 'concordant_unplaced'
+                confidence = 'HIGH'
+            elif len(conc_wrong) > 0:
+                selected_idx = conc_wrong['synteny_score'].idxmax()
+                reason = 'concordant_wrong_chr'
+                confidence = 'HIGH'
+
+        # Tier 2: Correct chromosome (no target) -> MEDIUM confidence
+        elif len(correct_chr) > 0:
+            selected_idx = correct_chr['synteny_score'].idxmax()
+            reason = 'correct_chr_best'
+            confidence = 'MEDIUM'
+
+        # Tier 3: Unplaced scaffolds (no correct-chr alternative) -> LOW confidence
+        elif len(unplaced) > 0:
+            selected_idx = unplaced['synteny_score'].idxmax()
+            reason = 'unplaced_only'
+            confidence = 'LOW'
+
+        # Tier 4: Wrong chromosome only (last resort) -> LOW confidence
+        elif len(wrong_chr) > 0:
+            selected_idx = wrong_chr['synteny_score'].idxmax()
+            reason = 'wrong_chr_only'
+            confidence = 'LOW'
+
+        # Mark the selected block
+        if selected_idx is not None:
+            blocks_df.loc[selected_idx, 'selected'] = True
+            blocks_df.loc[selected_idx, 'selection_reason'] = reason
+            blocks_df.loc[selected_idx, 'selection_confidence'] = confidence
+
+    return blocks_df
 
 
 def run_diamond_blastp(
@@ -494,8 +668,21 @@ def main():
 
     # Write outputs
     if all_empty_blocks:
-        pd.DataFrame(all_empty_blocks).to_csv(
+        blocks_df = pd.DataFrame(all_empty_blocks)
+
+        # Apply tiered selection algorithm
+        print("\n[TIERED SELECTION] Selecting best block per locus/genome...")
+        blocks_df = select_best_block_tiered(blocks_df)
+
+        # Save full output (all blocks with selection info)
+        blocks_df.to_csv(
             args.output_dir / "phase2b_synteny_blocks.tsv", sep='\t', index=False
+        )
+
+        # Also save selected-only version for convenience
+        selected_df = blocks_df[blocks_df['selected'] == True]
+        selected_df.to_csv(
+            args.output_dir / "phase2b_synteny_blocks_selected.tsv", sep='\t', index=False
         )
 
     if all_hit_details:
@@ -513,25 +700,49 @@ def main():
     print(f"  Total synteny blocks found: {len(all_empty_blocks)}")
 
     if all_empty_blocks:
-        blocks_df = pd.DataFrame(all_empty_blocks)
         n_empty = len(blocks_df[~blocks_df['has_target_overlap']])
         n_concordant = len(blocks_df[blocks_df['has_target_overlap']])
         print(f"    Empty (no target): {n_empty}")
         print(f"    Concordant (has target): {n_concordant}")
 
+        # Selection summary
+        selected = blocks_df[blocks_df['selected'] == True]
+        print(f"\n  Selected blocks: {len(selected)}")
+        if len(selected) > 0:
+            print(f"    By confidence:")
+            for conf in ['HIGH', 'MEDIUM', 'LOW']:
+                n = len(selected[selected['selection_confidence'] == conf])
+                if n > 0:
+                    print(f"      {conf}: {n}")
+
+            print(f"    By selection reason:")
+            for reason, count in selected['selection_reason'].value_counts().items():
+                print(f"      {reason}: {count}")
+
+            # Chromosome correctness summary
+            print(f"    By chromosome status:")
+            n_correct = len(selected[selected['chr_correct'] == True])
+            n_wrong = len(selected[selected['chr_correct'] == False])
+            n_unplaced = len(selected[selected['chr_correct'].isna()])
+            print(f"      Correct chr: {n_correct}")
+            print(f"      Wrong chr: {n_wrong}")
+            print(f"      Unplaced: {n_unplaced}")
+
         print(f"\nBlocks by locus:")
         for locus_id in blocks_df['locus_id'].unique():
             locus_df = blocks_df[blocks_df['locus_id'] == locus_id]
             n_total = len(locus_df)
+            n_selected = len(locus_df[locus_df['selected']])
             n_with_target = len(locus_df[locus_df['has_target_overlap']])
-            print(f"  {locus_id}: {n_total} blocks ({n_with_target} concordant)")
+            print(f"  {locus_id}: {n_total} blocks, {n_selected} selected ({n_with_target} concordant)")
 
-        print(f"\nBlocks by genome (top 10):")
-        genome_counts = blocks_df['genome'].value_counts().head(10)
+        print(f"\nSelected blocks by genome (top 10):")
+        genome_counts = selected['genome'].value_counts().head(10)
         for genome, count in genome_counts.items():
             print(f"  {genome}: {count} loci")
 
-    print(f"\n[OUTPUT] {args.output_dir}/phase2b_synteny_blocks.tsv")
+    print(f"\n[OUTPUT] {args.output_dir}/phase2b_synteny_blocks.tsv (all blocks)")
+    print(f"[OUTPUT] {args.output_dir}/phase2b_synteny_blocks_selected.tsv (best per locus/genome)")
     print(f"[OUTPUT] {args.output_dir}/locus_coverage_summary.tsv")
 
     return 0
