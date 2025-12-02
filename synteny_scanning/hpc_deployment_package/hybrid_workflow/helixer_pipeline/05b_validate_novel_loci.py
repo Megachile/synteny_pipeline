@@ -586,7 +586,260 @@ def main():
 
     print(f"\n[OUTPUT] {args.output_dir}")
 
+    # Cluster novel loci based on mutual flanking gene synteny
+    if validation_results:
+        # Load species mapping for proper naming
+        # gca_to_species.tsv is in hybrid_workflow/data/
+        # output_dir is outputs/{family}/phase5b_xxx, need to go up 3 levels
+        data_dir = args.output_dir.parent.parent.parent / "data"
+        species_mapping = load_species_mapping(data_dir)
+        print(f"  Loaded species mapping from {data_dir}: {len(species_mapping)} entries")
+
+        # Load chromosome mapping for CM→chr conversion
+        # chromosome_mappings.json is in hpc_deployment_package/
+        chr_mapping = load_chromosome_mapping(args.output_dir)
+        print(f"  Loaded chromosome mapping: {len(chr_mapping)} entries")
+
+        cluster_novel_loci(
+            results_df,
+            candidates,
+            args.output_dir,
+            min_synteny=0.15,
+            species_mapping=species_mapping,
+            chr_mapping=chr_mapping,
+        )
+
     return 0
+
+
+def load_species_mapping(data_dir: Path) -> dict:
+    """Load genome ID to species name mapping."""
+    mapping_file = data_dir / "gca_to_species.tsv"
+    if not mapping_file.exists():
+        return {}
+
+    mapping = {}
+    df = pd.read_csv(mapping_file, sep='\t')
+    for _, row in df.iterrows():
+        mapping[row['accession']] = row['species']
+    return mapping
+
+
+def load_chromosome_mapping(base_dir: Path) -> dict:
+    """
+    Load chromosome accession to chr# mapping.
+
+    Maps both RefSeq (NC_*) and GenBank (CM*) accessions to chromosome numbers.
+    Merges mappings from all genomes (BK, T_remus, etc.) into a single flat dict.
+    File location: hpc_deployment_package/chromosome_mappings.json
+    """
+    import json
+
+    # Try multiple locations going up from base_dir
+    candidates = [
+        base_dir / "chromosome_mappings.json",
+        base_dir.parent / "chromosome_mappings.json",
+        base_dir.parent.parent / "chromosome_mappings.json",
+        base_dir.parent.parent.parent / "chromosome_mappings.json",
+        base_dir.parent.parent.parent.parent / "chromosome_mappings.json",
+    ]
+
+    for mapping_file in candidates:
+        if mapping_file.exists():
+            with open(mapping_file) as f:
+                data = json.load(f)
+
+            # Merge all genome mappings into single flat dict
+            # Skip keys starting with '_' (comments, metadata)
+            merged = {}
+            for genome_key, genome_mapping in data.items():
+                if isinstance(genome_mapping, dict):
+                    for acc, chr_name in genome_mapping.items():
+                        if not acc.startswith('_'):
+                            merged[acc] = chr_name
+
+            return merged
+
+    return {}
+
+
+def cluster_novel_loci(
+    validation_df: pd.DataFrame,
+    candidates_df: pd.DataFrame,
+    output_dir: Path,
+    min_synteny: float = 0.15,
+    species_mapping: dict = None,
+    chr_mapping: dict = None,
+) -> pd.DataFrame:
+    """
+    Cluster novel locus candidates based on mutual flanking gene synteny.
+
+    Two candidates are the same locus if:
+    - Candidate A has high synteny in genome B
+    - Candidate B has high synteny in genome A
+
+    This mirrors Phase 2 synteny block detection.
+
+    Also tracks empty blocks (genomes with flanking pattern but no target).
+    """
+    print("\n" + "=" * 70)
+    print("CLUSTERING NOVEL LOCI")
+    print("=" * 70)
+
+    # Build lookup: candidate_id -> source_genome
+    candidate_genomes = {}
+    candidate_bitscores = {}
+    for _, row in candidates_df.iterrows():
+        cid = f"NOVEL_{row['genome']}_{row['scaffold']}_{row['start']}"
+        candidate_genomes[cid] = row['genome']
+        candidate_bitscores[cid] = row['best_bitscore']
+
+    # Build synteny matrix: which candidates have synteny to which genomes
+    # synteny_to[candidate_id] = {genome: score}
+    synteny_to = {}
+    for cid in validation_df['candidate_id'].unique():
+        cdf = validation_df[validation_df['candidate_id'] == cid]
+        synteny_to[cid] = {}
+        for _, row in cdf.iterrows():
+            if row['synteny_score'] >= min_synteny:
+                synteny_to[cid][row['target_genome']] = row['synteny_score']
+
+    # Build graph of mutual synteny connections
+    # Two candidates are connected if A has synteny in B's genome AND B has synteny in A's genome
+    from collections import defaultdict
+
+    connections = defaultdict(set)
+    candidate_ids = list(synteny_to.keys())
+
+    for i, cid_a in enumerate(candidate_ids):
+        genome_a = candidate_genomes.get(cid_a)
+        if not genome_a:
+            continue
+
+        for cid_b in candidate_ids[i+1:]:
+            genome_b = candidate_genomes.get(cid_b)
+            if not genome_b:
+                continue
+
+            # Check mutual synteny
+            a_has_b = genome_b in synteny_to.get(cid_a, {})
+            b_has_a = genome_a in synteny_to.get(cid_b, {})
+
+            if a_has_b and b_has_a:
+                connections[cid_a].add(cid_b)
+                connections[cid_b].add(cid_a)
+
+    # Find connected components (each component = one locus)
+    visited = set()
+    clusters = []
+
+    def dfs(node, cluster):
+        if node in visited:
+            return
+        visited.add(node)
+        cluster.add(node)
+        for neighbor in connections[node]:
+            dfs(neighbor, cluster)
+
+    for cid in candidate_ids:
+        if cid not in visited:
+            cluster = set()
+            dfs(cid, cluster)
+            clusters.append(cluster)
+
+    print(f"\nFound {len(clusters)} unique novel loci from {len(candidate_ids)} candidates")
+
+    # For each cluster, determine:
+    # - Representative (highest bitscore)
+    # - Member genomes (have target)
+    # - Empty genomes (have synteny but no target in candidates)
+    # - Locus name (from representative's species + scaffold)
+
+    locus_results = []
+
+    for i, cluster in enumerate(clusters):
+        # Get representative (highest bitscore)
+        cluster_list = list(cluster)
+        rep = max(cluster_list, key=lambda x: candidate_bitscores.get(x, 0))
+
+        # Member genomes (have targets)
+        member_genomes = set()
+        for cid in cluster:
+            genome = candidate_genomes.get(cid)
+            if genome:
+                member_genomes.add(genome)
+
+        # Genomes with synteny to this locus (from any member)
+        all_syntenic_genomes = set()
+        for cid in cluster:
+            for genome in synteny_to.get(cid, {}):
+                all_syntenic_genomes.add(genome)
+
+        # Empty genomes = syntenic but not members
+        empty_genomes = all_syntenic_genomes - member_genomes
+
+        # Get representative info for naming
+        rep_genome = candidate_genomes.get(rep, 'unknown')
+
+        # Get species name from mapping or use genome ID
+        if species_mapping and rep_genome in species_mapping:
+            species_name = species_mapping[rep_genome].replace(' ', '_')
+        elif '_' in rep_genome and not rep_genome.startswith('GCA'):
+            species_name = rep_genome  # Already a species name like Alloxysta_arcuata
+        else:
+            species_name = rep_genome.replace('GCA_', '').replace('.', '_')
+
+        # Extract scaffold/chromosome from candidate ID (NOVEL_genome_scaffold_position)
+        # Parse from representative candidate ID
+        rep_parts = rep.split('_')
+        rep_scaffold = 'unknown'
+        for j, part in enumerate(rep_parts):
+            if part.startswith('CM') or part.startswith('NC') or part.startswith('NODE'):
+                # Include version suffix if present (e.g., CM021342.1)
+                if j + 1 < len(rep_parts) and rep_parts[j + 1] in ['1', 'RagTag']:
+                    if rep_parts[j + 1] == 'RagTag':
+                        rep_scaffold = f"{part}.1"  # Add .1 for CM codes
+                    else:
+                        rep_scaffold = f"{part}.{rep_parts[j + 1]}"
+                else:
+                    rep_scaffold = part
+                break
+
+        # Convert scaffold accession to chromosome number using mapping
+        # e.g., CM021342.1 → chr5
+        chr_name = rep_scaffold
+        if chr_mapping:
+            # Try with and without version suffix
+            chr_name = chr_mapping.get(rep_scaffold,
+                       chr_mapping.get(rep_scaffold.split('.')[0] + '.1',
+                       rep_scaffold.replace('_RagTag', '').replace('.1', '')))
+
+        locus_name = f"{species_name}_{chr_name}"
+
+        locus_results.append({
+            'locus_id': f"NOVEL_{i+1}",
+            'locus_name': locus_name,
+            'representative': rep,
+            'n_members': len(member_genomes),
+            'n_empty': len(empty_genomes),
+            'n_total_genomes': len(member_genomes) + len(empty_genomes),
+            'member_genomes': ';'.join(sorted(member_genomes)),
+            'empty_genomes': ';'.join(sorted(empty_genomes)),
+            'rep_bitscore': candidate_bitscores.get(rep, 0),
+        })
+
+        print(f"\n  NOVEL_{i+1}: {locus_name}")
+        print(f"    Members: {len(member_genomes)} genomes with targets")
+        print(f"    Empty: {len(empty_genomes)} genomes with synteny only")
+        print(f"    Representative: {rep} (bitscore {candidate_bitscores.get(rep, 0):.0f})")
+
+    # Save clustered loci
+    loci_df = pd.DataFrame(locus_results)
+    loci_df.to_csv(output_dir / "novel_loci_clustered.tsv", sep='\t', index=False)
+
+    print(f"\n[OUTPUT] {output_dir / 'novel_loci_clustered.tsv'}")
+
+    return loci_df
 
 
 if __name__ == "__main__":

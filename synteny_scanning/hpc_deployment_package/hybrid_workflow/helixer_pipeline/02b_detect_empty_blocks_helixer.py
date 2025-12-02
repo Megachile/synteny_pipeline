@@ -43,10 +43,11 @@ BK_CHR_ACCESSION_TO_NUM = {
     'CM021343': 6, 'CM021344': 7, 'CM021345': 8, 'CM021346': 9, 'CM021347': 10,
 }
 
-# For Telenomus (GCA_020615435.1) which uses CM036XXX accessions
-TELENOMUS_CHR_ACCESSION_TO_NUM = {
-    'CM036336': 10, 'CM036337': 1, 'CM036338': 2, 'CM036339': 3, 'CM036340': 4,
-    'CM036341': 6, 'CM036342': 9, 'CM036343': 5, 'CM036344': 7, 'CM036345': 8,
+# Genomes with native chromosome-level assemblies that were NOT RagTag'd against BK.
+# For these genomes, chromosome numbers are NOT comparable to BK chromosomes
+# (different chromosome organization), so we exempt them from chr comparison.
+NATIVE_CHROMOSOME_GENOMES = {
+    'GCA_020615435.1',  # Telenomus remus - Platygastroidea, distant from Cynipoidea
 }
 
 
@@ -72,8 +73,16 @@ def get_scaffold_chromosome(scaffold: str, genome_id: str) -> Optional[int]:
     Scaffolds with _RagTag suffix are mapped to BK chromosomes.
     Scaffolds without _RagTag are unplaced.
 
-    Returns chromosome number (1-10), or None if unplaced.
+    Special case: Genomes with native chromosome-level assemblies (not RagTag'd)
+    return None because their chromosome numbers are not comparable to BK.
+
+    Returns chromosome number (1-10), or None if unplaced/not comparable.
     """
+    # Check for native chromosome-level genomes that weren't RagTag'd
+    # These have their own chromosome organization, not comparable to BK
+    if genome_id in NATIVE_CHROMOSOME_GENOMES:
+        return None  # Cannot compare chromosome numbers
+
     # Check if it's a RagTag-placed scaffold
     if '_RagTag' not in scaffold:
         return None  # Unplaced scaffold
@@ -81,10 +90,6 @@ def get_scaffold_chromosome(scaffold: str, genome_id: str) -> Optional[int]:
     # Extract the accession prefix (e.g., CM021343 from CM021343.1_RagTag)
     base_scaffold = scaffold.replace('_RagTag', '')
     accession_prefix = base_scaffold.split('.')[0]
-
-    # Check if this is a Telenomus genome (uses different accessions)
-    if genome_id == 'GCA_020615435.1':
-        return TELENOMUS_CHR_ACCESSION_TO_NUM.get(accession_prefix)
 
     # Standard BK-based RagTag mapping
     return BK_CHR_ACCESSION_TO_NUM.get(accession_prefix)
@@ -125,7 +130,8 @@ def select_best_block_tiered(blocks_df: pd.DataFrame) -> pd.DataFrame:
     2. Concordant + unplaced chr (still has target!) -> HIGH confidence
     3. Concordant + wrong chr (unlikely but possible) -> HIGH confidence
     4. Correct chr + highest score -> MEDIUM confidence
-    5. Unplaced chr + highest score (only if no correct-chr option) -> LOW confidence
+    4b. Native chr genome (not RagTag'd, can't compare) -> MEDIUM confidence
+    5. Unplaced scaffolds + highest score (no correct-chr option) -> LOW confidence
     6. Wrong chr + highest score (only if NO other option) -> LOW confidence
 
     Returns DataFrame with added columns:
@@ -154,6 +160,9 @@ def select_best_block_tiered(blocks_df: pd.DataFrame) -> pd.DataFrame:
     for (locus_id, genome), group in blocks_df.groupby(['locus_id', 'genome']):
         idx = group.index
 
+        # Check if this is a native chromosome genome (not RagTag'd)
+        is_native_chr_genome = genome in NATIVE_CHROMOSOME_GENOMES
+
         # Categorize blocks
         concordant = group[group['has_target_overlap'] == True]
         correct_chr = group[group['chr_correct'] == True]
@@ -176,7 +185,7 @@ def select_best_block_tiered(blocks_df: pd.DataFrame) -> pd.DataFrame:
                 confidence = 'HIGH'
             elif len(conc_unplaced) > 0:
                 selected_idx = conc_unplaced['synteny_score'].idxmax()
-                reason = 'concordant_unplaced'
+                reason = 'concordant_unplaced' if not is_native_chr_genome else 'concordant_native_chr'
                 confidence = 'HIGH'
             elif len(conc_wrong) > 0:
                 selected_idx = conc_wrong['synteny_score'].idxmax()
@@ -187,6 +196,13 @@ def select_best_block_tiered(blocks_df: pd.DataFrame) -> pd.DataFrame:
         elif len(correct_chr) > 0:
             selected_idx = correct_chr['synteny_score'].idxmax()
             reason = 'correct_chr_best'
+            confidence = 'MEDIUM'
+
+        # Tier 2b: Native chromosome genome (can't compare chr) -> MEDIUM confidence
+        # These genomes weren't RagTag'd so we can't penalize for "wrong" chr
+        elif is_native_chr_genome and len(unplaced) > 0:
+            selected_idx = unplaced['synteny_score'].idxmax()
+            reason = 'native_chr_best'
             confidence = 'MEDIUM'
 
         # Tier 3: Unplaced scaffolds (no correct-chr alternative) -> LOW confidence
