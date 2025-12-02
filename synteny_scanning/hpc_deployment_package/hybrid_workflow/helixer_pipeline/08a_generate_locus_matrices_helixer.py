@@ -124,61 +124,30 @@ def load_species_and_phylo(species_map_file: Path) -> Tuple[Dict[str, str], Dict
 
 def load_extracted_seq_metadata(extraction_dir: Path) -> Dict[str, Dict]:
     """
-    Load metadata from Phase 6/7 extracted sequences.
+    Load metadata from Phase 6 length_qc.tsv.
 
     Returns dict keyed by target_gene_id:
-      {target_id: {'length_aa': int}}
+      {target_id: {'length_aa': int, 'length_flag': str}}
     """
     metadata = {}
 
     if not extraction_dir or not extraction_dir.exists():
         return metadata
 
-    # Try new format: target_proteins.faa directly in the directory
-    target_proteins_file = extraction_dir / "target_proteins.faa"
-    if target_proteins_file.exists():
-        current_id = None
-        current_seq = []
-        with open(target_proteins_file) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith('>'):
-                    # Save previous sequence
-                    if current_id and current_seq:
-                        metadata[current_id] = {'length_aa': len(''.join(current_seq))}
-                    current_id = line[1:].split()[0]  # Take first part of header
-                    current_seq = []
-                else:
-                    current_seq.append(line)
-            # Don't forget last sequence
-            if current_id and current_seq:
-                metadata[current_id] = {'length_aa': len(''.join(current_seq))}
+    # Load from length_qc.tsv (preferred - has target_id directly)
+    length_qc_file = extraction_dir / "length_qc.tsv"
+    if length_qc_file.exists():
+        df = pd.read_csv(length_qc_file, sep='\t')
+        for _, row in df.iterrows():
+            target_id = row.get('target_id', '')
+            length_aa = int(row.get('extracted_length_aa', 0))
+            length_flag = row.get('length_flag', '')
+            if target_id:
+                metadata[target_id] = {
+                    'length_aa': length_aa,
+                    'length_flag': length_flag
+                }
         return metadata
-
-    # Fallback: old format with genome/locus subdirectories
-    for genome_dir in extraction_dir.iterdir():
-        if not genome_dir.is_dir():
-            continue
-
-        genome_id = genome_dir.name
-
-        for locus_dir in genome_dir.iterdir():
-            if not locus_dir.is_dir() or locus_dir.name == 'UNPLACED':
-                continue
-
-            locus_name = locus_dir.name
-
-            # Find protein FASTA
-            protein_files = list(locus_dir.glob("*_protein.fasta"))
-            if protein_files:
-                with open(protein_files[0]) as f:
-                    header = f.readline().strip()
-                    length_match = re.search(r'length:(\d+)aa', header)
-                    length_aa = int(length_match.group(1)) if length_match else 0
-
-                # Use target_id format: genome_scaffold_genenum
-                target_id = f"{genome_id}_{locus_name}"
-                metadata[target_id] = {'length_aa': length_aa}
 
     return metadata
 
@@ -294,12 +263,19 @@ def create_locus_matrix(
     upstream_proteins = locus_info.get('upstream', [])
     downstream_proteins = locus_info.get('downstream', [])
 
-    # Index targets by genome
+    # Index targets by genome - group for tandem detection
     locus_targets = targets_df[
         (targets_df['placement'] == 'synteny') &
         (targets_df['assigned_to'] == locus_id)
     ]
-    targets_by_genome = {row['genome']: row for _, row in locus_targets.iterrows()}
+
+    # Group all targets per genome for tandem display
+    targets_by_genome = {}
+    for _, row in locus_targets.iterrows():
+        genome = row['genome']
+        if genome not in targets_by_genome:
+            targets_by_genome[genome] = []
+        targets_by_genome[genome].append(row.to_dict())
 
     # Build target_id -> genome mapping from targets_df
     target_to_genome = {}
@@ -427,9 +403,10 @@ def create_locus_matrix(
         else:
             row['synteny_confidence'] = ''
 
-        # Add scaffold info - prefer target, fallback to empty block
+        # Add scaffold info - prefer target (use first/best), fallback to empty block
         if genome in targets_by_genome:
-            target = targets_by_genome[genome]
+            targets_list = targets_by_genome[genome]
+            target = targets_list[0]  # First target (highest score from Phase 5)
             row['scaffold'] = target.get('scaffold', '')
             row['strand'] = target.get('strand', '')
             row['start'] = target.get('start', '')
@@ -466,16 +443,30 @@ def create_locus_matrix(
             confidence_suffix = ' *LOW*'
 
         if genome in targets_by_genome:
-            target = targets_by_genome[genome]
-            target_id = target.get('target_gene_id', '')
-            meta = seq_metadata.get(target_id, {})
-            length = meta.get('length_aa', 0)
-            if length > 0:
-                row['TARGET'] = f"{gene_family} [{length}]"
+            targets_list = targets_by_genome[genome]
+            n_targets = len(targets_list)
+
+            # Get lengths for all targets
+            lengths = []
+            for t in targets_list:
+                target_id = t.get('target_gene_id', '')
+                meta = seq_metadata.get(target_id, {})
+                length = meta.get('length_aa', 0)
+                if length > 0:
+                    lengths.append(int(length))
+
+            # Sort lengths descending
+            lengths.sort(reverse=True)
+
+            # Format: synteny% [length] or synteny% [len1, len2] for tandems
+            syn_pct = int(synteny_pct)
+            if lengths:
+                lengths_str = ', '.join(str(l) for l in lengths)
+                row['TARGET'] = f"{gene_family} {syn_pct}% [{lengths_str}]"
             else:
-                row['TARGET'] = f"{gene_family} [hit]"
+                row['TARGET'] = f"{gene_family} {syn_pct}% [{n_targets} hit{'s' if n_targets > 1 else ''}]"
         elif synteny_pct > 0:
-            row['TARGET'] = f"{gene_family} [empty]{confidence_suffix}"
+            row['TARGET'] = f"{gene_family} {int(synteny_pct)}% [empty]{confidence_suffix}"
         else:
             row['TARGET'] = f"{gene_family} [0%]"
 
@@ -553,7 +544,8 @@ def main():
     if syntenic_file.exists():
         targets_df = pd.read_csv(syntenic_file, sep='\t')
         # Normalize column names for compatibility
-        if 'classification' in targets_df.columns:
+        # Only copy if destination column doesn't exist
+        if 'classification' in targets_df.columns and 'placement' not in targets_df.columns:
             targets_df['placement'] = targets_df['classification']
         if 'locus_id' in targets_df.columns and 'assigned_to' not in targets_df.columns:
             targets_df['assigned_to'] = targets_df['locus_id']
