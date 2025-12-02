@@ -348,6 +348,11 @@ def main():
         "--threads", type=int, default=4,
         help="DIAMOND threads"
     )
+    parser.add_argument(
+        "--min-total-genomes", type=int, default=3,
+        help="Minimum genomes with synteny block to keep locus (default: 3). "
+             "Filters out spurious single-genome hits."
+    )
 
     args = parser.parse_args()
 
@@ -605,6 +610,7 @@ def main():
             candidates,
             args.output_dir,
             min_synteny=0.15,
+            min_total_genomes=args.min_total_genomes,
             species_mapping=species_mapping,
             chr_mapping=chr_mapping,
         )
@@ -668,6 +674,7 @@ def cluster_novel_loci(
     candidates_df: pd.DataFrame,
     output_dir: Path,
     min_synteny: float = 0.15,
+    min_total_genomes: int = 3,
     species_mapping: dict = None,
     chr_mapping: dict = None,
 ) -> pd.DataFrame:
@@ -677,6 +684,10 @@ def cluster_novel_loci(
     Two candidates are the same locus if:
     - Candidate A has high synteny in genome B
     - Candidate B has high synteny in genome A
+
+    Filtering:
+    - Requires synteny block present in >= min_total_genomes
+    - This filters out spurious single-genome hits
 
     This mirrors Phase 2 synteny block detection.
 
@@ -844,11 +855,29 @@ def cluster_novel_loci(
         print(f"    Empty: {len(empty_genomes)} genomes with synteny only")
         print(f"    Representative: {rep} (bitscore {candidate_bitscores.get(rep, 0):.0f})")
 
-    # Save clustered loci
+    # Filter loci by minimum total genomes (block conservation)
+    # A genuine novel locus should have synteny block present in multiple genomes
+    # even if the target is only in one (novel insertion vs spurious hit)
     loci_df = pd.DataFrame(locus_results)
+
+    if not loci_df.empty:
+        n_before = len(loci_df)
+        loci_df = loci_df[loci_df['n_total_genomes'] >= min_total_genomes].copy()
+        n_filtered = n_before - len(loci_df)
+
+        if n_filtered > 0:
+            print(f"\n[FILTER] Removed {n_filtered} loci with synteny block in < {min_total_genomes} genomes")
+            print(f"         (These are likely spurious single-genome hits)")
+
+        # Renumber locus IDs after filtering
+        loci_df = loci_df.reset_index(drop=True)
+        loci_df['locus_id'] = [f"NOVEL_{i+1}" for i in range(len(loci_df))]
+
+    # Save clustered loci
     loci_df.to_csv(output_dir / "novel_loci_clustered.tsv", sep='\t', index=False)
 
     print(f"\n[OUTPUT] {output_dir / 'novel_loci_clustered.tsv'}")
+    print(f"         {len(loci_df)} novel loci passed filters (block in >= {min_total_genomes} genomes)")
 
     return loci_df
 
