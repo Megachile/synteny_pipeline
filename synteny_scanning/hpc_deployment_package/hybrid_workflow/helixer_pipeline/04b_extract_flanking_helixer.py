@@ -162,8 +162,8 @@ def main():
         help="Output directory"
     )
     parser.add_argument(
-        "--n-flanking", type=int, default=10,
-        help="Number of flanking genes on each side (default: 10)"
+        "--n-flanking", type=int, default=25,
+        help="Number of flanking genes on each side (default: 25)"
     )
 
     args = parser.parse_args()

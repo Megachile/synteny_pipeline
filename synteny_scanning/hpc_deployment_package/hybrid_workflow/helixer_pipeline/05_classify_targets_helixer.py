@@ -270,13 +270,17 @@ def main():
         n_flanking_with_bk = len(target_flanking_with_bk_hits.get(target_id, set()))
 
         # Calculate scores for ALL loci
+        # Use BK REFERENCE flanking count as denominator (not target flanking count)
+        # This measures "% of expected BK synteny pattern preserved"
         locus_scores = {}
         for locus_id, matches in target_synteny[target_id].items():
             n_matches = len(matches)
-            score = n_matches / n_flanking if n_flanking > 0 else 0
+            n_ref_flanking = len(locus_flanking.get(locus_id, set()))
+            score = n_matches / n_ref_flanking if n_ref_flanking > 0 else 0
             locus_scores[locus_id] = {
                 'score': score,
                 'n_matches': n_matches,
+                'n_ref_flanking': n_ref_flanking,
                 'matches': matches,
             }
 
@@ -304,15 +308,18 @@ def main():
         best_locus = None
         best_score = 0
         best_matches = 0
+        best_ref_flanking = 0
 
         for locus_id, info in locus_scores.items():
             if info['score'] > best_score:
                 best_score = info['score']
                 best_locus = locus_id
                 best_matches = info['n_matches']
+                best_ref_flanking = info['n_ref_flanking']
 
         row_dict = row.to_dict()
-        row_dict['n_flanking_genes'] = n_flanking
+        row_dict['n_flanking_genes'] = n_flanking  # Target genome flanking count
+        row_dict['n_ref_flanking'] = best_ref_flanking  # BK reference flanking count
         row_dict['n_flanking_with_bk_hits'] = n_flanking_with_bk
         row_dict['n_flanking_matches'] = best_matches
         row_dict['synteny_score'] = round(best_score, 3)
@@ -437,7 +444,7 @@ def main():
             for _, row in partial_matches.head(10).iterrows():
                 print(f"  {row['target_gene_id']}: best={row.get('best_locus_match', 'N/A')} "
                       f"score={row.get('best_locus_score', 0):.3f} "
-                      f"({row['n_flanking_matches']}/{row['n_flanking_genes']} flanking)")
+                      f"({row['n_flanking_matches']}/{row.get('n_ref_flanking', '?')} BK ref flanking)")
             if len(partial_matches) > 10:
                 print(f"  ... and {len(partial_matches) - 10} more")
 
