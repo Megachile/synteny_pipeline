@@ -757,6 +757,9 @@ def cluster_novel_loci(
 
     locus_results = []
 
+    # Track base name usage for suffix assignment (a, b, c...)
+    base_name_count = {}
+
     for i, cluster in enumerate(clusters):
         # Get representative (highest bitscore)
         cluster_list = list(cluster)
@@ -814,7 +817,15 @@ def cluster_novel_loci(
                        chr_mapping.get(rep_scaffold.split('.')[0] + '.1',
                        rep_scaffold.replace('_RagTag', '').replace('.1', '')))
 
-        locus_name = f"{species_name}_{chr_name}"
+        # Create base locus name (species_chr)
+        base_locus_name = f"{species_name}_{chr_name}"
+
+        # Assign suffix (a, b, c...) for multiple loci on same chromosome
+        suffix_idx = base_name_count.get(base_locus_name, 0)
+        suffix = chr(ord('a') + suffix_idx)  # 0=a, 1=b, 2=c, etc.
+        base_name_count[base_locus_name] = suffix_idx + 1
+
+        locus_name = f"{base_locus_name}_{suffix}"
 
         locus_results.append({
             'locus_id': f"NOVEL_{i+1}",
