@@ -246,19 +246,20 @@ def check_target_overlap(
     cluster: Dict,
     target_df: pd.DataFrame,
     genome: str,
-    overlap_margin_kb: float = 50.0,
 ) -> Tuple[bool, str]:
     """
-    Check if a cluster overlaps with any Phase 4 target hit.
+    Check if a cluster contains any Phase 4 target hit.
+
+    For concordance, we require the target to be INSIDE the cluster
+    (no margin) - this ensures both methods found the same region.
 
     Returns: (has_overlap, overlapping_target_id)
     """
     if target_df.empty:
         return False, ''
 
-    margin_bp = overlap_margin_kb * 1000
-    cluster_start = cluster['start'] - margin_bp
-    cluster_end = cluster['end'] + margin_bp
+    cluster_start = cluster['start']
+    cluster_end = cluster['end']
 
     genome_targets = target_df[
         (target_df['genome'] == genome) &
@@ -269,8 +270,8 @@ def check_target_overlap(
         target_start = target['start']
         target_end = target['end']
 
-        # Check overlap
-        if not (cluster_end < target_start or cluster_start > target_end):
+        # Check if target is INSIDE cluster (strict containment)
+        if target_start >= cluster_start and target_end <= cluster_end:
             return True, target['target_gene_id']
 
     return False, ''
