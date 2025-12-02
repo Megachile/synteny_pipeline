@@ -26,9 +26,40 @@ import argparse
 import re
 from collections import OrderedDict, defaultdict
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import pandas as pd
+
+
+# Thresholds for unplaceable classification
+LOWQUALITY_BITSCORE_THRESHOLD = 100  # Below this = low quality hit
+MIN_FLANKING_FOR_DISTINCT = 3  # Need at least this many flanking genes to be "distinct"
+
+
+def classify_unplaceable(target: dict) -> str:
+    """
+    Classify an unplaceable target into subcategories.
+
+    Returns one of:
+    - 'fragment': On a short scaffold with no/few flanking genes
+    - 'lowquality': Hit bitscore below threshold
+    - 'distinct': High-quality hit with flanking genes but no locus match
+    """
+    bitscore = target.get('best_bitscore', 0)
+    n_flanking = target.get('n_flanking_genes', 0)
+    reason = target.get('unplaceable_reason', '')
+
+    # Fragment: no flanking genes available (short scaffold)
+    if n_flanking == 0 or reason == 'no_flanking_genes':
+        return 'fragment'
+
+    # Low quality: weak hit regardless of flanking
+    if bitscore < LOWQUALITY_BITSCORE_THRESHOLD:
+        return 'lowquality'
+
+    # Distinct: good hit with flanking but doesn't match known loci
+    # This includes 'no_locus_matches' and 'no_bk_hits' reasons
+    return 'distinct'
 
 
 def load_species_and_phylo(species_map_file: Path) -> Tuple[Dict[str, str], Dict[str, int]]:
@@ -207,12 +238,27 @@ def create_summary_matrix(
             else:
                 row[locus] = "-"
 
-        # Handle unplaceable targets
+        # Handle unplaceable targets with subcategory counts
         unplaceable_entries = []
+        n_fragment = 0
+        n_lowquality = 0
+        n_distinct = 0
+
         for target in genome_targets:
             if target.get('placement') != 'synteny' or target.get('assigned_to') not in loci_list:
                 target_id = target['target_gene_id']
                 if target_id not in matched_target_ids:
+                    # Classify this unplaceable
+                    target_dict = target.to_dict() if hasattr(target, 'to_dict') else dict(target)
+                    category = classify_unplaceable(target_dict)
+
+                    if category == 'fragment':
+                        n_fragment += 1
+                    elif category == 'lowquality':
+                        n_lowquality += 1
+                    else:  # distinct
+                        n_distinct += 1
+
                     meta = seq_metadata.get(target_id, {})
                     length = meta.get('length_aa', 0)
                     if length > 0:
@@ -227,6 +273,11 @@ def create_summary_matrix(
 
         # Add unplaceable count for easier analysis
         row['unplaceable_count'] = len(unplaceable_entries)
+
+        # Add subcategory counts
+        row['n_fragment'] = n_fragment
+        row['n_lowquality'] = n_lowquality
+        row['n_distinct'] = n_distinct
 
         # Total target count
         row['total'] = len(genome_targets)
@@ -317,11 +368,19 @@ def main():
 
     dfs_to_concat = []
     if syntenic_file.exists():
-        syn_df = pd.read_csv(syntenic_file, sep='\t')
-        dfs_to_concat.append(syn_df)
+        try:
+            syn_df = pd.read_csv(syntenic_file, sep='\t')
+            if not syn_df.empty:
+                dfs_to_concat.append(syn_df)
+        except pd.errors.EmptyDataError:
+            print("  [NOTE] Syntenic targets file is empty")
     if unplaceable_file.exists():
-        unpl_df = pd.read_csv(unplaceable_file, sep='\t')
-        dfs_to_concat.append(unpl_df)
+        try:
+            unpl_df = pd.read_csv(unplaceable_file, sep='\t')
+            if not unpl_df.empty:
+                dfs_to_concat.append(unpl_df)
+        except pd.errors.EmptyDataError:
+            print("  [NOTE] Unplaceable targets file is empty")
 
     if dfs_to_concat:
         targets_df = pd.concat(dfs_to_concat, ignore_index=True)
@@ -390,6 +449,20 @@ def main():
         # Per-genome breakdown
         genomes_with_unplaceables = targets_df[targets_df['placement'] != 'synteny']['genome'].nunique()
         print(f"  Genomes with unplaceables: {genomes_with_unplaceables}")
+
+        # Unplaceable subcategory breakdown
+        unplaceable_df = targets_df[targets_df['placement'] != 'synteny'].copy()
+        if not unplaceable_df.empty:
+            # Classify each unplaceable
+            subcounts = {'fragment': 0, 'lowquality': 0, 'distinct': 0}
+            for _, row in unplaceable_df.iterrows():
+                cat = classify_unplaceable(row.to_dict())
+                subcounts[cat] += 1
+
+            print(f"\n  Unplaceable breakdown:")
+            print(f"    Fragment (no flanking): {subcounts['fragment']}")
+            print(f"    Low quality (bitscore<{LOWQUALITY_BITSCORE_THRESHOLD}): {subcounts['lowquality']}")
+            print(f"    Distinct (good hit, no locus match): {subcounts['distinct']}")
 
     print("\n" + "=" * 80)
     print("PHASE 8b (HELIXER) COMPLETE")
