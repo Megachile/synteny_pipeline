@@ -1,0 +1,30 @@
+# Outputs (regenerated from pipeline runs)
+outputs/
+*.out
+*.err
+*.log
+
+# Data files (live in genomes/, not tracked)
+*.faa
+*.fasta
+*.gff3
+*.dmnd
+*.tsv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Beads task tracker
+.beads/
+
+# Temp files
+temp_*
+test_*
+
+# BUSCO downloads (large, regenerated)
+busco_downloads/
+
+# Deprecated code
+deprecated/
