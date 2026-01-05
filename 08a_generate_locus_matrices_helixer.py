@@ -13,15 +13,15 @@ Inputs:
 - Phase 1 locus definitions (BK flanking proteins)
 - Phase 5 Helixer classifications
 - Phase 6 Helixer extracted sequences (for length metadata)
-- Phase 7 SwissProt annotations (flanking_matches_annotated.tsv, phase2b_flanking_annotated.tsv)
+- Phase 7 NR annotations (flanking_matches_annotated.tsv, phase2b_flanking_annotated.tsv)
 - Phase 2b synteny blocks (phase2b_synteny_blocks.tsv)
 - Species/phylo mapping
 
 Key insight: Phase 7 already unions Phase 5 and Phase 2b flanking proteins and annotates
-them with SwissProt. This script just displays the results in matrix format.
+them with NR annotations from Helixer headers. This script displays the results in matrix format.
 
 Outputs:
-- {locus_id}_genome_swissprot_matrix.tsv (one per locus)
+- {locus_id}_locus_matrix.tsv (one per locus)
 """
 
 from __future__ import annotations
@@ -741,7 +741,7 @@ def main():
         )
 
         if not matrix_df.empty:
-            output_file = args.output_dir / f"{args.family}_{locus_id}_genome_swissprot_matrix.tsv"
+            output_file = args.output_dir / f"{args.family}_{locus_id}_locus_matrix.tsv"
             matrix_df.to_csv(output_file, sep='\t', index=False)
 
             n_with_synteny = len(matrix_df[matrix_df['synteny_pct'] > 0])
