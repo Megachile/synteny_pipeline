@@ -322,13 +322,18 @@ def _find_gff_file(genome_gff_dir: Path, prefix: str) -> Path | None:
     # Define search patterns for each genome
     search_patterns = {
         'BK': [
+            # NCBI reference GFF (has LOC IDs) - prioritize this!
+            'Belonocnema_kinseyi*/GCF_010883055*.gff',
+            '**/GCF_010883055*_genomic.gff',
+            '**/GCF_010883055*.gff',
             # Direct file in root
             'genomic.gff',
             # Subdirectory patterns
             'belonocnema_kinseyi/*.gff',
             'belonocnema_kinseyi/**/*.gff',
-            '**/GCF_010883055*.gff',
             '**/bkinseyi*.gff',
+            # Helixer GFF (no LOC IDs) - only as fallback
+            'Belonocnema_kinseyi*/*_helixer.gff3',
         ],
         'LB': [
             # Subdirectory patterns
@@ -336,6 +341,8 @@ def _find_gff_file(genome_gff_dir: Path, prefix: str) -> Path | None:
             'leptopilina_boulardi/**/*.gff',
             '**/GCF_015476425*.gff',
             '**/GCF_019393585*.gff',  # Alternative LB assembly
+            '**/GCF_019393585*.gff3',
+            '**/GCA_019393585*_helixer.gff3',
         ],
     }
 
@@ -506,6 +513,12 @@ def run_coordinates_mode(
     if missing:
         raise ValueError(f"Coordinates file missing columns: {missing}")
 
+    # Filter to only the target gene family
+    coords_df = coords_df[coords_df['subcluster_id'] == gene_family]
+    if coords_df.empty:
+        raise ValueError(f"No coordinates found for gene family: {gene_family}")
+    print(f"  Filtered to {len(coords_df)} genes for family {gene_family}")
+
     # Group by subcluster_id (each subcluster = one locus)
     locus_groups = coords_df.groupby('subcluster_id')
     print(f"  Found {len(locus_groups)} loci (subclusters)")
@@ -562,111 +575,148 @@ def run_coordinates_mode(
     for chrom in chrom_genes:
         chrom_genes[chrom].sort(key=lambda x: x[0])
 
-    # Process each locus
+    # Chromosome name mapping
+    chrom_map = {
+        'NC_046657.1': 'chr1', 'NC_046658.1': 'chr2', 'NC_046659.1': 'chr3',
+        'NC_046660.1': 'chr4', 'NC_046661.1': 'chr5', 'NC_046662.1': 'chr6',
+        'NC_046663.1': 'chr7', 'NC_046664.1': 'chr8', 'NC_046665.1': 'chr9',
+        'NC_046666.1': 'chr10', 'NC_046667.1': 'chr11', 'NC_046668.1': 'chr12',
+        'NC_046669.1': 'chr13', 'NC_046670.1': 'chr14',
+    }
+
+    # Cluster genes into physical tandem loci (within 50kb of each other)
+    # This matches the logic in phase1_discovery_impl.detect_input_tandem_clusters
+    MAX_TANDEM_DISTANCE_KB = 50
+
+    def cluster_genes_into_loci(genes_df):
+        """Cluster genes within MAX_TANDEM_DISTANCE_KB into tandem loci."""
+        # Sort by chromosome and position
+        sorted_df = genes_df.sort_values(['chromosome', 'start'])
+
+        clusters = []
+        current_cluster = []
+
+        for _, row in sorted_df.iterrows():
+            if not current_cluster:
+                current_cluster.append(row)
+            else:
+                prev_row = current_cluster[-1]
+                # Check if same chromosome and within distance
+                if (row['chromosome'] == prev_row['chromosome'] and
+                    abs(row['start'] - prev_row['start']) < MAX_TANDEM_DISTANCE_KB * 1000):
+                    current_cluster.append(row)
+                else:
+                    clusters.append(pd.DataFrame(current_cluster))
+                    current_cluster = [row]
+
+        if current_cluster:
+            clusters.append(pd.DataFrame(current_cluster))
+
+        return clusters
+
+    # Process each family's genes into tandem loci
     locus_rows = []
     gene_coord_rows = []
 
-    for locus_id, group in locus_groups:
-        # Get locus envelope (min/max of all member genes)
-        locus_start = group['start'].min()
-        locus_end = group['end'].max()
-        chrom = group['chromosome'].iloc[0]
-        strand = group['strand'].iloc[0] if 'strand' in group.columns else '+'
+    for subcluster_id, group in locus_groups:
+        # Cluster this family's genes into physical tandem loci
+        tandem_clusters = cluster_genes_into_loci(group)
+        print(f"  {subcluster_id}: {len(group)} genes → {len(tandem_clusters)} tandem loci")
 
-        # Get cluster members
-        cluster_members = ','.join(group['gene_id'].tolist())
-        protein_ids = group['protein_id'].tolist() if 'protein_id' in group.columns else []
+        for cluster_idx, cluster_df in enumerate(tandem_clusters):
+            # Get locus envelope from this tandem cluster
+            locus_start = cluster_df['start'].min()
+            locus_end = cluster_df['end'].max()
+            chrom = cluster_df['chromosome'].iloc[0]
+            strand = cluster_df['strand'].iloc[0] if 'strand' in cluster_df.columns else '+'
 
-        # Create locus_id in BK format if not already
-        if not str(locus_id).startswith('BK_'):
-            # Convert NC_046662.1 -> chr number using common mapping
-            chrom_map = {
-                'NC_046657.1': 'chr1', 'NC_046658.1': 'chr2', 'NC_046659.1': 'chr3',
-                'NC_046660.1': 'chr4', 'NC_046661.1': 'chr5', 'NC_046662.1': 'chr6',
-                'NC_046663.1': 'chr7', 'NC_046664.1': 'chr8', 'NC_046665.1': 'chr9',
-                'NC_046666.1': 'chr10', 'NC_046667.1': 'chr11', 'NC_046668.1': 'chr12',
-                'NC_046669.1': 'chr13', 'NC_046670.1': 'chr14',
-            }
+            # Get cluster members
+            cluster_members = ','.join(cluster_df['gene_id'].tolist())
+            protein_ids = cluster_df['protein_id'].tolist() if 'protein_id' in cluster_df.columns else []
+
+            # Create locus_id with chromosome and letter suffix
             chr_name = chrom_map.get(chrom, chrom.replace('NC_', 'unk'))
-            # Keep subcluster_id as suffix for uniqueness
-            display_locus_id = f"BK_{chr_name}_{locus_id}"
-        else:
-            display_locus_id = locus_id
+            # Use letter suffix for multiple loci (a, b, c, ...)
+            suffix = chr(ord('a') + cluster_idx) if len(tandem_clusters) > 1 else ''
+            display_locus_id = f"BK_{chr_name}_{subcluster_id}{suffix}"
 
-        # Find flanking genes on this chromosome
-        flanking_genes = []
-        if chrom in chrom_genes:
-            genes_on_chrom = chrom_genes[chrom]
+            # Find flanking genes on this chromosome
+            flanking_genes = []
+            if chrom in chrom_genes:
+                genes_on_chrom = chrom_genes[chrom]
 
-            # Find genes within the locus
-            locus_gene_indices = []
-            for i, (gstart, gend, gid) in enumerate(genes_on_chrom):
-                if gstart >= locus_start and gend <= locus_end:
-                    locus_gene_indices.append(i)
+                # Find genes that OVERLAP the locus (not strict containment)
+                # Gene coordinates from GFF include UTRs, input coords are CDS-only
+                locus_gene_indices = []
+                for i, (gstart, gend, gid) in enumerate(genes_on_chrom):
+                    # Check for any overlap: gene overlaps locus if it doesn't end before or start after
+                    if gend >= locus_start and gstart <= locus_end:
+                        locus_gene_indices.append(i)
 
-            if locus_gene_indices:
-                first_idx = min(locus_gene_indices)
-                last_idx = max(locus_gene_indices)
+                if locus_gene_indices:
+                    first_idx = min(locus_gene_indices)
+                    last_idx = max(locus_gene_indices)
 
-                # Get N upstream and N downstream
-                upstream_start = max(0, first_idx - n_flanking)
-                downstream_end = min(len(genes_on_chrom), last_idx + n_flanking + 1)
+                    # Get N upstream and N downstream
+                    upstream_start = max(0, first_idx - n_flanking)
+                    downstream_end = min(len(genes_on_chrom), last_idx + n_flanking + 1)
 
-                for i in range(upstream_start, first_idx):
-                    flanking_genes.append(('U', genes_on_chrom[i][2]))
-                for i in range(last_idx + 1, downstream_end):
-                    flanking_genes.append(('D', genes_on_chrom[i][2]))
+                    for i in range(upstream_start, first_idx):
+                        flanking_genes.append(('U', genes_on_chrom[i][2]))
+                    for i in range(last_idx + 1, downstream_end):
+                        flanking_genes.append(('D', genes_on_chrom[i][2]))
 
-        # Write flanking FASTA
-        flanking_file = out_dir / f"{display_locus_id}_flanking.faa"
-        flanking_records = []
-        for direction, gene_id in flanking_genes:
-            # Find protein ID for this gene (from proteome)
-            # Try to match by LOC ID in proteome headers
-            for prot_id, record in proteome_seqs.items():
-                if gene_id in record.description:
-                    new_record = SeqRecord(
-                        record.seq,
-                        id=f"{prot_id}|{gene_id}",
-                        description=f"{direction} {prot_id} {record.description}"
-                    )
-                    flanking_records.append(new_record)
-                    break
+            # Write flanking FASTA
+            flanking_file = out_dir / f"{display_locus_id}_flanking.faa"
+            flanking_records = []
+            for direction, flank_gene_id in flanking_genes:
+                # Find protein ID for this gene (from proteome)
+                # Try to match by LOC ID in proteome headers
+                for prot_id, record in proteome_seqs.items():
+                    if flank_gene_id in record.description:
+                        new_record = SeqRecord(
+                            record.seq,
+                            id=f"{prot_id}|{flank_gene_id}",
+                            description=f"{direction} {prot_id} {record.description}"
+                        )
+                        flanking_records.append(new_record)
+                        break
 
-        if flanking_records:
-            SeqIO.write(flanking_records, flanking_file, 'fasta')
-        else:
-            # Write empty file
-            flanking_file.touch()
+            if flanking_records:
+                SeqIO.write(flanking_records, flanking_file, 'fasta')
+            else:
+                # Write empty file
+                flanking_file.touch()
 
-        # Record locus definition
-        locus_rows.append({
-            'locus_id': display_locus_id,
-            'subcluster_id': locus_id,
-            'genome': 'BK',
-            'chromosome': chrom,
-            'strand': strand,
-            'locus_span_start': locus_start,
-            'locus_span_end': locus_end,
-            'locus_span_kb': (locus_end - locus_start) / 1000.0,
-            'n_genes': len(group),
-            'cluster_members': cluster_members,
-            'flanking_file': str(flanking_file),
-            'n_flanking': len(flanking_genes),
-        })
-
-        # Record individual gene coordinates
-        for _, gene_row in group.iterrows():
-            gene_coord_rows.append({
+            # Record locus definition
+            locus_rows.append({
                 'locus_id': display_locus_id,
-                'gene_id': gene_row['gene_id'],
-                'protein_id': gene_row.get('protein_id', ''),
-                'chromosome': gene_row['chromosome'],
-                'start': gene_row['start'],
-                'end': gene_row['end'],
-                'strand': gene_row.get('strand', '+'),
-                'length': gene_row['end'] - gene_row['start'] + 1,
+                'subcluster_id': subcluster_id,
+                'gene_family': gene_family,  # For downstream compatibility
+                'genome': 'BK',
+                'chromosome': chrom,
+                'strand': strand,
+                'locus_span_start': locus_start,
+                'locus_span_end': locus_end,
+                'locus_span_kb': (locus_end - locus_start) / 1000.0,
+                'n_genes': len(cluster_df),
+                'cluster_members': cluster_members,
+                'flanking_file': str(flanking_file),
+                'n_flanking': len(flanking_genes),
             })
+
+            # Record individual gene coordinates
+            for _, gene_row in cluster_df.iterrows():
+                gene_coord_rows.append({
+                    'locus_id': display_locus_id,
+                    'gene_id': gene_row['gene_id'],
+                    'protein_id': gene_row.get('protein_id', ''),
+                    'chromosome': gene_row['chromosome'],
+                    'start': gene_row['start'],
+                    'end': gene_row['end'],
+                    'strand': gene_row.get('strand', '+'),
+                    'length': gene_row['end'] - gene_row['start'] + 1,
+                })
 
     # Write outputs
     locus_defs_df = pd.DataFrame(locus_rows)
@@ -676,6 +726,35 @@ def run_coordinates_mode(
     gene_coords_df = pd.DataFrame(gene_coord_rows)
     gene_coords_df.to_csv(out_dir / 'cluster_gene_coordinates.tsv', sep='\t', index=False)
     print(f"  Wrote {len(gene_coords_df)} gene coordinates to cluster_gene_coordinates.tsv")
+
+    # Create query_proteins.faa from cluster member protein IDs
+    query_records = []
+    if 'protein_id' in coords_df.columns and proteome_seqs:
+        # Get unique protein IDs from this family only
+        family_df = coords_df[coords_df['subcluster_id'] == gene_family]
+        protein_ids_to_extract = family_df['protein_id'].dropna().unique().tolist()
+
+        for prot_id in protein_ids_to_extract:
+            if prot_id in proteome_seqs:
+                record = proteome_seqs[prot_id]
+                # Get the gene_id for this protein
+                matching_row = family_df[family_df['protein_id'] == prot_id].iloc[0]
+                gene_id = matching_row.get('gene_id', '')
+                new_record = SeqRecord(
+                    record.seq,
+                    id=prot_id,
+                    description=f"{gene_id} {record.description}"
+                )
+                query_records.append(new_record)
+
+    query_faa = out_dir / 'query_proteins.faa'
+    if query_records:
+        SeqIO.write(query_records, query_faa, 'fasta')
+        print(f"  Wrote {len(query_records)} query proteins to query_proteins.faa")
+    else:
+        # Try to extract from gene coordinates if protein_id column is available
+        print(f"  WARNING: No query proteins extracted (no matching protein IDs in proteome)")
+        query_faa.touch()
 
 
 def parse_args():

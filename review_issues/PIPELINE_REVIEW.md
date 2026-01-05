@@ -351,3 +351,191 @@ print(f"Phase completed in {time.time() - start:.1f}s")
 1. Remove test_run/ debris or document as examples
 2. Consider renumbering for clarity
 3. Add timing instrumentation
+
+---
+
+## 7. COORDINATES MODE TESTING (2026-01-05)
+
+Testing of the unified SLURM runner with coordinates mode input revealed multiple critical bugs.
+
+### 7.1 Bug: Coordinates Mode Processed All Families (FIXED)
+
+**File:** `01_discover_loci.py`
+
+**Problem:** When running coordinates mode with `--gene-family MC_0002_1`, the script was processing ALL 50 families from the coordinates file instead of just the target family.
+
+**Evidence:** Output files named `MC_0002_1_BK_chr10_MC_0009_1_locus_matrix.tsv` - two different family IDs in one filename.
+
+**Fix:** Added filter after loading coordinates file:
+```python
+# Filter to only the target gene family
+coords_df = coords_df[coords_df['subcluster_id'] == gene_family]
+if coords_df.empty:
+    raise ValueError(f"No coordinates found for gene family: {gene_family}")
+```
+
+---
+
+### 7.2 Bug: Missing Tandem Clustering - 156 MB Loci (FIXED)
+
+**File:** `01_discover_loci.py` coordinates mode
+
+**Problem:** Original LOC mode uses `detect_input_tandem_clusters()` to group genes within 50kb into tandem loci. Coordinates mode was missing this step - it took the min/max of ALL genes in a family, creating loci spanning entire chromosomes.
+
+**Evidence for MC_0002_1:**
+- 37 genes spread across 10 chromosomes
+- Single "locus" per chromosome spanning min to max
+- One locus span: 156,469,347 - 5,251,316 = **156 MB**
+- All loci had `n_flanking=0` (impossible to find flanking genes for 156 MB span)
+
+**Root cause:** Coordinates mode took the min/max of all input coordinates without grouping nearby genes:
+```python
+# OLD (wrong) - spans entire chromosome
+locus_span_start = int(chrom_genes['start'].min())
+locus_span_end = int(chrom_genes['end'].max())
+```
+
+**Fix:** Added `cluster_genes_into_loci()` function matching the original `detect_input_tandem_clusters()` logic:
+```python
+MAX_TANDEM_DISTANCE_KB = 50
+
+def cluster_genes_into_loci(genes_df):
+    """Cluster genes within MAX_TANDEM_DISTANCE_KB into tandem loci."""
+    sorted_df = genes_df.sort_values(['chromosome', 'start'])
+    clusters = []
+    current_cluster = []
+
+    for _, row in sorted_df.iterrows():
+        if not current_cluster:
+            current_cluster.append(row)
+        else:
+            prev_row = current_cluster[-1]
+            if (row['chromosome'] == prev_row['chromosome'] and
+                abs(row['start'] - prev_row['start']) < MAX_TANDEM_DISTANCE_KB * 1000):
+                current_cluster.append(row)
+            else:
+                clusters.append(pd.DataFrame(current_cluster))
+                current_cluster = [row]
+
+    if current_cluster:
+        clusters.append(pd.DataFrame(current_cluster))
+    return clusters
+```
+
+**Result after fix (MC_0002_1):**
+- 37 genes → 31 tandem loci (some genes cluster together)
+- Locus spans: 7-58 kb (reasonable)
+- Many loci now have flanking genes
+
+---
+
+### 7.3 Bug: Strict Gene Containment Check (FIXED)
+
+**Status:** FIXED 2026-01-05
+
+**Observation:** After tandem clustering fix, some loci still have `n_flanking=0` in locus definitions. Looking at `locus_definitions.tsv`:
+```
+BK_chr1_MC_0002_1a  ...  n_flanking=0
+BK_chr1_MC_0002_1b  ...  n_flanking=0
+BK_chr3_MC_0002_1c  ...  n_flanking=40
+BK_chr3_MC_0002_1d  ...  n_flanking=40
+...
+```
+
+**Root cause found:** The flanking gene extraction used strict containment instead of overlap:
+
+```python
+# OLD (too strict):
+if gstart >= locus_start and gend <= locus_end:
+```
+
+This fails because:
+- Input coordinates come from protein/CDS bounds
+- GFF gene coordinates include UTRs and extend beyond CDS
+
+**Evidence:**
+```
+Input file (locus_a): LOC117170510 at 24559649-24562762
+GFF gene:             LOC117170510 at 24559540-24562818
+```
+Gene extends 109bp before and 56bp after the input coordinates. The containment check fails because 24559540 < 24559649.
+
+**Fix:** Changed to overlap-based detection:
+```python
+# NEW (overlap-based):
+if gend >= locus_start and gstart <= locus_end:
+```
+
+**Impact:** All loci should now find their genes and extract proper flanking regions.
+
+---
+
+### 7.4 Bug: Tandem Duplicates Counted as Flanking Genes (FIXED)
+
+**Status:** FIXED 2026-01-05
+
+**Problem:** Low syntenic assignment (10 syntenic vs 309 unplaceable for MC_0009_1).
+
+**Root cause found:** Target genes in tandem clusters had their SIBLINGS counted as flanking genes:
+```
+Target _000097 → flanking: [_001084, _000096, _000098, _000099, _000100, ...]
+                            ↑ these ARE family members! ↑
+```
+
+When these "flanking" genes BLASTed against BK, they hit BK target family genes (not BK flanking genes), so no synteny match was found.
+
+**Fix implemented in Phase 4 (`04_extract_flanking.py`):**
+
+1. **Cluster targets into tandem groups** before flanking extraction
+   - Uses gene adjacency: ≤1 non-target gene between them
+   - Plus physical distance sanity check: ≤200kb apart
+
+2. **Extract flanking for the CLUSTER**, not individual targets
+   - All targets in a tandem cluster share the same flanking genes
+   - Family members are EXCLUDED from flanking counts
+
+3. **New output**: `tandem_clusters.tsv` tracks cluster assignments
+
+```python
+# Tandem clustering criteria (both must be satisfied)
+MAX_INTERVENING_GENES = 1   # Gene adjacency
+MAX_TANDEM_DISTANCE_KB = 200  # Physical proximity sanity check
+```
+
+**Expected improvement:** Flanking genes will now be TRUE flanking (outside the family), enabling proper synteny matching.
+
+---
+
+### 7.5 Minor Issue: Output Directory Naming
+
+**Status:** Cosmetic, low priority
+
+**Observation:** Output directories use old phase numbers embedded in script names:
+```
+outputs/MC_0002_1/phase1/           (from 01_discover_loci.py)
+outputs/MC_0002_1/phase4/           (from 03_detect_targets.py - was 04_)
+outputs/MC_0002_1/phase4b/          (from 04_extract_flanking.py - was 04b_)
+outputs/MC_0002_1/phase5_helixer_filtered/  (from 05_classify_targets.py)
+```
+
+The directory names don't match the new script numbers because the phase constants are still set to the old values inside the Python scripts.
+
+**Impact:** Confusion when correlating outputs to scripts. Not blocking.
+
+---
+
+### 7.6 Test Results Summary (Job 200544)
+
+**Configuration:** 3 families as test (MC_0002_1, MC_0009_1, MC_0013_1)
+
+| Family | Genes | Loci Created | Avg Span | Syntenic | Unplaceable |
+|--------|-------|--------------|----------|----------|-------------|
+| MC_0002_1 | 37 | 31 | 7-58 kb | running | running |
+| MC_0009_1 | - | - | - | 3 | 316 |
+| MC_0013_1 | - | - | - | running | running |
+
+**Conclusions:**
+1. Tandem clustering fix is working (31 loci from 37 genes, reasonable spans)
+2. Family filtering fix is working (output files only contain target family)
+3. Synteny assignment rate is still very low - needs investigation
+4. Some reference loci have 0 flanking genes - may be structural issue or extraction bug
