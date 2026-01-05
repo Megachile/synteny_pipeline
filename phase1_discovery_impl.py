@@ -42,24 +42,9 @@ import argparse
 import xml.etree.ElementTree as ET
 
 # Configuration
-# NOTE: Only using BK/LB (NCBI genomes) as landmarks
-# TR/DR (BRAKER3 genomes) removed due to unreliable annotations:
-# - Low-complexity repetitive sequences annotated as proteins
-# - Possible translated introns in protein predictions
-# - SwissProt validation fails (no real homologs)
-# - Synteny blocks cannot be validated
-LANDMARKS = {
-    'BK': {
-        'proteome': 'data/proteomes/GCF_010883055.1_Bkinseyi_NCBI.faa',
-        'gff': 'data/genomes/GCF_010883055.1_Bkinseyi.gff',
-        'db': 'data/proteomes/GCF_010883055.1_Bkinseyi_NCBI.dmnd'
-    },
-    'LB': {
-        'proteome': 'data/proteomes/GCF_019393585.1_Lboulardi_NCBI.faa',
-        'gff': 'data/genomes/GCF_019393585.1_Lboulardi.gff',
-        'db': 'data/proteomes/GCF_019393585.1_Lboulardi_NCBI.dmnd'
-    }
-}
+# Import landmark paths from data_paths module (handles per-species directory structure)
+from data_paths import get_landmark_dict
+LANDMARKS = get_landmark_dict()
 
 # Genome-specific flanking distance caps to normalize gene counts
 # BK: 10.4 genes/Mb, LB: 42.5 genes/Mb (4.1x difference)

@@ -32,12 +32,15 @@ MIN_GOOD_IN_GROUP = 2       # Need this many good genomes to trigger redundancy 
 GOOD_THRESHOLD = 75.0       # What counts as "good" alternative
 
 # =============================================================================
-# PATHS
+# PATHS - use data_paths module for consistency
 # =============================================================================
-BASE_DIR = Path("/carc/scratch/projects/emartins/2016456/adam/synteny_scanning/hpc_deployment_package")
-RAGTAG_DIR = BASE_DIR / "data" / "ragtag_output"
-EXCLUDED_DIR = BASE_DIR / "data" / "ragtag_output" / "excluded"
-GCA_FILE = BASE_DIR / "data" / "gca_to_species.tsv"
+from data_paths import get_data_dir, PIPELINE_DIR
+
+DATA_DIR = get_data_dir()
+RAGTAG_DIR = DATA_DIR  # pancynipoid_helixer contains all genomes
+EXCLUDED_DIR = DATA_DIR / "excluded"  # Will be created if needed
+# GCA to species mapping - stored in pipeline directory
+GCA_FILE = PIPELINE_DIR / "gca_to_species.tsv"
 
 
 def parse_busco_summary(summary_file: Path) -> dict:

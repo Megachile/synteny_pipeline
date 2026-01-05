@@ -12,9 +12,9 @@ from pathlib import Path
 from collections import defaultdict
 import json
 
-# Base paths
-# Helixer outputs are stored INSIDE each genome's ragtag_output directory
-RAGTAG_BASE = Path("/carc/scratch/projects/emartins/2016456/adam/synteny_scanning/hpc_deployment_package/data/ragtag_output")
+# Base paths - use data_paths module for consistency
+from data_paths import get_data_dir, list_genomes, get_genome_dir
+RAGTAG_BASE = get_data_dir()
 
 def get_genome_dirs():
     """Get all genome directories (excluding 'excluded')"""
