@@ -43,8 +43,8 @@ import xml.etree.ElementTree as ET
 
 # Configuration
 # Import landmark paths from data_paths module (handles per-species directory structure)
-from data_paths import get_landmark_dict
-LANDMARKS = get_landmark_dict()
+from data_paths import get_ncbi_landmark_dict
+LANDMARKS = get_ncbi_landmark_dict()
 
 # Genome-specific flanking distance caps to normalize gene counts
 # BK: 10.4 genes/Mb, LB: 42.5 genes/Mb (4.1x difference)

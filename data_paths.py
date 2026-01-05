@@ -224,6 +224,45 @@ def get_landmark_dict() -> Dict[str, Dict[str, str]]:
 
 
 # =============================================================================
+# NCBI REFERENCE GENOMES (for Phase 1 LOC-based locus discovery)
+# =============================================================================
+
+# NCBI reference data with LOC IDs - needed for Phase 1 which takes LOC IDs as input
+GENOMES_DIR = Path("/carc/scratch/projects/emartins/2016456/adam/genomes")
+
+NCBI_LANDMARKS = {
+    'BK': {
+        'gff': GENOMES_DIR / "belonocnema_kinseyi/GCF_010883055.1_B_treatae_v1_genomic.gff",
+        'proteome': GENOMES_DIR / "belonocnema_kinseyi/GCF_010883055.1_B_treatae_v1_protein.faa",
+        'db': GENOMES_DIR / "belonocnema_kinseyi/GCF_010883055.1_B_treatae_v1_protein.dmnd",
+    },
+    'LB': {
+        'gff': GENOMES_DIR / "Leptopilina_boulardi/GCF_019393585.1/genomic.gff",
+        'proteome': GENOMES_DIR / "Leptopilina_boulardi/GCF_019393585.1/protein.faa",
+        'db': GENOMES_DIR / "Leptopilina_boulardi/GCF_019393585.1/protein.dmnd",
+    },
+}
+
+
+def get_ncbi_landmark_dict() -> Dict[str, Dict[str, str]]:
+    """
+    Get NCBI reference landmarks for Phase 1 (LOC-based discovery).
+
+    Phase 1 requires NCBI annotations with LOC IDs, not Helixer annotations.
+    This returns paths to the original NCBI reference data.
+    """
+    landmarks = {}
+    for code, paths in NCBI_LANDMARKS.items():
+        if paths['gff'].exists() and paths['proteome'].exists():
+            landmarks[code] = {
+                'gff': str(paths['gff']),
+                'proteome': str(paths['proteome']),
+                'db': str(paths['db']) if paths['db'] and paths['db'].exists() else None,
+            }
+    return landmarks
+
+
+# =============================================================================
 # VALIDATION
 # =============================================================================
 

@@ -43,12 +43,14 @@ BK_CHR_ACCESSION_TO_NUM = {
     'CM021343': 6, 'CM021344': 7, 'CM021345': 8, 'CM021346': 9, 'CM021347': 10,
 }
 
-# Genomes with native chromosome-level assemblies that were NOT RagTag'd against BK.
-# For these genomes, chromosome numbers are NOT comparable to BK chromosomes
-# (different chromosome organization), so we exempt them from chr comparison.
-NATIVE_CHROMOSOME_GENOMES = {
-    'GCA_020615435.1',  # Telenomus remus - Platygastroidea, distant from Cynipoidea
+# Genomes where RagTag couldn't map to BK chromosomes (0% placement in chromosome_placement_stats.tsv)
+# These should not be penalized for "wrong chromosome" - they have no chromosome mapping
+UNMAPPED_CHROMOSOME_GENOMES = {
+    'GCA_020615435.1',  # Telenomus remus - Platygastroidea, too distant from Cynipoidea
 }
+
+# Alias for backward compatibility
+NATIVE_CHROMOSOME_GENOMES = UNMAPPED_CHROMOSOME_GENOMES
 
 
 def extract_expected_chromosome(locus_id: str) -> Optional[int]:
