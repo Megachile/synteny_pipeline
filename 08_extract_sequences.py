@@ -8,16 +8,22 @@ Creates per-genome/per-locus directory structure matching the original tblastn p
 For Helixer, we extract complete gene predictions directly from the Helixer proteome
 (no Exonerate needed since Helixer already provides complete gene models).
 
+Also extracts NR annotations from Helixer FASTA headers for each target protein.
+This is critical for:
+- Novel loci: Provides the only indication of what gene family they might belong to
+- Known loci: Sanity check (does Helixer annotation match our BLAST expectation?)
+- Discordance flagging: If BLAST says "venom protease" but Helixer says "ribosomal protein"
+
 Inputs:
 - Phase 4 Helixer targets (all_target_loci.tsv)
 - Phase 5 Helixer classifications (syntenic_targets.tsv, unplaceable_targets.tsv)
-- Helixer proteomes ({genome}_helixer_proteins.faa)
+- Helixer proteomes ({genome}_helixer_proteins.faa) - contains NR annotations in headers
 - Phase 1 query proteins (for length comparison)
 
 Outputs:
 - Per-genome/per-locus protein FASTA files
 - all_extracted_genes.faa (aggregated)
-- length_qc.tsv (QC report for unusual lengths)
+- length_qc.tsv (QC report with length flags AND helixer_annotation column)
 """
 
 from __future__ import annotations
@@ -79,8 +85,14 @@ def load_query_protein_lengths(phase1_dir: Path) -> Dict[str, int]:
     return lengths
 
 
-def load_helixer_proteome(helixer_dir: Path, genome: str) -> Dict[str, str]:
-    """Load Helixer protein sequences for a genome."""
+def load_helixer_proteome(helixer_dir: Path, genome: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    Load Helixer protein sequences and NR annotations for a genome.
+
+    Returns: (sequences_dict, annotations_dict)
+        sequences_dict: {protein_id: sequence}
+        annotations_dict: {protein_id: NR_annotation}
+    """
     proteome_file = helixer_dir / genome / f"{genome}_helixer_proteins.faa"
 
     if not proteome_file.exists():
@@ -89,13 +101,39 @@ def load_helixer_proteome(helixer_dir: Path, genome: str) -> Dict[str, str]:
         if alt_file.exists():
             proteome_file = alt_file
         else:
-            return {}
+            return {}, {}
 
     sequences = {}
+    annotations = {}
     for record in SeqIO.parse(proteome_file, 'fasta'):
         sequences[record.id] = str(record.seq)
+        # Extract NR annotation from description (after the ID)
+        # Format: ">ID description" -> description is the NR annotation
+        if record.description and record.description != record.id:
+            # Description includes the ID, so strip it
+            annotation = record.description[len(record.id):].strip()
+            annotations[record.id] = annotation if annotation else "hypothetical"
+        else:
+            annotations[record.id] = "hypothetical"
 
-    return sequences
+    return sequences, annotations
+
+
+def lookup_annotation(annotations: Dict[str, str], gene_id: str) -> str:
+    """Look up NR annotation for a gene, handling suffix variants."""
+    if gene_id in annotations:
+        return annotations[gene_id]
+
+    # Try without isoform suffix
+    base_id = gene_id.rsplit('.', 1)[0]
+    if base_id in annotations:
+        return annotations[base_id]
+
+    # Try adding .1 suffix
+    if f"{base_id}.1" in annotations:
+        return annotations[f"{base_id}.1"]
+
+    return "unknown"
 
 
 def get_protein_coordinates(gff_file: Path, gene_id: str) -> Optional[Tuple[str, int, int, str]]:
@@ -267,7 +305,8 @@ def main():
     # Track extraction stats
     extracted_count = 0
     failed_count = 0
-    genome_proteomes = {}  # Cache loaded proteomes
+    genome_proteomes = {}  # Cache loaded proteomes: {genome: sequences_dict}
+    genome_annotations = {}  # Cache loaded annotations: {genome: annotations_dict}
 
     # Process syntenic targets
     print("\n[1] Extracting syntenic targets...")
@@ -296,9 +335,12 @@ def main():
 
         # Load proteome if not cached
         if genome not in genome_proteomes:
-            genome_proteomes[genome] = load_helixer_proteome(args.helixer_dir, genome)
+            seqs, annots = load_helixer_proteome(args.helixer_dir, genome)
+            genome_proteomes[genome] = seqs
+            genome_annotations[genome] = annots
 
         proteome = genome_proteomes[genome]
+        annotations = genome_annotations[genome]
 
         # Extract protein sequence (handles .1/.2 suffix variants)
         protein_seq = lookup_protein(proteome, target_id)
@@ -308,6 +350,9 @@ def main():
                 print(f"  [WARNING] No protein for {target_id} in {genome}")
             failed_count += 1
             continue
+
+        # Get NR annotation for this target
+        helixer_annotation = lookup_annotation(annotations, target_id)
 
         # Write protein FASTA
         output_file = target_dir / f"{assigned_locus}_gene1_protein.fasta"
@@ -328,10 +373,11 @@ def main():
             'extracted_length_aa': extracted_length,
             'length_flag': length_flag,
             'ratio': round(extracted_length / query_length, 2) if query_length > 0 else 0,
+            'helixer_annotation': helixer_annotation,
         })
 
         if args.verbose:
-            print(f"  {genome}/{assigned_locus}: {extracted_length}aa ({length_flag})")
+            print(f"  {genome}/{assigned_locus}: {extracted_length}aa ({length_flag}) - {helixer_annotation[:30]}...")
 
     # Process unplaceable targets
     print("\n[2] Extracting unplaceable targets...")
@@ -360,9 +406,12 @@ def main():
 
         # Load proteome if not cached
         if genome not in genome_proteomes:
-            genome_proteomes[genome] = load_helixer_proteome(args.helixer_dir, genome)
+            seqs, annots = load_helixer_proteome(args.helixer_dir, genome)
+            genome_proteomes[genome] = seqs
+            genome_annotations[genome] = annots
 
         proteome = genome_proteomes[genome]
+        annotations = genome_annotations[genome]
 
         # Extract protein sequence (handles .1/.2 suffix variants)
         protein_seq = lookup_protein(proteome, target_id)
@@ -372,6 +421,9 @@ def main():
                 print(f"  [WARNING] No protein for {target_id} in {genome}")
             failed_count += 1
             continue
+
+        # Get NR annotation for this target
+        helixer_annotation = lookup_annotation(annotations, target_id)
 
         # Write protein FASTA
         output_file = target_dir / f"{unique_tag}_gene1_protein.fasta"
@@ -392,10 +444,11 @@ def main():
             'extracted_length_aa': extracted_length,
             'length_flag': length_flag,
             'ratio': round(extracted_length / query_length, 2) if query_length > 0 else 0,
+            'helixer_annotation': helixer_annotation,
         })
 
         if args.verbose:
-            print(f"  {genome}/UNPLACED/{unique_tag}: {extracted_length}aa ({length_flag})")
+            print(f"  {genome}/UNPLACED/{unique_tag}: {extracted_length}aa ({length_flag}) - {helixer_annotation[:30]}...")
 
     # Process novel loci from Phase 5b
     novel_loci_count = 0
@@ -455,9 +508,12 @@ def main():
 
                     # Load proteome if not cached
                     if genome not in genome_proteomes:
-                        genome_proteomes[genome] = load_helixer_proteome(args.helixer_dir, genome)
+                        seqs, annots = load_helixer_proteome(args.helixer_dir, genome)
+                        genome_proteomes[genome] = seqs
+                        genome_annotations[genome] = annots
 
                     proteome = genome_proteomes[genome]
+                    annotations = genome_annotations[genome]
 
                     # Extract protein sequence (handles .1/.2 suffix variants)
                     protein_seq = lookup_protein(proteome, target_id)
@@ -467,6 +523,9 @@ def main():
                             print(f"  [WARNING] No protein for {target_id} in {genome}")
                         novel_failed_count += 1
                         continue
+
+                    # Get NR annotation for this target (especially important for novel loci!)
+                    helixer_annotation = lookup_annotation(annotations, target_id)
 
                     # Write protein FASTA - use unknown query length since novel
                     output_file = novel_locus_dir / f"NOVEL_{locus_name}_gene1_protein.fasta"
@@ -488,10 +547,11 @@ def main():
                         'extracted_length_aa': extracted_length,
                         'length_flag': 'novel',
                         'ratio': 0,
+                        'helixer_annotation': helixer_annotation,
                     })
 
                     if args.verbose:
-                        print(f"  {genome}/NOVEL_{locus_name}: {extracted_length}aa")
+                        print(f"  {genome}/NOVEL_{locus_name}: {extracted_length}aa - {helixer_annotation[:30]}...")
 
             print(f"  Extracted {novel_loci_count} novel loci targets")
             if novel_failed_count > 0:

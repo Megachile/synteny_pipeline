@@ -134,15 +134,16 @@ This folder is **self-contained** - all scripts needed to run the complete pipel
 ## Quick Start
 
 ```bash
-cd /carc/scratch/projects/emartins/2016456/adam/synteny_scanning/hpc_deployment_package/hybrid_workflow
+cd /carc/scratch/projects/emartins/2016456/adam/analysis/helixer_pipeline
 
-# Run complete pipeline for all 33 families (3 sequential jobs)
-sbatch helixer_pipeline/run_phase1.slurm                    # ~1 hour
-sbatch --dependency=afterok:$JOBID helixer_pipeline/run_helixer_phases_4_5_array.slurm   # ~1 hour
-sbatch --dependency=afterok:$JOBID helixer_pipeline/run_helixer_phases_6_8_array.slurm   # ~30 min
+# Run complete pipeline for all 33 families as array job:
+sbatch run_full_pipeline.slurm
 
-# Or run complete pipeline as single job per family:
-sbatch helixer_pipeline/run_full_pipeline.slurm
+# Or run sequentially:
+sbatch run_phase1.slurm                    # Phase 1 + 1.5
+# Then:
+sbatch run_helixer_phases_4_5_array.slurm  # Phases 4, 4b, 2b, 5, 5b
+sbatch run_helixer_phases_6_8_array.slurm  # Phases 6, 7, 8a, 8b
 ```
 
 ---
@@ -151,13 +152,28 @@ sbatch helixer_pipeline/run_full_pipeline.slurm
 
 ### Phase 1: Locus Discovery
 
+**Two modes of operation:**
+
+**Mode 1: Legacy (LOC ID lookup)** - Parses BK GFF to find gene coordinates from LOC IDs:
 ```bash
-python helixer_pipeline/01_phase1.py \
+python 01_phase1.py \
     --loc-ids "LOC117167432,LOC117167433" \
     --gene-family "ferritin_MC102" \
-    --output-dir "outputs/ferritin_MC102/phase1_v2" \
+    --output-dir "outputs/ferritin_MC102/phase1" \
     --genome-gff-dir "data/reference"
 ```
+
+**Mode 2: Coordinates (pre-computed)** - Uses genomic coordinates directly, bypasses GFF lookup:
+```bash
+python 01_phase1.py \
+    --coordinates-file "top50_effector_genomic_coordinates.tsv" \
+    --gene-family "top50_effectors" \
+    --output-dir "outputs/top50_effectors/phase1" \
+    --genome-gff-dir "data/reference" \
+    --n-flanking 20
+```
+
+The coordinates file should have columns: `subcluster_id`, `gene_id`, `chromosome`, `start`, `end`, `strand`
 
 **Outputs:**
 - `locus_definitions.tsv` - Locus metadata (chromosome, coordinates, flanking files)
@@ -167,8 +183,8 @@ python helixer_pipeline/01_phase1.py \
 ### Phase 1.5: BK-LB Unification
 
 ```bash
-python helixer_pipeline/01b_merge_bk_lb_loci.py \
-    --locus-defs "outputs/{family}/phase1_v2/locus_definitions.tsv" \
+python 01b_merge_bk_lb_loci.py \
+    --locus-defs "outputs/{family}/phase1/locus_definitions.tsv" \
     --lb-proteome-db "data/proteomes/GCF_019393585.1_Lboulardi_NCBI.dmnd" \
     --diamond-threads 4
 ```
@@ -180,10 +196,10 @@ python helixer_pipeline/01b_merge_bk_lb_loci.py \
 ### Phase 2b: Flanking-First Synteny Detection
 
 ```bash
-python helixer_pipeline/02b_detect_empty_blocks_helixer.py \
+python 02b_detect_empty_blocks_helixer.py \
     --family "ferritin_MC102" \
     --phase1-dir "outputs/ferritin_MC102/phase1_v2" \
-    --phase4-dir "outputs/ferritin_MC102/phase4_helixer_filtered" \
+    --phase4-targets "outputs/ferritin_MC102/phase4_helixer_filtered/all_target_loci.tsv" \
     --helixer-dir "data/ragtag_output" \
     --output-dir "outputs/ferritin_MC102/phase2b_helixer" \
     --threads 8
@@ -196,9 +212,9 @@ python helixer_pipeline/02b_detect_empty_blocks_helixer.py \
 ### Phase 4: Target Detection (DIAMOND)
 
 ```bash
-python helixer_pipeline/04_detect_targets_helixer.py \
+python 04_detect_targets_helixer.py \
     --family "ferritin_MC102" \
-    --phase1-dir "outputs/ferritin_MC102/phase1_v2" \
+    --phase1-dir "outputs/ferritin_MC102/phase1" \
     --helixer-dir "data/ragtag_output" \
     --genome-list "helixer_genomes.tsv" \
     --output-dir "outputs/ferritin_MC102/phase4_helixer_filtered" \
@@ -212,7 +228,7 @@ python helixer_pipeline/04_detect_targets_helixer.py \
 ### Phase 4b: Extract Flanking Genes
 
 ```bash
-python helixer_pipeline/04b_extract_flanking_helixer.py \
+python 04b_extract_flanking_helixer.py \
     --family "ferritin_MC102" \
     --phase4-output "outputs/ferritin_MC102/phase4_helixer_filtered/all_target_loci.tsv" \
     --helixer-dir "data/ragtag_output" \
@@ -227,11 +243,11 @@ python helixer_pipeline/04b_extract_flanking_helixer.py \
 ### Phase 5: Classify Targets
 
 ```bash
-python helixer_pipeline/05_classify_targets_helixer.py \
+python 05_classify_targets_helixer.py \
     --family "ferritin_MC102" \
     --phase4-dir "outputs/ferritin_MC102/phase4_helixer_filtered" \
     --phase4b-dir "outputs/ferritin_MC102/phase4b_helixer_filtered" \
-    --phase1-dir "outputs/ferritin_MC102/phase1_v2" \
+    --phase1-dir "outputs/ferritin_MC102/phase1" \
     --output-dir "outputs/ferritin_MC102/phase5_helixer_filtered" \
     --min-synteny 0.15 \
     --threads 8
@@ -244,12 +260,11 @@ python helixer_pipeline/05_classify_targets_helixer.py \
 ### Phase 5b: Validate Novel Loci
 
 ```bash
-python helixer_pipeline/05b_validate_novel_loci.py \
+python 05b_validate_novel_loci.py \
     --family "ferritin_MC102" \
     --phase5-dir "outputs/ferritin_MC102/phase5_helixer_filtered" \
-    --phase4b-dir "outputs/ferritin_MC102/phase4b_helixer_filtered" \
+    --phase1-dir "outputs/ferritin_MC102/phase1" \
     --helixer-dir "data/ragtag_output" \
-    --bk-proteome "data/proteomes/GCF_010883055.1_bkinseyi.dmnd" \
     --output-dir "outputs/ferritin_MC102/phase5b_helixer" \
     --threads 8
 ```
@@ -260,9 +275,9 @@ python helixer_pipeline/05b_validate_novel_loci.py \
 ### Phase 6: Extract Sequences
 
 ```bash
-python helixer_pipeline/06_extract_sequences_helixer.py \
+python 06_extract_sequences_helixer.py \
     --family "ferritin_MC102" \
-    --phase1-dir "outputs/ferritin_MC102/phase1_v2" \
+    --phase1-dir "outputs/ferritin_MC102/phase1" \
     --phase4-dir "outputs/ferritin_MC102/phase4_helixer_filtered" \
     --phase5-dir "outputs/ferritin_MC102/phase5_helixer_filtered" \
     --helixer-dir "data/ragtag_output" \
@@ -275,29 +290,32 @@ python helixer_pipeline/06_extract_sequences_helixer.py \
 - `all_extracted_genes.faa` - Combined FASTA
 - `NOVEL_{locus_name}/` - Novel loci protein sequences (if `--phase5b-dir` provided)
 
-### Phase 7: SwissProt Annotation
+### Phase 7: Annotate Flanking (NR annotations from headers)
+
+Uses NR annotations already present in Helixer proteome FASTA headers instead of running a separate DIAMOND search. This simplified approach parses annotations like "Cytochrome P450 3A31" directly from the FASTA description lines.
 
 ```bash
-python helixer_pipeline/07_annotate_flanking_swissprot.py \
+python 07_annotate_flanking.py \
     --family "ferritin_MC102" \
     --phase4b-dir "outputs/ferritin_MC102/phase4b_helixer_filtered" \
     --phase5-dir "outputs/ferritin_MC102/phase5_helixer_filtered" \
-    --swissprot-db "/carc/scratch/projects/emartins/2016456/adam/databases/uniprot_sprot.dmnd" \
+    --helixer-dir "data/ragtag_output" \
     --output-dir "outputs/ferritin_MC102/phase7_helixer_filtered" \
-    --threads 4 \
+    --phase2b-dir "outputs/ferritin_MC102/phase2b_helixer"  # Optional
     --phase5b-dir "outputs/ferritin_MC102/phase5b_helixer"  # Optional: novel loci
 ```
 
 **Outputs:**
-- `flanking_matches_annotated.tsv` - SwissProt annotations for flanking genes
-- `novel_loci_flanking_annotated.tsv` - Novel loci flanking gene annotations (if `--phase5b-dir` provided)
+- `flanking_annotations.tsv` - NR annotations for flanking genes + chromosome info
+- `flanking_matches_annotated.tsv` - Phase 5 matches with annotations
+- `phase2b_flanking_annotated.tsv` - Phase 2b flanking with annotations (if `--phase2b-dir` provided)
 
 ### Phase 8a: Locus Matrices
 
 ```bash
-python helixer_pipeline/08a_generate_locus_matrices_helixer.py \
+python 08a_generate_locus_matrices_helixer.py \
     --family "ferritin_MC102" \
-    --phase1-dir "outputs/ferritin_MC102/phase1_v2" \
+    --phase1-dir "outputs/ferritin_MC102/phase1" \
     --phase5-dir "outputs/ferritin_MC102/phase5_helixer_filtered" \
     --phase6-dir "outputs/ferritin_MC102/phase6_helixer_filtered" \
     --phase7-dir "outputs/ferritin_MC102/phase7_helixer_filtered" \
@@ -313,9 +331,9 @@ python helixer_pipeline/08a_generate_locus_matrices_helixer.py \
 ### Phase 8b: Summary Matrix
 
 ```bash
-python helixer_pipeline/08b_generate_summary_matrices_helixer.py \
+python 08b_generate_summary_matrices_helixer.py \
     --family "ferritin_MC102" \
-    --phase1-dir "outputs/ferritin_MC102/phase1_v2" \
+    --phase1-dir "outputs/ferritin_MC102/phase1" \
     --phase2b-dir "outputs/ferritin_MC102/phase2b_helixer" \
     --phase5-dir "outputs/ferritin_MC102/phase5_helixer_filtered" \
     --phase5b-dir "outputs/ferritin_MC102/phase5b_helixer" \
@@ -339,6 +357,8 @@ python helixer_pipeline/08b_generate_summary_matrices_helixer.py \
 | `data/reference/` | BK/LB genome GFF files |
 | `data/proteomes/` | BK/LB DIAMOND databases |
 | `helixer_genomes.tsv` | List of Helixer-annotated genomes |
+
+**Optional** (used for BK flanking SwissProt annotation):
 | `/carc/scratch/projects/emartins/2016456/adam/databases/uniprot_sprot.dmnd` | SwissProt DB |
 
 ---

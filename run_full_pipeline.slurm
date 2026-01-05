@@ -11,23 +11,21 @@
 # Helixer Pipeline: Complete single-job execution
 #
 # Runs ALL phases for one family:
-#   Phase 1:   Locus discovery
-#   Phase 1.5: BK-LB unification
-#   Phase 2b:  Flanking-first synteny detection
-#   Phase 4:   Target detection (DIAMOND)
-#   Phase 4b:  Extract flanking genes
-#   Phase 5:   Classify targets
-#   Phase 5b:  Validate novel loci
-#   Phase 6:   Extract sequences
-#   Phase 7:   SwissProt annotation
-#   Phase 8a:  Locus matrices
-#   Phase 8b:  Summary matrix
-#   Phase 9:   Novel loci detection
+#   Step 01: Locus discovery (BK GFF parsing or coordinates file)
+#   Step 02: BK-LB unification (DIAMOND merge)
+#   Step 03: Target detection (DIAMOND vs all proteomes)
+#   Step 04: Extract flanking genes
+#   Step 05: Synteny block detection (flanking-first)
+#   Step 06: Classify targets (syntenic vs novel)
+#   Step 07: Validate novel loci (synteny-aware clustering)
+#   Step 08: Extract sequences (proteins from targets + NR annotations)
+#   Step 09: Annotate flanking (parse NR annotations from headers)
+#   Step 10: Generate matrices (locus + summary)
 ################################################################################
 
 set -e  # Exit on error
 
-cd /carc/scratch/projects/emartins/2016456/adam/synteny_scanning/hpc_deployment_package/hybrid_workflow
+cd /carc/scratch/projects/emartins/2016456/adam/analysis/helixer_pipeline
 
 # Family list (33 families)
 FAMILIES=(
@@ -121,7 +119,7 @@ LOC_IDS=$(tail -n +2 "$INPUT_FILE" | cut -f2 | tr '\n' ',' | sed 's/,$//')
 echo "  Input: $INPUT_FILE"
 echo "  LOC IDs: $LOC_IDS"
 
-python helixer_pipeline/01_phase1.py \
+python 01_discover_loci.py \
     --loc-ids "$LOC_IDS" \
     --gene-family "$FAMILY" \
     --output-dir "$PHASE1_DIR" \
@@ -134,7 +132,7 @@ echo ""
 echo "=== PHASE 1.5: BK-LB Unification ==="
 
 if [ -f "$LB_PROTEOME_DB" ]; then
-    python helixer_pipeline/01b_merge_bk_lb_loci.py \
+    python 02_merge_reference_loci.py \
         --locus-defs "${PHASE1_DIR}/locus_definitions.tsv" \
         --lb-proteome-db "$LB_PROTEOME_DB" \
         --diamond-threads 8 || echo "  WARNING: Phase 1.5 failed, continuing"
@@ -148,7 +146,7 @@ fi
 echo ""
 echo "=== PHASE 4: Target Detection (DIAMOND) ==="
 
-python helixer_pipeline/04_detect_targets_helixer.py \
+python 03_detect_targets.py \
     --family "$FAMILY" \
     --phase1-dir "$PHASE1_DIR" \
     --helixer-dir "$HELIXER_DIR" \
@@ -163,7 +161,7 @@ python helixer_pipeline/04_detect_targets_helixer.py \
 echo ""
 echo "=== PHASE 4b: Extract Flanking Genes ==="
 
-python helixer_pipeline/04b_extract_flanking_helixer.py \
+python 04_extract_flanking.py \
     --family "$FAMILY" \
     --phase4-output "${PHASE4_DIR}/all_target_loci.tsv" \
     --helixer-dir "$HELIXER_DIR" \
@@ -176,10 +174,10 @@ python helixer_pipeline/04b_extract_flanking_helixer.py \
 echo ""
 echo "=== PHASE 2b: Flanking-First Synteny Detection ==="
 
-python helixer_pipeline/02b_detect_empty_blocks_helixer.py \
+python 05_detect_synteny_blocks.py \
     --family "$FAMILY" \
     --phase1-dir "$PHASE1_DIR" \
-    --phase4-dir "$PHASE4_DIR" \
+    --phase4-targets "${PHASE4_DIR}/all_target_loci.tsv" \
     --helixer-dir "$HELIXER_DIR" \
     --output-dir "$PHASE2B_DIR" \
     --threads 8 || echo "  WARNING: Phase 2b failed, continuing"
@@ -190,7 +188,7 @@ python helixer_pipeline/02b_detect_empty_blocks_helixer.py \
 echo ""
 echo "=== PHASE 5: Classify Targets ==="
 
-python helixer_pipeline/05_classify_targets_helixer.py \
+python 06_classify_targets.py \
     --family "$FAMILY" \
     --phase4-dir "$PHASE4_DIR" \
     --phase4b-dir "$PHASE4B_DIR" \
@@ -211,12 +209,11 @@ echo ""
 echo "=== PHASE 5b: Validate Novel Loci ==="
 
 if [ -f "${PHASE5_DIR}/unplaceable_targets.tsv" ]; then
-    python helixer_pipeline/05b_validate_novel_loci.py \
+    python 07_validate_novel_loci.py \
         --family "$FAMILY" \
         --phase5-dir "$PHASE5_DIR" \
-        --phase4b-dir "$PHASE4B_DIR" \
+        --phase1-dir "$PHASE1_DIR" \
         --helixer-dir "$HELIXER_DIR" \
-        --bk-proteome "$BK_PROTEOME_DB" \
         --output-dir "$PHASE5B_DIR" \
         --threads 8 || echo "  WARNING: Phase 5b failed, continuing"
 else
@@ -229,7 +226,7 @@ fi
 echo ""
 echo "=== PHASE 6: Extract Sequences ==="
 
-python helixer_pipeline/06_extract_sequences_helixer.py \
+python 08_extract_sequences.py \
     --family "$FAMILY" \
     --phase1-dir "$PHASE1_DIR" \
     --phase4-dir "$PHASE4_DIR" \
@@ -238,24 +235,23 @@ python helixer_pipeline/06_extract_sequences_helixer.py \
     --output-dir "$PHASE6_DIR"
 
 ################################################################################
-# PHASE 7: SwissProt Annotation
+# PHASE 7: Annotate Flanking (NR annotations from Helixer FASTA headers)
 ################################################################################
 echo ""
-echo "=== PHASE 7: SwissProt Annotation ==="
+echo "=== PHASE 7: Annotate Flanking (NR) ==="
 
 PHASE2B_ARG=""
 if [ -d "$PHASE2B_DIR" ]; then
     PHASE2B_ARG="--phase2b-dir $PHASE2B_DIR"
 fi
 
-python helixer_pipeline/07_annotate_flanking_swissprot.py \
+python 09_annotate_flanking.py \
     --family "$FAMILY" \
     --phase4b-dir "$PHASE4B_DIR" \
     --phase5-dir "$PHASE5_DIR" \
+    --helixer-dir "$HELIXER_DIR" \
     $PHASE2B_ARG \
-    --swissprot-db "$SWISSPROT_DB" \
-    --output-dir "$PHASE7_DIR" \
-    --threads 8
+    --output-dir "$PHASE7_DIR"
 
 # Also annotate BK flanking proteins
 BK_SWISSPROT_DIR="${PHASE1_DIR}/bk_swissprot"
@@ -291,7 +287,7 @@ if [ -d "$PHASE5B_DIR" ] && [ -f "$PHASE5B_DIR/novel_loci_clustered.tsv" ]; then
     PHASE5B_ARG="--phase5b-dir $PHASE5B_DIR"
 fi
 
-python helixer_pipeline/08a_generate_locus_matrices_helixer.py \
+python 10a_generate_locus_matrices.py \
     --family "$FAMILY" \
     --phase1-dir "$PHASE1_DIR" \
     --phase5-dir "$PHASE5_DIR" \
@@ -309,7 +305,7 @@ python helixer_pipeline/08a_generate_locus_matrices_helixer.py \
 echo ""
 echo "=== PHASE 8b: Summary Matrix ==="
 
-python helixer_pipeline/08b_generate_summary_matrices_helixer.py \
+python 10b_generate_summary_matrices.py \
     --family "$FAMILY" \
     --phase1-dir "$PHASE1_DIR" \
     --phase2b-dir "$PHASE2B_DIR" \
@@ -320,21 +316,14 @@ python helixer_pipeline/08b_generate_summary_matrices_helixer.py \
     --output-dir "$PHASE8_DIR"
 
 ################################################################################
-# PHASE 9: Novel Loci Detection
+# PHASE 9: Novel Loci Detection (DEPRECATED 2026-01-04)
+# - Script moved to deprecated/ folder
+# - Input/output mismatch with Phase 5b prevents execution
+# - Phase 5b's novel_loci_clustered.tsv provides sufficient novel locus info
 ################################################################################
+# Skipping deprecated Phase 9
 echo ""
-echo "=== PHASE 9: Novel Loci Detection ==="
-
-if [ -d "$PHASE5B_DIR" ]; then
-    python helixer_pipeline/09_detect_novel_loci_helixer.py \
-        --family "$FAMILY" \
-        --phase5b-dir "$PHASE5B_DIR" \
-        --phase4b-dir "$PHASE4B_DIR" \
-        --helixer-dir "$HELIXER_DIR" \
-        --output-dir "$PHASE9_DIR" || echo "  WARNING: Phase 9 failed"
-else
-    echo "  SKIP: No Phase 5b outputs"
-fi
+echo "=== PHASE 9: Skipped (deprecated) ==="
 
 ################################################################################
 # DONE
@@ -350,6 +339,5 @@ echo "  Phase 5b: $PHASE5B_DIR"
 echo "  Phase 6:  $PHASE6_DIR"
 echo "  Phase 7:  $PHASE7_DIR"
 echo "  Phase 8:  $PHASE8_DIR"
-echo "  Phase 9:  $PHASE9_DIR"
 echo "  Date: $(date)"
 echo "============================================================"

@@ -4,18 +4,33 @@ Phase 1: Locus discovery + locus envelope metadata + dedup flanking preference.
 
 Part of the Helixer proteome pipeline (canonical synteny-scanning pipeline).
 
+TWO MODES OF OPERATION:
+
+1. Legacy mode (--loc-ids): Takes LOC IDs, parses BK GFF to find coordinates
+   python 01_phase1.py \
+       --loc-ids LOC117167432,LOC117167433 \
+       --gene-family ferritin_MC102 \
+       --output-dir outputs/ferritin_MC102/phase1
+
+2. Coordinates mode (--coordinates-file): Uses pre-computed genomic coordinates
+   python 01_phase1.py \
+       --coordinates-file top50_effector_genomic_coordinates.tsv \
+       --gene-family ferritin_MC102 \
+       --output-dir outputs/ferritin_MC102/phase1
+
+   Expected columns in coordinates file:
+   - subcluster_id: Used as locus_id
+   - gene_id: LOC ID (e.g., LOC117175425)
+   - chromosome: RefSeq chromosome ID (e.g., NC_046662.1)
+   - start, end: Genomic coordinates
+   - strand: + or -
+
 This wraps the discovery implementation to produce flanking/targets, then
 post-processes locus_definitions.tsv to:
   - Prefer deduplicated flanking files ("*_flanking_dedup.faa")
   - Add expected chromosome from locus_id (e.g., BK_chr2_x → chr2)
   - Add locus envelope coordinates from debug flanking files when available
   - Compute a per-locus scale factor (locus_scale) based on span vs cohort median
-
-Usage:
-    python 01_phase1.py \
-        --loc-ids LOC117167432,LOC117167433 \
-        --gene-family ferritin_MC102 \
-        --output-dir outputs/ferritin_MC102/phase1
 """
 
 from __future__ import annotations
@@ -465,13 +480,230 @@ def postprocess_phase1(phase1_dir: Path, genome_gff_dir: Path | None = None) -> 
     return locus_defs
 
 
+def run_coordinates_mode(
+    coords_file: Path,
+    gene_family: str,
+    out_dir: Path,
+    genome_gff_dir: Path,
+    n_flanking: int = 20
+) -> None:
+    """
+    Create Phase 1 outputs directly from pre-computed coordinates file.
+
+    This bypasses GFF LOC lookup - coordinates are already provided.
+    Still needs GFF for extracting flanking gene sequences.
+    """
+    from Bio import SeqIO
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+
+    print(f"\n[COORDINATES MODE] Reading {coords_file}")
+    coords_df = pd.read_csv(coords_file, sep='\t')
+
+    # Validate required columns
+    required = {'subcluster_id', 'gene_id', 'chromosome', 'start', 'end'}
+    missing = required - set(coords_df.columns)
+    if missing:
+        raise ValueError(f"Coordinates file missing columns: {missing}")
+
+    # Group by subcluster_id (each subcluster = one locus)
+    locus_groups = coords_df.groupby('subcluster_id')
+    print(f"  Found {len(locus_groups)} loci (subclusters)")
+
+    # Load BK GFF for flanking gene extraction
+    bk_gff = _find_gff_file(genome_gff_dir, 'BK')
+    if not bk_gff:
+        raise FileNotFoundError(f"BK GFF not found in {genome_gff_dir}")
+    print(f"  Loading BK GFF: {bk_gff}")
+    gene_positions = _load_gff_gene_positions(bk_gff)
+    print(f"  Loaded {len(gene_positions)} gene positions")
+
+    # Load BK proteome for flanking sequences
+    bk_proteome_path = None
+    proteome_candidates = [
+        genome_gff_dir / 'belonocnema_kinseyi' / 'GCF_010883055.1_B_treatae_v1_protein.faa',
+        Path('/carc/scratch/projects/emartins/2016456/adam/genomes/belonocnema_kinseyi/GCF_010883055.1_B_treatae_v1_protein.faa'),
+    ]
+    for candidate in proteome_candidates:
+        if candidate.exists():
+            bk_proteome_path = candidate
+            break
+
+    # Also try glob
+    if not bk_proteome_path:
+        for candidate in genome_gff_dir.glob('**/GCF_010883055*protein*.faa'):
+            bk_proteome_path = candidate
+            break
+        if not bk_proteome_path:
+            for candidate in genome_gff_dir.glob('**/*kinseyi*protein*.faa'):
+                bk_proteome_path = candidate
+                break
+
+    # Load proteome sequences
+    proteome_seqs = {}
+    if bk_proteome_path and bk_proteome_path.exists():
+        print(f"  Loading BK proteome: {bk_proteome_path}")
+        for record in SeqIO.parse(bk_proteome_path, 'fasta'):
+            # Extract LOC ID from header (e.g., XP_033221023.1 -> find LOC in description)
+            # Header format varies: "XP_033221023.1 protein description [Belonocnema kinseyi]"
+            protein_id = record.id.split()[0]
+            proteome_seqs[protein_id] = record
+        print(f"  Loaded {len(proteome_seqs)} protein sequences")
+    else:
+        print(f"  WARNING: BK proteome not found, flanking FASTAs will be empty")
+
+    # Build chromosome -> sorted gene list for flanking extraction
+    chrom_genes = {}
+    for gene_id, (chrom, start, end) in gene_positions.items():
+        if chrom not in chrom_genes:
+            chrom_genes[chrom] = []
+        chrom_genes[chrom].append((start, end, gene_id))
+
+    for chrom in chrom_genes:
+        chrom_genes[chrom].sort(key=lambda x: x[0])
+
+    # Process each locus
+    locus_rows = []
+    gene_coord_rows = []
+
+    for locus_id, group in locus_groups:
+        # Get locus envelope (min/max of all member genes)
+        locus_start = group['start'].min()
+        locus_end = group['end'].max()
+        chrom = group['chromosome'].iloc[0]
+        strand = group['strand'].iloc[0] if 'strand' in group.columns else '+'
+
+        # Get cluster members
+        cluster_members = ','.join(group['gene_id'].tolist())
+        protein_ids = group['protein_id'].tolist() if 'protein_id' in group.columns else []
+
+        # Create locus_id in BK format if not already
+        if not str(locus_id).startswith('BK_'):
+            # Convert NC_046662.1 -> chr number using common mapping
+            chrom_map = {
+                'NC_046657.1': 'chr1', 'NC_046658.1': 'chr2', 'NC_046659.1': 'chr3',
+                'NC_046660.1': 'chr4', 'NC_046661.1': 'chr5', 'NC_046662.1': 'chr6',
+                'NC_046663.1': 'chr7', 'NC_046664.1': 'chr8', 'NC_046665.1': 'chr9',
+                'NC_046666.1': 'chr10', 'NC_046667.1': 'chr11', 'NC_046668.1': 'chr12',
+                'NC_046669.1': 'chr13', 'NC_046670.1': 'chr14',
+            }
+            chr_name = chrom_map.get(chrom, chrom.replace('NC_', 'unk'))
+            # Keep subcluster_id as suffix for uniqueness
+            display_locus_id = f"BK_{chr_name}_{locus_id}"
+        else:
+            display_locus_id = locus_id
+
+        # Find flanking genes on this chromosome
+        flanking_genes = []
+        if chrom in chrom_genes:
+            genes_on_chrom = chrom_genes[chrom]
+
+            # Find genes within the locus
+            locus_gene_indices = []
+            for i, (gstart, gend, gid) in enumerate(genes_on_chrom):
+                if gstart >= locus_start and gend <= locus_end:
+                    locus_gene_indices.append(i)
+
+            if locus_gene_indices:
+                first_idx = min(locus_gene_indices)
+                last_idx = max(locus_gene_indices)
+
+                # Get N upstream and N downstream
+                upstream_start = max(0, first_idx - n_flanking)
+                downstream_end = min(len(genes_on_chrom), last_idx + n_flanking + 1)
+
+                for i in range(upstream_start, first_idx):
+                    flanking_genes.append(('U', genes_on_chrom[i][2]))
+                for i in range(last_idx + 1, downstream_end):
+                    flanking_genes.append(('D', genes_on_chrom[i][2]))
+
+        # Write flanking FASTA
+        flanking_file = out_dir / f"{display_locus_id}_flanking.faa"
+        flanking_records = []
+        for direction, gene_id in flanking_genes:
+            # Find protein ID for this gene (from proteome)
+            # Try to match by LOC ID in proteome headers
+            for prot_id, record in proteome_seqs.items():
+                if gene_id in record.description:
+                    new_record = SeqRecord(
+                        record.seq,
+                        id=f"{prot_id}|{gene_id}",
+                        description=f"{direction} {prot_id} {record.description}"
+                    )
+                    flanking_records.append(new_record)
+                    break
+
+        if flanking_records:
+            SeqIO.write(flanking_records, flanking_file, 'fasta')
+        else:
+            # Write empty file
+            flanking_file.touch()
+
+        # Record locus definition
+        locus_rows.append({
+            'locus_id': display_locus_id,
+            'subcluster_id': locus_id,
+            'genome': 'BK',
+            'chromosome': chrom,
+            'strand': strand,
+            'locus_span_start': locus_start,
+            'locus_span_end': locus_end,
+            'locus_span_kb': (locus_end - locus_start) / 1000.0,
+            'n_genes': len(group),
+            'cluster_members': cluster_members,
+            'flanking_file': str(flanking_file),
+            'n_flanking': len(flanking_genes),
+        })
+
+        # Record individual gene coordinates
+        for _, gene_row in group.iterrows():
+            gene_coord_rows.append({
+                'locus_id': display_locus_id,
+                'gene_id': gene_row['gene_id'],
+                'protein_id': gene_row.get('protein_id', ''),
+                'chromosome': gene_row['chromosome'],
+                'start': gene_row['start'],
+                'end': gene_row['end'],
+                'strand': gene_row.get('strand', '+'),
+                'length': gene_row['end'] - gene_row['start'] + 1,
+            })
+
+    # Write outputs
+    locus_defs_df = pd.DataFrame(locus_rows)
+    locus_defs_df.to_csv(out_dir / 'locus_definitions.tsv', sep='\t', index=False)
+    print(f"  Wrote {len(locus_defs_df)} loci to locus_definitions.tsv")
+
+    gene_coords_df = pd.DataFrame(gene_coord_rows)
+    gene_coords_df.to_csv(out_dir / 'cluster_gene_coordinates.tsv', sep='\t', index=False)
+    print(f"  Wrote {len(gene_coords_df)} gene coordinates to cluster_gene_coordinates.tsv")
+
+
 def parse_args():
-    p = argparse.ArgumentParser(description='Phase 1 (redesign): locus discovery + envelope + scaling')
-    p.add_argument('--loc-ids', required=True, help='Comma-separated LOC IDs (e.g., LOC...,LOC...)')
+    p = argparse.ArgumentParser(
+        description='Phase 1: locus discovery + envelope + scaling',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Legacy mode (LOC ID lookup):
+  python 01_phase1.py --loc-ids LOC117167432,LOC117167433 --gene-family MC102 --output-dir out/phase1
+
+  # Coordinates mode (pre-computed):
+  python 01_phase1.py --coordinates-file coords.tsv --gene-family MC102 --output-dir out/phase1
+"""
+    )
+
+    # Input mode (mutually exclusive)
+    input_group = p.add_mutually_exclusive_group(required=True)
+    input_group.add_argument('--loc-ids', help='Comma-separated LOC IDs (legacy mode)')
+    input_group.add_argument('--coordinates-file', type=Path,
+                             help='TSV with pre-computed genomic coordinates (coordinates mode)')
+
     p.add_argument('--gene-family', required=True, help='Gene family label')
     p.add_argument('--output-dir', required=True, type=Path, help='Output directory for phase1 outputs')
-    p.add_argument('--genome-gff-dir', required=True, type=Path,
-                   help='Directory containing genome GFF files (REQUIRED for per-gene coordinate extraction)')
+    p.add_argument('--genome-gff-dir', type=Path, default=Path('data/reference'),
+                   help='Directory containing genome GFF files')
+    p.add_argument('--n-flanking', type=int, default=20,
+                   help='Number of flanking genes per side (default: 20)')
     return p.parse_args()
 
 
@@ -481,48 +713,75 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print('=' * 80)
-    print('PHASE 1 (REDESIGN): DISCOVERY + ENVELOPE + DEDUP PREFERENCE')
+    print('PHASE 1: LOCUS DISCOVERY')
     print('=' * 80)
     print(f'Output dir: {out_dir}')
+    print(f'Gene family: {args.gene_family}')
 
-    # 1) Run legacy discovery into the requested directory
-    print('\n[1] Running legacy discovery...')
-    run_legacy_discovery(args.loc_ids, args.gene_family, out_dir)
+    # Determine mode
+    if args.coordinates_file:
+        # COORDINATES MODE: Use pre-computed coordinates
+        print(f'Mode: COORDINATES (using {args.coordinates_file.name})')
+        print('=' * 80)
 
-    # 2) Post-process locus definitions
-    print('\n[2] Post-processing locus definitions...')
-    locus_defs = postprocess_phase1(out_dir, genome_gff_dir=args.genome_gff_dir)
-    print(f'  Updated: {locus_defs}')
+        run_coordinates_mode(
+            coords_file=args.coordinates_file,
+            gene_family=args.gene_family,
+            out_dir=out_dir,
+            genome_gff_dir=args.genome_gff_dir,
+            n_flanking=args.n_flanking
+        )
 
-    # 3) Extract individual gene coordinates (REQUIRED for Phase 4 calibration)
-    print('\n[3] Extracting cluster gene coordinates from GFF...')
-    extract_cluster_gene_coordinates(out_dir, args.genome_gff_dir)
+    else:
+        # LEGACY MODE: LOC ID lookup
+        print(f'Mode: LEGACY (LOC ID lookup)')
+        print('=' * 80)
 
-    # Validate that gene coordinates were extracted
+        # 1) Run legacy discovery into the requested directory
+        print('\n[1] Running legacy discovery...')
+        run_legacy_discovery(args.loc_ids, args.gene_family, out_dir)
+
+        # 2) Post-process locus definitions
+        print('\n[2] Post-processing locus definitions...')
+        locus_defs = postprocess_phase1(out_dir, genome_gff_dir=args.genome_gff_dir)
+        print(f'  Updated: {locus_defs}')
+
+        # 3) Extract individual gene coordinates (REQUIRED for Phase 4 calibration)
+        print('\n[3] Extracting cluster gene coordinates from GFF...')
+        extract_cluster_gene_coordinates(out_dir, args.genome_gff_dir)
+
+    # Validate outputs (both modes)
     gene_coords_file = out_dir / 'cluster_gene_coordinates.tsv'
+    locus_defs_file = out_dir / 'locus_definitions.tsv'
+
     if not gene_coords_file.exists():
         print(f'ERROR: Failed to create {gene_coords_file}')
         print('       This file is REQUIRED for Phase 4 factorial calibration.')
-        print('       Check that GFF files exist in --genome-gff-dir')
         raise FileNotFoundError(f'Missing required output: {gene_coords_file}')
+
+    if not locus_defs_file.exists():
+        print(f'ERROR: Failed to create {locus_defs_file}')
+        raise FileNotFoundError(f'Missing required output: {locus_defs_file}')
 
     coords_df = pd.read_csv(gene_coords_file, sep='\t')
     if len(coords_df) == 0:
         print(f'ERROR: {gene_coords_file} is empty')
-        print('       No gene coordinates could be extracted from GFF files.')
+        print('       No gene coordinates could be extracted.')
         raise ValueError(f'Empty gene coordinates file: {gene_coords_file}')
 
-    print(f'  ✓ Extracted {len(coords_df)} gene coordinates')
+    print(f'\n[VALIDATION] Extracted {len(coords_df)} gene coordinates')
 
-    # 4) Summary
-    print('\n[4] Summary (preview):')
+    # Summary
+    print('\n[SUMMARY]')
     try:
-        df = pd.read_csv(locus_defs, sep='\t')
-        cols = [c for c in ['locus_id','genome','expected_chromosome','locus_span_kb','locus_scale'] if c in df.columns]
+        df = pd.read_csv(locus_defs_file, sep='\t')
+        cols = [c for c in ['locus_id', 'genome', 'chromosome', 'locus_span_kb', 'n_genes', 'n_flanking'] if c in df.columns]
         if cols:
-            print(df[cols].to_string(index=False))
-    except Exception:
-        pass
+            print(df[cols].head(10).to_string(index=False))
+            if len(df) > 10:
+                print(f'  ... and {len(df) - 10} more loci')
+    except Exception as e:
+        print(f'  Could not display summary: {e}')
 
     print('\nDone.')
 
