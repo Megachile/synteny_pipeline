@@ -233,10 +233,17 @@ def create_summary_matrix(
     """
 
     # Index Phase 2b blocks by (genome, locus)
+    # Only use selected blocks (one best block per genome/locus)
     # blocks_by_genome_locus[genome][locus] = [{synteny_score, has_target_overlap, overlapping_target_id}, ...]
     blocks_by_genome_locus = defaultdict(lambda: defaultdict(list))
     if not phase2b_blocks_df.empty:
-        for _, block in phase2b_blocks_df.iterrows():
+        # Filter to selected blocks only
+        if 'selected' in phase2b_blocks_df.columns:
+            selected_blocks = phase2b_blocks_df[phase2b_blocks_df['selected'] == True]
+        else:
+            selected_blocks = phase2b_blocks_df
+
+        for _, block in selected_blocks.iterrows():
             genome = block['genome']
             locus = block['locus_id']
             blocks_by_genome_locus[genome][locus].append({
