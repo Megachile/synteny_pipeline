@@ -32,6 +32,8 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from data_paths import get_species_mapping_file
+
 
 # Match Phase 2b parameters exactly
 DIAMOND_EVALUE = 1e-5
@@ -653,11 +655,8 @@ def main():
     # Cluster novel loci based on mutual flanking gene synteny
     if validation_results:
         # Load species mapping for proper naming
-        # gca_to_species.tsv is in hybrid_workflow/data/
-        # output_dir is outputs/{family}/phase5b_xxx, need to go up 3 levels
-        data_dir = args.output_dir.parent.parent.parent / "data"
-        species_mapping = load_species_mapping(data_dir)
-        print(f"  Loaded species mapping from {data_dir}: {len(species_mapping)} entries")
+        species_mapping = load_species_mapping()
+        print(f"  Loaded species mapping: {len(species_mapping)} entries")
 
         # Load chromosome mapping for CM→chr conversion
         # chromosome_mappings.json is in hpc_deployment_package/
@@ -677,9 +676,9 @@ def main():
     return 0
 
 
-def load_species_mapping(data_dir: Path) -> dict:
+def load_species_mapping(data_dir: Path = None) -> dict:
     """Load genome ID to species name mapping."""
-    mapping_file = data_dir / "gca_to_species.tsv"
+    mapping_file = get_species_mapping_file()
     if not mapping_file.exists():
         return {}
 

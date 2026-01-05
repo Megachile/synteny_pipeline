@@ -41,6 +41,24 @@ def get_data_dir() -> Path:
 
 
 # =============================================================================
+# METADATA FILES
+# =============================================================================
+
+def get_species_mapping_file() -> Path:
+    """Get path to gca_to_species.tsv (species names, families, BUSCO)."""
+    return get_data_dir() / "gca_to_species.tsv"
+
+
+def get_genome_quality_file() -> Path:
+    """Get path to genome_quality_full.tsv (assembly metrics)."""
+    return get_data_dir() / "genome_quality_full.tsv"
+
+
+GCA_TO_SPECIES_FILE = get_species_mapping_file()
+GENOME_QUALITY_FILE = get_genome_quality_file()
+
+
+# =============================================================================
 # GENOME DISCOVERY
 # =============================================================================
 

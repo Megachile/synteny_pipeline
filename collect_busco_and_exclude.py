@@ -34,13 +34,13 @@ GOOD_THRESHOLD = 75.0       # What counts as "good" alternative
 # =============================================================================
 # PATHS - use data_paths module for consistency
 # =============================================================================
-from data_paths import get_data_dir, PIPELINE_DIR
+from data_paths import get_data_dir, get_species_mapping_file, PIPELINE_DIR
 
 DATA_DIR = get_data_dir()
 RAGTAG_DIR = DATA_DIR  # pancynipoid_helixer contains all genomes
 EXCLUDED_DIR = DATA_DIR / "excluded"  # Will be created if needed
-# GCA to species mapping - stored in pipeline directory
-GCA_FILE = PIPELINE_DIR / "gca_to_species.tsv"
+# GCA to species mapping - canonical location in data directory
+GCA_FILE = get_species_mapping_file()
 
 
 def parse_busco_summary(summary_file: Path) -> dict:
