@@ -67,7 +67,7 @@ eval "$(/carc/scratch/projects/emartins/2016456/micromamba_root/bin/micromamba s
 micromamba activate busco_env
 
 # Paths
-PHASE1_DIR="outputs/$FAMILY/phase1_v2"
+PHASE1_DIR="outputs/$FAMILY/phase1"
 PHASE4_DIR="outputs/$FAMILY/phase4_helixer_filtered"
 PHASE4B_DIR="outputs/$FAMILY/phase4b_helixer_filtered"
 PHASE5_DIR="outputs/$FAMILY/phase5_helixer_filtered"

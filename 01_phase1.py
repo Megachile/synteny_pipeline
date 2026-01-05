@@ -15,7 +15,7 @@ Usage:
     python 01_phase1.py \
         --loc-ids LOC117167432,LOC117167433 \
         --gene-family ferritin_MC102 \
-        --output-dir outputs/ferritin_MC102/phase1_v2
+        --output-dir outputs/ferritin_MC102/phase1
 """
 
 from __future__ import annotations
@@ -469,7 +469,7 @@ def parse_args():
     p = argparse.ArgumentParser(description='Phase 1 (redesign): locus discovery + envelope + scaling')
     p.add_argument('--loc-ids', required=True, help='Comma-separated LOC IDs (e.g., LOC...,LOC...)')
     p.add_argument('--gene-family', required=True, help='Gene family label')
-    p.add_argument('--output-dir', required=True, type=Path, help='Output directory for phase1_v2 outputs')
+    p.add_argument('--output-dir', required=True, type=Path, help='Output directory for phase1 outputs')
     p.add_argument('--genome-gff-dir', required=True, type=Path,
                    help='Directory containing genome GFF files (REQUIRED for per-gene coordinate extraction)')
     return p.parse_args()

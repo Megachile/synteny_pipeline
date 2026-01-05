@@ -290,11 +290,12 @@ def main():
 
         # Use swissprot_name for backward compatibility with Phase 8
         # (even though it's NR annotation, not SwissProt)
+        # Note: swissprot_pident is 0 since we're not running DIAMOND - just using header annotations
         annotation_records.append({
             'helixer_flanking': fid,
             'source': '+'.join(sources),
             'swissprot_name': annot['nr_annotation'],  # Phase 8 expects this column name
-            'swissprot_pident': 100.0 if annot['nr_annotation'] else 0,  # Placeholder for Phase 8
+            'swissprot_pident': 0,  # No alignment - annotations from FASTA headers
             'nr_annotation': annot['nr_annotation'],
             'scaffold': annot['scaffold'],
             'on_chromosome': annot['on_chromosome'],

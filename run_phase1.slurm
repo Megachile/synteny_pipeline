@@ -91,7 +91,7 @@ fi
 echo "LOC IDs: $LOC_IDS"
 
 # Output directories
-PHASE1_DIR="outputs/$FAMILY/phase1_v2"
+PHASE1_DIR="outputs/$FAMILY/phase1"
 GENOME_GFF_DIR="data/reference"
 LB_PROTEOME_DB="data/proteomes/GCF_019393585.1_Lboulardi_NCBI.dmnd"
 

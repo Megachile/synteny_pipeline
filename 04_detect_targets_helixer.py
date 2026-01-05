@@ -382,7 +382,7 @@ def main():
     )
     parser.add_argument(
         "--phase1-dir", type=Path, required=True,
-        help="Path to phase1_v2 directory with query proteins"
+        help="Path to phase1 directory with query proteins"
     )
     parser.add_argument(
         "--helixer-dir", type=Path, required=True,

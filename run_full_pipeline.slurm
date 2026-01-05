@@ -88,7 +88,7 @@ LB_PROTEOME_DB="data/proteomes/GCF_019393585.1_Lboulardi_NCBI.dmnd"
 BK_PROTEOME_DB="data/proteomes/GCF_010883055.1_bkinseyi.dmnd"
 
 # Output directories
-PHASE1_DIR="outputs/$FAMILY/phase1_v2"
+PHASE1_DIR="outputs/$FAMILY/phase1"
 PHASE2B_DIR="outputs/$FAMILY/phase2b_helixer"
 PHASE4_DIR="outputs/$FAMILY/phase4_helixer_filtered"
 PHASE4B_DIR="outputs/$FAMILY/phase4b_helixer_filtered"
