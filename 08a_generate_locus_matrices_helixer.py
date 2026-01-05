@@ -111,15 +111,23 @@ def load_bk_swissprot_annotations(bk_swissprot_file: Path) -> Dict[str, str]:
 
 
 def load_species_and_phylo(species_map_file: Path) -> Tuple[Dict[str, str], Dict[str, int]]:
-    """Load species mapping and phylogenetic order."""
+    """Load species mapping and phylogenetic order, excluding genomes marked as excluded."""
     species_map = {}
     phylo_order_map = {}
 
     with open(species_map_file) as f:
-        header = f.readline()
+        header = f.readline().strip().split('\t')
+        # Find status column index
+        status_idx = header.index('status') if 'status' in header else -1
+
         for line in f:
             parts = line.strip().split('\t')
             if len(parts) >= 4:
+                # Skip excluded genomes
+                if status_idx >= 0 and len(parts) > status_idx:
+                    if parts[status_idx] == 'excluded':
+                        continue
+
                 genome_id = parts[0]
                 species_map[genome_id] = parts[1]
                 try:

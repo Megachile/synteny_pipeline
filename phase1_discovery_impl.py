@@ -1163,6 +1163,21 @@ def main():
     locus_df = pd.DataFrame(unique_loci)
     locus_df.to_csv(args.output_dir / "locus_definitions.tsv", sep='\t', index=False)
 
+    # Combine all target proteins into query_proteins.faa for Phase 4
+    query_proteins_file = args.output_dir / "query_proteins.faa"
+    target_count = 0
+    with open(query_proteins_file, 'w') as out_f:
+        for locus in unique_loci:
+            locus_name = locus['locus_id']
+            target_file = args.output_dir / locus_name / f"{locus_name}_targets.faa"
+            if target_file.exists():
+                with open(target_file) as in_f:
+                    for line in in_f:
+                        out_f.write(line)
+                        if line.startswith('>'):
+                            target_count += 1
+    print(f"  - query_proteins.faa: {target_count} target proteins for Phase 4")
+
     # Save detailed paralog info
     with open(args.output_dir / "paralog_details.json", 'w') as f:
         # Convert DataFrames to dicts for JSON serialization
@@ -1176,6 +1191,7 @@ def main():
 
     print(f"\nResults saved to {args.output_dir}/")
     print(f"  - locus_definitions.tsv: {len(unique_loci)} loci across {len(LANDMARKS)} genomes")
+    print(f"  - query_proteins.faa: Combined target proteins for Phase 4")
     print(f"  - paralog_details.json: Detailed BLAST results")
     print(f"  - *_flanking.faa: Flanking proteins for each locus (ORDERED: U1...Un, D1...Dn)")
 

@@ -316,7 +316,7 @@ def main():
         print(f"\n[OUTPUT] flanking_annotations.tsv: {len(annot_df)} rows")
 
         # Stats
-        n_annotated = annot_df['nr_annotation'].apply(lambda x: x and x != 'hypothetical').sum()
+        n_annotated = annot_df['nr_annotation'].apply(lambda x: bool(x and x != 'hypothetical')).sum()
         n_on_chrom = annot_df['on_chromosome'].sum()
         print(f"  With functional annotation: {n_annotated}")
         print(f"  On BK-mapped chromosome: {n_on_chrom}")

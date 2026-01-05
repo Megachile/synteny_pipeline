@@ -87,15 +87,23 @@ def classify_unplaceable(target: dict) -> str:
 
 
 def load_species_and_phylo(species_map_file: Path) -> Tuple[Dict[str, str], Dict[str, int]]:
-    """Load species mapping and phylogenetic order."""
+    """Load species mapping and phylogenetic order, excluding genomes marked as excluded."""
     species_map = {}
     phylo_order_map = {}
 
     with open(species_map_file) as f:
-        header = f.readline()
+        header = f.readline().strip().split('\t')
+        # Find status column index
+        status_idx = header.index('status') if 'status' in header else -1
+
         for line in f:
             parts = line.strip().split('\t')
             if len(parts) >= 4:
+                # Skip excluded genomes
+                if status_idx >= 0 and len(parts) > status_idx:
+                    if parts[status_idx] == 'excluded':
+                        continue
+
                 genome_id = parts[0]
                 species_map[genome_id] = parts[1]
                 try:
@@ -624,28 +632,35 @@ def main():
     else:
         print("  No targets found")
 
-    # Phase 6 metadata - try target_proteins.faa format first
+    # Phase 6 metadata - load from length_qc.tsv (keyed by target_id)
     seq_metadata = {}
-    target_proteins_file = args.phase6_dir / "target_proteins.faa"
-    if target_proteins_file.exists():
-        current_id = None
-        current_seq = []
-        with open(target_proteins_file) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith('>'):
-                    if current_id and current_seq:
-                        seq_metadata[current_id] = {'length_aa': len(''.join(current_seq))}
-                    current_id = line[1:].split()[0]
-                    current_seq = []
-                else:
-                    current_seq.append(line)
-            if current_id and current_seq:
-                seq_metadata[current_id] = {'length_aa': len(''.join(current_seq))}
+    length_qc_file = args.phase6_dir / "length_qc.tsv"
+    if length_qc_file.exists():
+        length_df = pd.read_csv(length_qc_file, sep='\t')
+        for _, row in length_df.iterrows():
+            target_id = row['target_id']
+            length_aa = int(row['extracted_length_aa']) if pd.notna(row['extracted_length_aa']) else 0
+            seq_metadata[target_id] = {'length_aa': length_aa}
         print(f"  Extracted sequences: {len(seq_metadata)}")
     else:
-        seq_metadata = load_extracted_seq_metadata(args.phase6_dir)
-        print(f"  Extracted sequences: {len(seq_metadata)}")
+        # Fallback to all_extracted_genes.faa
+        all_genes_file = args.phase6_dir / "all_extracted_genes.faa"
+        if all_genes_file.exists():
+            current_id = None
+            current_seq = []
+            with open(all_genes_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('>'):
+                        if current_id and current_seq:
+                            seq_metadata[current_id] = {'length_aa': len(''.join(current_seq))}
+                        current_id = line[1:].split()[0]
+                        current_seq = []
+                    else:
+                        current_seq.append(line)
+                if current_id and current_seq:
+                    seq_metadata[current_id] = {'length_aa': len(''.join(current_seq))}
+            print(f"  Extracted sequences: {len(seq_metadata)}")
 
     # Phase 5b novel loci (optional)
     novel_loci_df = pd.DataFrame()
