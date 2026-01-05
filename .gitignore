@@ -10,6 +10,14 @@ outputs/
 *.gff3
 *.dmnd
 *.tsv
+*.json
+
+# Data symlink
+data
+
+# Session documentation (regenerated from analysis)
+HELIXER_QC_*.md
+CURRENT_SESSION_STATUS.md
 
 # Python cache
 __pycache__/

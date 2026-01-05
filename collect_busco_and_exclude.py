@@ -35,8 +35,8 @@ GOOD_THRESHOLD = 75.0       # What counts as "good" alternative
 # PATHS
 # =============================================================================
 BASE_DIR = Path("/carc/scratch/projects/emartins/2016456/adam/synteny_scanning/hpc_deployment_package")
-RAGTAG_DIR = BASE_DIR / "hybrid_workflow" / "data" / "ragtag_output"
-EXCLUDED_DIR = BASE_DIR / "hybrid_workflow" / "data" / "ragtag_output_excluded"
+RAGTAG_DIR = BASE_DIR / "data" / "ragtag_output"
+EXCLUDED_DIR = BASE_DIR / "data" / "ragtag_output" / "excluded"
 GCA_FILE = BASE_DIR / "data" / "gca_to_species.tsv"
 
 
