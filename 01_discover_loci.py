@@ -531,6 +531,32 @@ def run_coordinates_mode(
     gene_positions = _load_gff_gene_positions(bk_gff)
     print(f"  Loaded {len(gene_positions)} gene positions")
 
+    # Build LOC -> XP protein ID mapping from GFF CDS entries
+    # This is critical for extracting flanking proteins - BK proteome headers
+    # don't contain LOC IDs, so we need this mapping
+    loc_to_xp = {}
+    with open(bk_gff) as f:
+        for line in f:
+            if line.startswith('#'):
+                continue
+            parts = line.strip().split('\t')
+            if len(parts) < 9:
+                continue
+            if parts[2] != 'CDS':
+                continue
+            attrs = parts[8]
+            # Extract gene=LOC* and protein_id=XP_*
+            gene_id = None
+            protein_id = None
+            for attr in attrs.split(';'):
+                if attr.startswith('gene=LOC'):
+                    gene_id = attr.split('=')[1]
+                elif attr.startswith('protein_id='):
+                    protein_id = attr.split('=')[1]
+            if gene_id and protein_id:
+                loc_to_xp[gene_id] = protein_id
+    print(f"  Built LOC->XP mapping: {len(loc_to_xp)} entries")
+
     # Load BK proteome for flanking sequences
     bk_proteome_path = None
     proteome_candidates = [
@@ -670,17 +696,16 @@ def run_coordinates_mode(
             flanking_file = out_dir / f"{display_locus_id}_flanking.faa"
             flanking_records = []
             for direction, flank_gene_id in flanking_genes:
-                # Find protein ID for this gene (from proteome)
-                # Try to match by LOC ID in proteome headers
-                for prot_id, record in proteome_seqs.items():
-                    if flank_gene_id in record.description:
-                        new_record = SeqRecord(
-                            record.seq,
-                            id=f"{prot_id}|{flank_gene_id}",
-                            description=f"{direction} {prot_id} {record.description}"
-                        )
-                        flanking_records.append(new_record)
-                        break
+                # Use LOC -> XP mapping to find protein ID
+                prot_id = loc_to_xp.get(flank_gene_id)
+                if prot_id and prot_id in proteome_seqs:
+                    record = proteome_seqs[prot_id]
+                    new_record = SeqRecord(
+                        record.seq,
+                        id=f"{prot_id}|{flank_gene_id}",
+                        description=f"{direction} {prot_id} {record.description}"
+                    )
+                    flanking_records.append(new_record)
 
             if flanking_records:
                 SeqIO.write(flanking_records, flanking_file, 'fasta')
